@@ -99,12 +99,8 @@ target/
 *.war
 *.ear
 
-# Maven wrapper JAR
-# Keep this commented if you want to commit Maven Wrapper files
-# .mvn/wrapper/maven-wrapper.jar
-
 # ==============================
-# Audio / generated files
+# Audio files
 # ==============================
 *.wav
 *.mp3
@@ -117,3 +113,8 @@ target/
 # ==============================
 *.local
 config.local.*
+
+# ==============================
+# Local development data
+# ==============================
+scratch/
