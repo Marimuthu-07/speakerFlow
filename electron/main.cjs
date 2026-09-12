@@ -13,26 +13,30 @@ const systemPowerService = createSystemPowerService();
 
 async function adjustMasterVolume(delta) {
   if (!speakerEngineService.session) return;
-  const currentStatus = speakerEngineService.getWaveStatus();
+  const currentStatus = await speakerEngineService.getWaveStatus();
   const currentVol = currentStatus?.masterVolume ?? 100;
   const nextVol = Math.max(0, Math.min(100, currentVol + delta));
-  await speakerEngineService.setMasterVolume(nextVol);
+  const updatedStatus = await speakerEngineService.setMasterVolume(nextVol);
+  console.log(`[SpeakerFlow MediaKey] engine active: true`);
+  console.log(`[SpeakerFlow MediaKey] master volume: ${currentVol} -> ${nextVol}`);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('audio:master-volume-updated', {
       masterVolume: nextVol,
-      masterMuted: currentStatus?.masterMuted ?? false
+      masterMuted: updatedStatus?.masterMuted ?? currentStatus?.masterMuted ?? false
     });
   }
 }
 
 async function toggleMasterMute() {
   if (!speakerEngineService.session) return;
-  const currentStatus = speakerEngineService.getWaveStatus();
+  const currentStatus = await speakerEngineService.getWaveStatus();
   const nextMute = !(currentStatus?.masterMuted ?? false);
-  await speakerEngineService.setMasterMute(nextMute);
+  const updatedStatus = await speakerEngineService.setMasterMute(nextMute);
+  console.log(`[SpeakerFlow MediaKey] engine active: true`);
+  console.log(`[SpeakerFlow MediaKey] master mute: ${currentStatus?.masterMuted ?? false} -> ${nextMute}`);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('audio:master-volume-updated', {
-      masterVolume: currentStatus?.masterVolume ?? 100,
+      masterVolume: updatedStatus?.masterVolume ?? currentStatus?.masterVolume ?? 100,
       masterMuted: nextMute
     });
   }
@@ -70,19 +74,27 @@ function registerMediaShortcuts() {
   unregisterMediaShortcuts();
   if (!speakerEngineService.session) return;
   try {
-    globalShortcut.register('VolumeUp', () => {
+    const upOk = globalShortcut.register('VolumeUp', () => {
+      console.log('[SpeakerFlow MediaKey] global shortcut: VolumeUp');
       if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
       handleVolumeUp().catch(() => {});
     });
-    globalShortcut.register('VolumeDown', () => {
+    const downOk = globalShortcut.register('VolumeDown', () => {
+      console.log('[SpeakerFlow MediaKey] global shortcut: VolumeDown');
       if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
       handleVolumeDown().catch(() => {});
     });
-    globalShortcut.register('VolumeMute', () => {
+    const muteOk = globalShortcut.register('VolumeMute', () => {
+      console.log('[SpeakerFlow MediaKey] global shortcut: VolumeMute');
       if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
       handleVolumeMute().catch(() => {});
     });
-  } catch {}
+    if (!upOk || !downOk || !muteOk) {
+      console.log(`[SpeakerFlow MediaKey] globalShortcut registration: VolumeUp=${upOk}, VolumeDown=${downOk}, VolumeMute=${muteOk} (expected on Wayland/GNOME where compositor owns media keys)`);
+    }
+  } catch (err) {
+    console.log('[SpeakerFlow MediaKey] globalShortcut registration error:', err.message);
+  }
 }
 
 function unregisterMediaShortcuts() {
@@ -117,17 +129,20 @@ function createWindow() {
 
     // Media Keys for SpeakerFlow Engine (Active Session Only)
     if (speakerEngineService.session) {
-      if (input.key === 'AudioVolumeUp' || input.code === 'AudioVolumeUp') {
+      if (input.key === 'AudioVolumeUp' || input.code === 'AudioVolumeUp' || input.key === 'VolumeUp' || input.code === 'VolumeUp') {
+        console.log(`[SpeakerFlow MediaKey] before-input-event: ${input.key || input.code}`);
         handleVolumeUp().catch(() => {});
         event.preventDefault();
         return;
       }
-      if (input.key === 'AudioVolumeDown' || input.code === 'AudioVolumeDown') {
+      if (input.key === 'AudioVolumeDown' || input.code === 'AudioVolumeDown' || input.key === 'VolumeDown' || input.code === 'VolumeDown') {
+        console.log(`[SpeakerFlow MediaKey] before-input-event: ${input.key || input.code}`);
         handleVolumeDown().catch(() => {});
         event.preventDefault();
         return;
       }
-      if (input.key === 'AudioVolumeMute' || input.code === 'AudioVolumeMute') {
+      if (input.key === 'AudioVolumeMute' || input.code === 'AudioVolumeMute' || input.key === 'VolumeMute' || input.code === 'VolumeMute') {
+        console.log(`[SpeakerFlow MediaKey] before-input-event: ${input.key || input.code}`);
         handleVolumeMute().catch(() => {});
         event.preventDefault();
         return;
