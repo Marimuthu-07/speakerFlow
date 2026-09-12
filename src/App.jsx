@@ -53,6 +53,7 @@ function App() {
     branchGains: []
   });
   const [waveAction, setWaveAction] = useState(false);
+  const [battery, setBattery] = useState({ available: false, percentage: null, state: 'unknown', onAc: false });
 
   // Dragging state for 2D room canvas
   const svgCanvasRef = useRef(null);
@@ -140,6 +141,26 @@ function App() {
     }, 100);
     return () => window.clearInterval(waveInterval);
   }, [waveStatus?.enabled, engineStatus?.session?.active, refreshWaveStatus]);
+
+  // Battery monitoring and live master volume keyboard event listeners
+  useEffect(() => {
+    if (window.speakerFlow?.getBatteryStatus) {
+      window.speakerFlow.getBatteryStatus().then((status) => {
+        if (status) setBattery(status);
+      }).catch(() => {});
+    }
+    const unsubBattery = window.speakerFlow?.onBatteryStatusChanged?.((status) => {
+      if (status) setBattery(status);
+    });
+    const unsubMaster = window.speakerFlow?.onMasterVolumeUpdated?.(({ masterVolume, masterMuted }) => {
+      setWaveStatus((prev) => prev ? { ...prev, masterVolume, masterMuted } : prev);
+      refreshEngineStatus();
+    });
+    return () => {
+      if (typeof unsubBattery === 'function') unsubBattery();
+      if (typeof unsubMaster === 'function') unsubMaster();
+    };
+  }, [refreshEngineStatus]);
 
   const selectedStream = useMemo(
     () => streams.find((stream) => stream.id === selectedStreamId) || null,
@@ -599,14 +620,37 @@ function App() {
           <h1>SpeakerFlow</h1>
           <p className="subtitle">Pavucontrol-style per-application volume, output routing, and multi-speaker mixer.</p>
         </div>
-        <button
-          className="button secondary refresh-hero-btn"
-          onClick={() => { refreshDevices(); refreshStreams(); refreshEngineStatus(); }}
-          disabled={loadingDevices || loadingStreams}
-          title="Refresh PipeWire state"
-        >
-          {loadingDevices || loadingStreams ? 'Refreshing…' : '↻ Refresh'}
-        </button>
+        <div className="hero-actions">
+          {(battery?.host?.available ?? battery?.available) && (
+            <div
+              className={`battery-badge battery-${(battery?.host?.state || battery?.state) || 'discharging'}`}
+              title={`Host Battery: ${(battery?.host?.percentage ?? battery?.percentage)}% (${(battery?.host?.state || battery?.state)})`}
+            >
+              <span className="battery-icon">
+                {(battery?.host?.state || battery?.state) === 'charging'
+                  ? '⚡'
+                  : (battery?.host?.percentage ?? battery?.percentage) > 20
+                  ? '🔋'
+                  : '🪫'}
+              </span>
+              <span className="battery-pct">{(battery?.host?.percentage ?? battery?.percentage)}%</span>
+            </div>
+          )}
+          {!(battery?.host?.available ?? battery?.available) && (battery?.host?.onAc ?? battery?.onAc) && (
+            <div className="battery-badge battery-ac" title="Connected to AC Power">
+              <span className="battery-icon">🔌</span>
+              <span className="battery-pct">AC</span>
+            </div>
+          )}
+          <button
+            className="button secondary refresh-hero-btn"
+            onClick={() => { refreshDevices(); refreshStreams(); refreshEngineStatus(); }}
+            disabled={loadingDevices || loadingStreams}
+            title="Refresh PipeWire state"
+          >
+            {loadingDevices || loadingStreams ? 'Refreshing…' : '↻ Refresh'}
+          </button>
+        </div>
       </header>
 
       {/* Multi-Speaker Engine Master Volume & Mute Bar */}
@@ -622,7 +666,7 @@ function App() {
             <span className="master-title">Engine Master Output</span>
             <span className="master-sub">
               {engineActive
-                ? `Multiplies across all ${engineSession?.activeBranchCount || 0} active SpeakerFlow Engine branches`
+                ? `Multiplies across all ${engineSession?.activeBranchCount || 0} active SpeakerFlow Engine branches (Software gain; hardware output volume remains independent).`
                 : 'Controls active SpeakerFlow Engine branches. Start engine in Output Devices or Movement tabs to activate.'}
             </span>
           </div>
@@ -884,6 +928,15 @@ function App() {
                 (dynamicGain / 100) * 100
               );
 
+              // Find connected Bluetooth battery if available
+              const devBattery = (battery?.devices || []).find((d) => {
+                if (!d || d.percentage === null || d.percentage === undefined) return false;
+                const sinkStr = `${sink.id} ${sink.name} ${sink.technicalName || ''}`.toLowerCase().replace(/_/g, ':');
+                const devId = (d.id || '').toLowerCase().replace(/_/g, ':');
+                const devName = (d.name || '').toLowerCase();
+                return (devId && sinkStr.includes(devId)) || (devName && sinkStr.includes(devName));
+              });
+
               return (
                 <div
                   className={`pavu-card ${isBranchActive ? 'card-speakerflow' : isBranchDisconnected ? 'card-disconnected' : ''}`}
@@ -899,6 +952,12 @@ function App() {
                       <div className="pavu-app-titles">
                         <div className="pavu-app-name-row">
                           <strong className="pavu-app-name">{sink.name}</strong>
+                          {devBattery && (
+                            <span className="battery-badge battery-device" title={`Device Battery: ${devBattery.percentage}% (${devBattery.name})`}>
+                              <span className="battery-icon">{devBattery.percentage > 20 ? '🔋' : '🪫'}</span>
+                              <span className="battery-pct">{devBattery.percentage}%</span>
+                            </span>
+                          )}
                           <span className={`status-pill ${sink.state}`}>
                             {sink.state}
                           </span>
@@ -943,6 +1002,7 @@ function App() {
                           Target: <strong>{effectiveGain}%</strong> (Master {waveStatus.masterMuted ? '0%' : `${waveStatus.masterVolume ?? 100}%`} × User {spkMuted ? '0%' : `${userVol}%`} × Engine {dynamicGain}%)
                         </span>
                       </div>
+                      <p className="branch-help-text">Software gain; hardware output volume remains independent.</p>
 
                       <div className="pavu-volume-row">
                         <button

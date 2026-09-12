@@ -21,5 +21,16 @@ contextBridge.exposeInMainWorld('speakerFlow', {
   setSpeakerMute: (sinkId, muted) => ipcRenderer.invoke('audio:set-speaker-mute', sinkId, muted),
   getWaveStatus: () => ipcRenderer.invoke('audio:get-wave-status'),
   setWaveConfig: (config) => ipcRenderer.invoke('audio:set-wave-config', config),
-  setMotionConfig: (config) => ipcRenderer.invoke('audio:set-motion-config', config)
+  setMotionConfig: (config) => ipcRenderer.invoke('audio:set-motion-config', config),
+  getBatteryStatus: () => ipcRenderer.invoke('power:get-battery-status'),
+  onBatteryStatusChanged: (callback) => {
+    const handler = (_event, status) => callback(status);
+    ipcRenderer.on('power:battery-updated', handler);
+    return () => ipcRenderer.removeListener('power:battery-updated', handler);
+  },
+  onMasterVolumeUpdated: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('audio:master-volume-updated', handler);
+    return () => ipcRenderer.removeListener('audio:master-volume-updated', handler);
+  }
 });

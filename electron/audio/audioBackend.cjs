@@ -30,6 +30,14 @@ class AudioBackend {
   async setSinkMute() {
     throw new Error('Sink mute control is not implemented for this platform.');
   }
+
+  async setSinkInputVolume() {
+    throw new Error('Sink-input volume control is not implemented for this platform.');
+  }
+
+  async listSinkInputs() {
+    throw new Error('Sink-input discovery is not implemented for this platform.');
+  }
 }
 
 module.exports = { AudioBackend };

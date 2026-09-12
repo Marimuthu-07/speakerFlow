@@ -1177,6 +1177,70 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
   color: #60a5fa;
 }
 
+.branch-help-text {
+  margin: 2px 0 0;
+  font-size: 0.73rem;
+  color: #8fa4cb;
+  font-style: italic;
+}
+
+.hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.battery-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #151f33;
+  border: 1px solid #293d61;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #c9d8f6;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  transition: all 0.2s ease;
+}
+.battery-badge:hover {
+  border-color: #3b82f6;
+  background: #1b2842;
+}
+.battery-badge.battery-charging {
+  border-color: #22c55e;
+  color: #86efac;
+  background: rgba(34, 197, 94, 0.12);
+}
+.battery-badge.battery-discharging {
+  border-color: #38bdf8;
+  color: #bae6fd;
+}
+.battery-badge.battery-full {
+  border-color: #10b981;
+  color: #6ee7b7;
+}
+.battery-badge.battery-ac {
+  border-color: #6366f1;
+  color: #c7d2fe;
+}
+.battery-badge.battery-device {
+  padding: 2px 7px;
+  font-size: 0.72rem;
+  box-shadow: none;
+  border-radius: 6px;
+  border-color: #293d61;
+}
+.battery-icon {
+  font-size: 0.95rem;
+  line-height: 1;
+}
+.battery-pct {
+  letter-spacing: 0.02em;
+}
+
 /* Action Buttons inside Cards */
 .pavu-card-actions {
   display: flex;

@@ -1,5 +1,3 @@
-const { execFile } = require('node:child_process');
-const { promisify } = require('node:util');
 const { calculatePatternGains, normalizePattern } = require('./wavePatterns.cjs');
 const {
   calculateSpatialGains,
@@ -19,8 +17,6 @@ const {
   calculatePathPosition,
   calculateSpatialPathGains
 } = require('./motionEngine.cjs');
-
-const execFileAsync = promisify(execFile);
 
 class WaveEngineController {
   constructor(audioBackend) {
@@ -141,7 +137,7 @@ class WaveEngineController {
 
   async resolveSinkInputIds() {
     try {
-      const sinkInputs = await this.audioBackend.runPactlJson(['--format=json', 'list', 'sink-inputs']);
+      const sinkInputs = await this.audioBackend.listSinkInputs();
       for (const branch of this.branches.values()) {
         if (branch.state === 'active') {
           const match = sinkInputs.find(
@@ -743,7 +739,7 @@ class WaveEngineController {
       try {
         while (branch.sinkInputId && branch.state === 'active' && branch.pendingVolume !== branch.currentAppliedVolume) {
           const volToSet = branch.pendingVolume;
-          await execFileAsync('pactl', ['set-sink-input-volume', String(branch.sinkInputId), `${volToSet}%`]);
+          await this.audioBackend.setSinkInputVolume(branch.sinkInputId, volToSet);
           branch.currentAppliedVolume = volToSet;
         }
       } catch (err) {

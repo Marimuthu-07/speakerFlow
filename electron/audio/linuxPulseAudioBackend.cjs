@@ -24,7 +24,7 @@ class LinuxPulseAudioBackend extends AudioBackend {
   async listApplicationStreams() {
     const [sinks, sinkInputs] = await Promise.all([
       this.listSinks(),
-      this.runPactlJson(['--format=json', 'list', 'sink-inputs'])
+      this.listSinkInputs()
     ]);
     const sinksByIndex = new Map(sinks.map((sink) => [sink.index, sink]));
 
@@ -81,6 +81,15 @@ class LinuxPulseAudioBackend extends AudioBackend {
     }
   }
 
+  async setSinkInputVolume(sinkInputId, volumePercent) {
+    try {
+      const clamped = Math.max(0, Math.min(150, Math.round(volumePercent)));
+      await execFileAsync('pactl', ['set-sink-input-volume', String(sinkInputId), `${clamped}%`]);
+    } catch (error) {
+      throw new Error(`Unable to set volume for sink-input ${sinkInputId}: ${readableError(error)}`);
+    }
+  }
+
   async setStreamMute(streamId, muted) {
     try {
       await execFileAsync('pactl', ['set-sink-input-mute', String(streamId), muted ? '1' : '0']);
@@ -111,6 +120,14 @@ class LinuxPulseAudioBackend extends AudioBackend {
       return await this.runPactlJson(['--format=json', 'list', 'sinks']);
     } catch (error) {
       throw new Error(`Unable to read PipeWire/PulseAudio output devices: ${readableError(error)}`);
+    }
+  }
+
+  async listSinkInputs() {
+    try {
+      return await this.runPactlJson(['--format=json', 'list', 'sink-inputs']);
+    } catch (error) {
+      throw new Error(`Unable to read PipeWire/PulseAudio sink-inputs: ${readableError(error)}`);
     }
   }
 

@@ -1,13 +1,15 @@
 const { randomUUID } = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { createAudioPipelineAdapter } = require('./createAudioBackend.cjs');
 const { WaveEngineController } = require('./waveEngineController.cjs');
 
 class SpeakerEngineService {
-  constructor(audioBackend) {
+  constructor(audioBackend, pipelineAdapter) {
     this.audioBackend = audioBackend;
+    this.pipelineAdapter = pipelineAdapter || createAudioPipelineAdapter(audioBackend);
     this.session = null;
     this.lastMessage = '';
     this.waveController = new WaveEngineController(audioBackend);
+    this.reconnectTimers = new Map(); // sinkId -> timeoutHandle
   }
 
   async getStatus() {
@@ -38,7 +40,8 @@ class SpeakerEngineService {
               sinkName: b.sinkName,
               branchSinkId: b.branchSinkId,
               state: b.state,
-              error: b.error || null
+              error: b.error || null,
+              intentionalDisconnect: b.intentionalDisconnect || false
             })),
             activeBranchCount: this.session.branches.filter((b) => b.state === 'active').length,
             totalBranchCount: this.session.branches.length,
@@ -53,6 +56,8 @@ class SpeakerEngineService {
     if (this.session) {
       throw new Error('A Speaker Engine session is already active.');
     }
+
+    this.clearAllReconnectTimers();
 
     const sinkIdList = Array.isArray(selectedSinkIds)
       ? selectedSinkIds
@@ -90,11 +95,9 @@ class SpeakerEngineService {
     const ingressSinkId = `speakerflow.session.${sessionId}.ingress`;
     const tapSourceId = `speakerflow.session.${sessionId}.tap`;
 
-    const ingressProcess = this.startIngressTap(ingressSinkId, tapSourceId);
-
     const session = {
       sessionId,
-      ingressProcess,
+      pipeline: null,
       ingressSinkId,
       tapSourceId,
       ingressStatus: 'starting',
@@ -110,26 +113,30 @@ class SpeakerEngineService {
     this.session = session;
     this.lastMessage = '';
 
-    ingressProcess.once('error', (error) => {
-      if (this.session === session) {
-        session.ingressStatus = 'error';
-        session.tapStatus = 'error';
-        this.lastMessage = `The temporary Speaker Engine ingress could not start: ${error.message}`;
-        this.stopSession({ restore: true, preserveMessage: true }).catch(() => {});
-      }
-    });
-
-    ingressProcess.once('exit', (code, signal) => {
-      if (this.session === session && !session.stopping) {
-        session.ingressStatus = 'stopped';
-        session.tapStatus = 'stopped';
-        this.lastMessage = `The temporary Speaker Engine ingress stopped unexpectedly (${signal || `exit ${code}`}).`;
-        this.stopSession({ restore: true, preserveMessage: true }).catch(() => {});
-      }
-    });
-
     try {
-      await this.waitForSink(ingressSinkId);
+      const pipeline = await this.pipelineAdapter.createPipeline({
+        sessionId,
+        ingressSinkId,
+        tapSourceId,
+        onIngressError: (error) => {
+          if (this.session === session) {
+            session.ingressStatus = 'error';
+            session.tapStatus = 'error';
+            this.lastMessage = `The temporary Speaker Engine ingress could not start: ${error.message}`;
+            this.stopSession({ restore: true, preserveMessage: true }).catch(() => {});
+          }
+        },
+        onIngressExit: (reason) => {
+          if (this.session === session && !session.stopping) {
+            session.ingressStatus = 'stopped';
+            session.tapStatus = 'stopped';
+            this.lastMessage = `The temporary Speaker Engine ingress stopped unexpectedly (${reason}).`;
+            this.stopSession({ restore: true, preserveMessage: true }).catch(() => {});
+          }
+        }
+      });
+
+      session.pipeline = pipeline;
       session.ingressStatus = 'active';
       session.tapStatus = 'active';
 
@@ -141,34 +148,41 @@ class SpeakerEngineService {
           sinkId: physicalSink.id,
           sinkName: physicalSink.name,
           branchSinkId,
-          process: null,
+          handle: null,
           state: 'starting',
-          error: null
+          error: null,
+          intentionalDisconnect: false,
+          retryCount: 0,
+          reconnecting: false
         };
         session.branches.push(branchObj);
 
         try {
-          const branchProcess = this.startBranch(branchSinkId, tapSourceId, physicalSink.id);
-          branchObj.process = branchProcess;
-
-          branchProcess.once('error', (error) => {
-            branchObj.state = 'failed';
-            branchObj.error = error.message;
-            if (this.session === session && !session.stopping) {
-              this.reconcileSessionState();
-              this.waveController.updateBranches(session.branches).catch(() => {});
+          const branchHandle = await pipeline.createBranch({
+            branchSinkId,
+            physicalSinkId: physicalSink.id,
+            onError: (error) => {
+              branchObj.state = 'failed';
+              branchObj.error = error.message;
+              if (this.session === session && !session.stopping) {
+                this.reconcileSessionState();
+                this.waveController.updateBranches(session.branches).catch(() => {});
+              }
+            },
+            onDisconnect: (reason) => {
+              if (this.session === session && !session.stopping && branchObj.state === 'active') {
+                branchObj.state = 'disconnected';
+                branchObj.handle = null;
+                this.lastMessage = `Branch for "${physicalSink.name}" stopped (${reason}).`;
+                this.reconcileSessionState();
+                this.waveController.updateBranches(session.branches).catch(() => {});
+                if (!branchObj.intentionalDisconnect) {
+                  this.scheduleAutoReconnect(branchObj.sinkId);
+                }
+              }
             }
           });
-
-          branchProcess.once('exit', (code, signal) => {
-            if (this.session === session && !session.stopping && branchObj.state === 'active') {
-              branchObj.state = 'disconnected';
-              this.lastMessage = `Branch for "${physicalSink.name}" stopped (${signal || `exit ${code}`}).`;
-              this.reconcileSessionState();
-              this.waveController.updateBranches(session.branches).catch(() => {});
-            }
-          });
-
+          branchObj.handle = branchHandle;
           branchObj.state = 'active';
           successfulBranches++;
         } catch (branchError) {
@@ -184,9 +198,6 @@ class SpeakerEngineService {
       await this.audioBackend.moveSinkInput(stream.id, ingressSinkId);
       await this.verifyStreamSink(stream.id, ingressSinkId);
 
-      // Give PipeWire a moment to register branch sink-inputs
-      await this.waitForBranchSinkInputs(session.branches.filter((b) => b.state === 'active'));
-
       this.reconcileSessionState();
       await this.waveController.updateBranches(session.branches);
 
@@ -199,6 +210,8 @@ class SpeakerEngineService {
 
   async stopSession(options = {}) {
     const session = this.session;
+    this.clearAllReconnectTimers();
+
     if (!session) return;
 
     session.stopping = true;
@@ -222,16 +235,8 @@ class SpeakerEngineService {
       }
     }
 
-    const branchStopPromises = session.branches.map((branch) => {
-      if (branch.process) {
-        return stopProcess(branch.process);
-      }
-      return Promise.resolve();
-    });
-    await Promise.all(branchStopPromises);
-
-    if (session.ingressProcess) {
-      await stopProcess(session.ingressProcess);
+    if (session.pipeline) {
+      await session.pipeline.destroy().catch(() => {});
     }
 
     if (this.session === session) {
@@ -293,11 +298,14 @@ class SpeakerEngineService {
       throw new Error(`Branch for output ${sinkId} was not found in active session.`);
     }
 
+    branch.intentionalDisconnect = true;
+    this.clearReconnectTimer(sinkId);
+
     if (branch.state !== 'disconnected') {
       branch.state = 'disconnected';
-      if (branch.process) {
-        await stopProcess(branch.process);
-        branch.process = null;
+      if (branch.handle && session.pipeline) {
+        await session.pipeline.destroyBranch(branch.handle);
+        branch.handle = null;
       }
       this.reconcileSessionState();
       await this.waveController.updateBranches(session.branches);
@@ -311,118 +319,133 @@ class SpeakerEngineService {
       throw new Error('No active Speaker Engine session.');
     }
 
-    const allSinks = await this.audioBackend.listSinks();
-    const physicalSink = allSinks.find((s) => s.name === sinkId);
-    if (!physicalSink) {
-      throw new Error('The physical output is not currently available in PipeWire.');
-    }
-
     let branch = session.branches.find((b) => b.sinkId === sinkId);
-    if (!branch) {
-      const branchIndex = session.branches.length;
-      branch = {
-        sinkId: physicalSink.name,
-        sinkName: physicalSink.description || physicalSink.name,
-        branchSinkId: `speakerflow.session.${session.sessionId}.branch.${branchIndex}`,
-        process: null,
-        state: 'starting',
-        error: null
-      };
-      session.branches.push(branch);
+    if (branch) {
+      branch.intentionalDisconnect = false;
+      branch.retryCount = 0;
+      this.clearReconnectTimer(sinkId);
     }
 
-    if (branch.process) {
-      await stopProcess(branch.process);
-      branch.process = null;
-    }
+    await this._performBranchReconnect(sinkId, false);
+  }
 
-    const branchProcess = this.startBranch(branch.branchSinkId, session.tapSourceId, branch.sinkId);
-    branch.process = branchProcess;
-    branch.state = 'active';
-    branch.error = null;
+  scheduleAutoReconnect(sinkId, delayMs = 1500) {
+    const session = this.session;
+    if (!session || session.stopping) return;
 
-    branchProcess.once('error', (error) => {
-      branch.state = 'failed';
-      branch.error = error.message;
-      if (this.session === session && !session.stopping) {
-        this.reconcileSessionState();
-        this.waveController.updateBranches(session.branches).catch(() => {});
+    const branch = session.branches.find((b) => b.sinkId === sinkId);
+    if (!branch || branch.intentionalDisconnect || branch.reconnecting) return;
+
+    this.clearReconnectTimer(sinkId);
+
+    const timer = setTimeout(async () => {
+      this.reconnectTimers.delete(sinkId);
+      if (this.session !== session || session.stopping || branch.intentionalDisconnect || branch.state === 'active') {
+        return;
       }
-    });
+      await this._performBranchReconnect(sinkId, true);
+    }, delayMs);
 
-    branchProcess.once('exit', (code, signal) => {
-      if (this.session === session && !session.stopping && branch.state === 'active') {
+    this.reconnectTimers.set(sinkId, timer);
+  }
+
+  clearReconnectTimer(sinkId) {
+    const timer = this.reconnectTimers.get(sinkId);
+    if (timer) {
+      clearTimeout(timer);
+      this.reconnectTimers.delete(sinkId);
+    }
+  }
+
+  clearAllReconnectTimers() {
+    for (const timer of this.reconnectTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.reconnectTimers.clear();
+  }
+
+  async _performBranchReconnect(sinkId, isAuto = false) {
+    const session = this.session;
+    if (!session || session.stopping) return;
+
+    const branch = session.branches.find((b) => b.sinkId === sinkId);
+    if (!branch) return;
+    if (branch.reconnecting) return;
+    branch.reconnecting = true;
+
+    try {
+      const allSinks = await this.audioBackend.listSinks();
+      const physicalSink = allSinks.find((s) => s.name === sinkId);
+
+      if (!physicalSink || physicalSink.properties?.['node.virtual'] === 'true') {
+        branch.reconnecting = false;
+        if (!isAuto) {
+          throw new Error('The physical output is not currently available in PipeWire.');
+        }
         branch.state = 'disconnected';
-        this.lastMessage = `Branch for "${branch.sinkName}" stopped (${signal || `exit ${code}`}).`;
-        this.reconcileSessionState();
-        this.waveController.updateBranches(session.branches).catch(() => {});
+        branch.error = 'Physical sink is not available.';
+        branch.retryCount = (branch.retryCount || 0) + 1;
+        const nextDelay = Math.min(5000, Math.round(1500 * Math.pow(1.5, Math.min(branch.retryCount, 3))));
+        this.scheduleAutoReconnect(sinkId, nextDelay);
+        return;
       }
-    });
 
-    // Wait for the reconnected branch sink-input to register in PipeWire
-    await this.waitForBranchSinkInputs([branch]);
+      if (branch.handle && session.pipeline) {
+        await session.pipeline.destroyBranch(branch.handle).catch(() => {});
+        branch.handle = null;
+      }
 
-    this.reconcileSessionState();
-    await this.waveController.updateBranches(session.branches);
-    this.lastMessage = `Output "${branch.sinkName}" reconnected to session.`;
-  }
+      if (session.pipeline) {
+        const branchHandle = await session.pipeline.createBranch({
+          branchSinkId: branch.branchSinkId,
+          physicalSinkId: branch.sinkId,
+          onError: (error) => {
+            branch.state = 'failed';
+            branch.error = error.message;
+            if (this.session === session && !session.stopping) {
+              this.reconcileSessionState();
+              this.waveController.updateBranches(session.branches).catch(() => {});
+            }
+          },
+          onDisconnect: (reason) => {
+            if (this.session === session && !session.stopping && branch.state === 'active') {
+              branch.state = 'disconnected';
+              branch.handle = null;
+              this.lastMessage = `Branch for "${branch.sinkName}" stopped (${reason}).`;
+              this.reconcileSessionState();
+              this.waveController.updateBranches(session.branches).catch(() => {});
+              if (!branch.intentionalDisconnect) {
+                this.scheduleAutoReconnect(branch.sinkId);
+              }
+            }
+          }
+        });
 
-  async waitForBranchSinkInputs(branchesToWait, timeoutMs = 1500) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      try {
-        const sinkInputs = await this.audioBackend.runPactlJson(['--format=json', 'list', 'sink-inputs']);
-        const allFound = branchesToWait.every((b) =>
-          sinkInputs.some(
-            (si) =>
-              si.properties?.['node.name'] === `${b.branchSinkId}.playback` ||
-              si.properties?.['node.name'] === b.branchSinkId ||
-              si.properties?.['device.description'] === b.branchSinkId ||
-              si.properties?.['node.group'] === b.branchSinkId
-          )
-        );
-        if (allFound) return;
-      } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 30));
+        branch.handle = branchHandle;
+        branch.state = 'active';
+        branch.error = null;
+        branch.retryCount = 0;
+        this.clearReconnectTimer(sinkId);
+        this.reconcileSessionState();
+        await this.waveController.updateBranches(session.branches);
+        this.lastMessage = isAuto
+          ? `Output "${branch.sinkName}" reconnected automatically.`
+          : `Output "${branch.sinkName}" reconnected to session.`;
+      }
+    } catch (error) {
+      branch.reconnecting = false;
+      branch.state = 'disconnected';
+      branch.error = error.message;
+      if (isAuto) {
+        branch.retryCount = (branch.retryCount || 0) + 1;
+        const nextDelay = Math.min(5000, Math.round(1500 * Math.pow(1.5, Math.min(branch.retryCount, 3))));
+        this.scheduleAutoReconnect(sinkId, nextDelay);
+      } else {
+        throw error;
+      }
+    } finally {
+      branch.reconnecting = false;
     }
-  }
-
-  startIngressTap(ingressSinkId, tapSourceId) {
-    return spawn(
-      'pw-loopback',
-      [
-        '--name',
-        ingressSinkId,
-        '--group',
-        ingressSinkId,
-        '--capture-props',
-        `{ node.name = "${ingressSinkId}" media.class = "Audio/Sink" node.virtual = true }`,
-        '--playback-props',
-        `{ node.name = "${tapSourceId}" media.class = "Audio/Source" node.virtual = true }`
-      ],
-      { stdio: ['ignore', 'ignore', 'pipe'] }
-    );
-  }
-
-  startBranch(branchSinkId, tapSourceId, physicalSinkId) {
-    return spawn(
-      'pw-loopback',
-      [
-        '--name',
-        branchSinkId,
-        '--group',
-        branchSinkId,
-        '--capture',
-        tapSourceId,
-        '--capture-props',
-        `{ node.name = "${branchSinkId}.capture" node.passive = true }`,
-        '--playback',
-        physicalSinkId,
-        '--playback-props',
-        `{ node.name = "${branchSinkId}.playback" node.passive = true node.dont-reconnect = true }`
-      ],
-      { stdio: ['ignore', 'ignore', 'pipe'] }
-    );
   }
 
   async reconcileSession() {
@@ -438,11 +461,19 @@ class SpeakerEngineService {
         if (!sinkNames.has(branch.sinkId)) {
           branch.state = 'disconnected';
           branch.error = 'Physical sink disconnected.';
-          if (branch.process) {
-            stopProcess(branch.process).catch(() => {});
+          if (branch.handle && session.pipeline) {
+            session.pipeline.destroyBranch(branch.handle).catch(() => {});
+            branch.handle = null;
           }
           this.lastMessage = `Output "${branch.sinkName}" disconnected. Branch disabled.`;
           changed = true;
+          if (!branch.intentionalDisconnect) {
+            this.scheduleAutoReconnect(branch.sinkId);
+          }
+        }
+      } else if (branch.state === 'disconnected' && !branch.intentionalDisconnect && !branch.reconnecting) {
+        if (sinkNames.has(branch.sinkId)) {
+          this.scheduleAutoReconnect(branch.sinkId, 100);
         }
       }
     }
@@ -488,50 +519,6 @@ class SpeakerEngineService {
     }
     throw new Error(`The application stream did not reach the expected temporary audio path (current: ${stream.currentSinkId}, expected: ${expectedSinkId}).`);
   }
-
-  async waitForSink(sinkId) {
-    const deadline = Date.now() + 3000;
-    while (Date.now() < deadline) {
-      const sink = await this.audioBackend.findSinkByName(sinkId);
-      if (sink) return;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    throw new Error('SpeakerFlow could not create its temporary ingress sink.');
-  }
-}
-
-function stopProcess(child) {
-  if (!child || child.exitCode !== null || child.signalCode) return Promise.resolve();
-
-  return new Promise((resolve) => {
-    let resolved = false;
-    const cleanup = () => {
-      if (!resolved) {
-        resolved = true;
-        resolve();
-      }
-    };
-
-    const timeout = setTimeout(() => {
-      if (child.exitCode === null && !child.signalCode) {
-        try {
-          child.kill('SIGKILL');
-        } catch {}
-      }
-      cleanup();
-    }, 1500);
-
-    child.once('exit', () => {
-      clearTimeout(timeout);
-      cleanup();
-    });
-
-    try {
-      child.kill('SIGTERM');
-    } catch {
-      cleanup();
-    }
-  });
 }
 
 module.exports = { SpeakerEngineService };
