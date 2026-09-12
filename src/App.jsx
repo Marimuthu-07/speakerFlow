@@ -12,6 +12,7 @@ function App() {
   const [streams, setStreams] = useState([]);
   const [aggregate, setAggregate] = useState(null);
   const [selectedStreamId, setSelectedStreamId] = useState(null);
+  const [isManualStreamSelection, setIsManualStreamSelection] = useState(false);
   const [loadingStreams, setLoadingStreams] = useState(true);
   const [streamError, setStreamError] = useState('');
   const [routingAction, setRoutingAction] = useState(false);
@@ -80,16 +81,51 @@ function App() {
     setStreamError('');
     try {
       const result = await window.speakerFlow.listApplicationStreams();
-      const streamIds = new Set(result.streams.map((stream) => stream.id));
-      setStreams(result.streams);
+      const streamList = result.streams || [];
+      const streamMap = new Map(streamList.map((stream) => [stream.id, stream]));
+
+      setStreams(streamList);
       setAggregate(result.aggregate);
-      setSelectedStreamId((current) => (streamIds.has(current) ? current : (result.streams[0]?.id || null)));
+
+      setSelectedStreamId((currentId) => {
+        const currentStream = currentId ? streamMap.get(currentId) : null;
+        const fallbackStream = streamList[0] || null;
+
+        // In manual mode, preserve user's explicitly selected stream as long as it exists
+        if (isManualStreamSelection && currentStream) {
+          return currentId;
+        }
+
+        // If manual stream disappeared, clear manual mode
+        if (isManualStreamSelection && !currentStream) {
+          setIsManualStreamSelection(false);
+        }
+
+        // In auto mode: if current stream is still active, maintain stability (no jumping)
+        if (currentStream && currentStream.isActive) {
+          return currentId;
+        }
+
+        // In auto mode: if current stream is inactive/absent, prefer an active/playing stream
+        const activePlayingStream = streamList.find((s) => s.isActive);
+        if (activePlayingStream) {
+          return activePlayingStream.id;
+        }
+
+        // If no stream is active, keep current stream if present
+        if (currentStream) {
+          return currentId;
+        }
+
+        // Fallback to first stream or null
+        return fallbackStream ? fallbackStream.id : null;
+      });
     } catch (refreshError) {
       setStreamError(refreshError.message || 'Could not detect application audio streams.');
     } finally {
       setLoadingStreams(false);
     }
-  }, []);
+  }, [isManualStreamSelection]);
 
   const refreshEngineStatus = useCallback(async () => {
     try {
@@ -97,6 +133,11 @@ function App() {
       setEngineStatus(nextStatus);
       if (nextStatus?.session?.wave) {
         setWaveStatus(nextStatus.session.wave);
+      }
+      if (nextStatus?.session?.active && nextStatus.session.streamId) {
+        if (!isManualStreamSelection) {
+          setSelectedStreamId(nextStatus.session.streamId);
+        }
       }
       setSelectedEngineSinkIds((current) => {
         const availableIds = new Set(nextStatus.outputs.map((o) => o.id));
@@ -109,7 +150,7 @@ function App() {
     } catch (refreshError) {
       setEngineError(refreshError.message || 'Could not inspect the Multi-Speaker Engine.');
     }
-  }, []);
+  }, [isManualStreamSelection]);
 
   const refreshWaveStatus = useCallback(async () => {
     try {
@@ -142,7 +183,7 @@ function App() {
     return () => window.clearInterval(waveInterval);
   }, [waveStatus?.enabled, engineStatus?.session?.active, refreshWaveStatus]);
 
-  // Battery monitoring and live master volume keyboard event listeners
+  // Battery monitoring, live master volume, and real-time backend event listeners
   useEffect(() => {
     if (window.speakerFlow?.getBatteryStatus) {
       window.speakerFlow.getBatteryStatus().then((status) => {
@@ -156,11 +197,24 @@ function App() {
       setWaveStatus((prev) => prev ? { ...prev, masterVolume, masterMuted } : prev);
       refreshEngineStatus();
     });
+    const unsubDevices = window.speakerFlow?.onDevicesUpdated?.(() => {
+      refreshDevices();
+    });
+    const unsubStreams = window.speakerFlow?.onStreamsUpdated?.(() => {
+      refreshStreams();
+    });
+    const unsubEngineStatus = window.speakerFlow?.onEngineStatusUpdated?.(() => {
+      refreshEngineStatus();
+    });
+
     return () => {
       if (typeof unsubBattery === 'function') unsubBattery();
       if (typeof unsubMaster === 'function') unsubMaster();
+      if (typeof unsubDevices === 'function') unsubDevices();
+      if (typeof unsubStreams === 'function') unsubStreams();
+      if (typeof unsubEngineStatus === 'function') unsubEngineStatus();
     };
-  }, [refreshEngineStatus]);
+  }, [refreshDevices, refreshStreams, refreshEngineStatus]);
 
   const selectedStream = useMemo(
     () => streams.find((stream) => stream.id === selectedStreamId) || null,
@@ -168,6 +222,14 @@ function App() {
   );
   const engineActive = Boolean(engineStatus?.session?.active);
   const engineSession = engineStatus?.session || null;
+
+  function handleSelectStream(streamId) {
+    setIsManualStreamSelection(true);
+    setSelectedStreamId(streamId);
+    if (engineActive && window.speakerFlow?.setSessionStream) {
+      window.speakerFlow.setSessionStream(streamId, true).catch(() => {});
+    }
+  }
 
   function toggleDevice(deviceId) {
     setSelectedDeviceIds((current) => {
@@ -343,7 +405,8 @@ function App() {
     try {
       await window.speakerFlow.startSpeakerEngineSession(
         selectedStream.id,
-        Array.from(selectedEngineSinkIds)
+        Array.from(selectedEngineSinkIds),
+        isManualStreamSelection
       );
       await Promise.all([refreshStreams(), refreshEngineStatus()]);
     } catch (startError) {
@@ -804,7 +867,7 @@ function App() {
                 <div
                   className={`pavu-card ${isSpeakerFlowSession ? 'card-speakerflow' : ''} ${isSelectedStream ? 'card-selected-stream' : ''}`}
                   key={stream.id}
-                  onClick={() => setSelectedStreamId(stream.id)}
+                  onClick={() => handleSelectStream(stream.id)}
                   title="Click to select this application stream for Engine Graph"
                 >
                   {/* Stream Card Header */}
@@ -2148,22 +2211,30 @@ function App() {
             <div className="engine-stream-summary">
               <span className="summary-label">Target Application Stream:</span>
               <div className="engine-stream-picker-wrap">
-                {streams.length > 0 ? (
+                {engineActive && engineSession ? (
+                  <div className="engine-active-stream-pill">
+                    <span className="stream-app-name">{engineSession.streamName || 'Active Session Stream'}</span>
+                    <span className="stream-id-tag">(Stream {engineSession.streamId})</span>
+                    <span className={`status-pill ${engineSession.streamActive !== false ? 'playing' : 'paused'}`}>
+                      {engineSession.streamActive !== false ? 'playing' : 'paused'}
+                    </span>
+                  </div>
+                ) : streams.length > 0 ? (
                   <select
                     className="pavu-select engine-stream-select"
                     value={selectedStreamId || ''}
-                    onChange={(e) => setSelectedStreamId(Number(e.target.value))}
+                    onChange={(e) => handleSelectStream(Number(e.target.value))}
                     disabled={engineActive || engineAction}
                   >
                     {streams.map((s) => (
                       <option value={s.id} key={s.id}>
-                        {s.applicationName} {s.streamName ? `— ${s.streamName}` : ''} (Stream {s.id})
+                        {s.applicationName} {s.streamName ? `— ${s.streamName}` : ''} {s.isActive ? '▶ (Playing)' : '⏸ (Paused)'} (Stream {s.id})
                       </option>
                     ))}
                   </select>
                 ) : (
                   <span className="summary-value">
-                    <em>No audio playback streams detected. Start playback in Strawberry or media player.</em>
+                    <em>No audio playback streams detected. Start playback in a media player or browser.</em>
                   </span>
                 )}
               </div>

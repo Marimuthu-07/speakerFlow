@@ -1,10 +1,109 @@
-const { execFile } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { AudioBackend } = require('./audioBackend.cjs');
 
 const execFileAsync = promisify(execFile);
 
 class LinuxPulseAudioBackend extends AudioBackend {
+  constructor() {
+    super();
+    this._subscribeProcess = null;
+    this._monitoringActive = false;
+    this._restartTimer = null;
+  }
+
+  startMonitoring() {
+    this._monitoringActive = true;
+    if (this._subscribeProcess) return;
+    if (this._restartTimer) {
+      clearTimeout(this._restartTimer);
+      this._restartTimer = null;
+    }
+
+    try {
+      this._subscribeProcess = spawn('pactl', ['subscribe']);
+
+      let debounceTimer = null;
+      let pendingEvents = { devices: false, streams: false, defaultSink: false };
+
+      const flushEvents = () => {
+        if (pendingEvents.devices) {
+          this.emit('devices-changed');
+        }
+        if (pendingEvents.streams) {
+          this.emit('streams-changed');
+        }
+        if (pendingEvents.defaultSink) {
+          this.emit('default-sink-changed');
+        }
+        pendingEvents = { devices: false, streams: false, defaultSink: false };
+      };
+
+      let buffer = '';
+      this._subscribeProcess.stdout.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+
+          if (trimmed.includes("on sink #") || trimmed.includes("on card #")) {
+            pendingEvents.devices = true;
+          } else if (trimmed.includes("on sink-input #")) {
+            pendingEvents.streams = true;
+          } else if (trimmed.includes("on server #")) {
+            pendingEvents.devices = true;
+            pendingEvents.defaultSink = true;
+          }
+        }
+
+        if (pendingEvents.devices || pendingEvents.streams || pendingEvents.defaultSink) {
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(flushEvents, 60);
+        }
+      });
+
+      this._subscribeProcess.on('error', () => {
+        this._subscribeProcess = null;
+        this._scheduleMonitoringRestart();
+      });
+
+      this._subscribeProcess.on('exit', () => {
+        this._subscribeProcess = null;
+        this._scheduleMonitoringRestart();
+      });
+    } catch {
+      this._subscribeProcess = null;
+      this._scheduleMonitoringRestart();
+    }
+  }
+
+  _scheduleMonitoringRestart() {
+    if (!this._monitoringActive || this._restartTimer) return;
+    this._restartTimer = setTimeout(() => {
+      this._restartTimer = null;
+      if (this._monitoringActive) {
+        this.startMonitoring();
+      }
+    }, 1000);
+  }
+
+  stopMonitoring() {
+    this._monitoringActive = false;
+    if (this._restartTimer) {
+      clearTimeout(this._restartTimer);
+      this._restartTimer = null;
+    }
+    if (this._subscribeProcess) {
+      try {
+        this._subscribeProcess.kill('SIGTERM');
+      } catch {}
+      this._subscribeProcess = null;
+    }
+  }
+
   async listOutputDevices() {
     const sinks = await this.listSinks();
 
@@ -33,6 +132,7 @@ class LinuxPulseAudioBackend extends AudioBackend {
       .map((stream) => {
         const properties = stream.properties || {};
         const sink = sinksByIndex.get(stream.sink);
+        const isCorked = stream.corked === true || properties['pulse.corked'] === 'true';
 
         return {
           id: stream.index,
@@ -40,7 +140,7 @@ class LinuxPulseAudioBackend extends AudioBackend {
           streamName: properties['media.name'] || properties['node.name'] || '',
           currentSinkId: sink?.name || null,
           currentSinkName: sink?.description || sink?.name || `Unknown sink (${stream.sink})`,
-          isActive: !stream.corked,
+          isActive: !isCorked,
           volumePercent: parseVolumePercent(stream.volume),
           mute: Boolean(stream.mute),
           iconName: properties['application.icon_name'] || properties['application.process.binary'] || 'audio-x-generic'

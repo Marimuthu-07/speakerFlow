@@ -11,7 +11,8 @@ contextBridge.exposeInMainWorld('speakerFlow', {
   setSinkVolume: (sinkName, volume) => ipcRenderer.invoke('audio:set-sink-volume', sinkName, volume),
   setSinkMute: (sinkName, muted) => ipcRenderer.invoke('audio:set-sink-mute', sinkName, muted),
   getSpeakerEngineStatus: () => ipcRenderer.invoke('audio:get-speaker-engine-status'),
-  startSpeakerEngineSession: (streamId, sinkIds) => ipcRenderer.invoke('audio:start-speaker-engine-session', streamId, sinkIds),
+  startSpeakerEngineSession: (streamId, sinkIds, isManual) => ipcRenderer.invoke('audio:start-speaker-engine-session', streamId, sinkIds, isManual),
+  setSessionStream: (streamId, isManual) => ipcRenderer.invoke('audio:set-session-stream', streamId, isManual),
   stopSpeakerEngineSession: () => ipcRenderer.invoke('audio:stop-speaker-engine-session'),
   disconnectBranch: (sinkId) => ipcRenderer.invoke('audio:disconnect-branch', sinkId),
   reconnectBranch: (sinkId) => ipcRenderer.invoke('audio:reconnect-branch', sinkId),
@@ -32,5 +33,20 @@ contextBridge.exposeInMainWorld('speakerFlow', {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on('audio:master-volume-updated', handler);
     return () => ipcRenderer.removeListener('audio:master-volume-updated', handler);
+  },
+  onDevicesUpdated: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on('audio:devices-updated', handler);
+    return () => ipcRenderer.removeListener('audio:devices-updated', handler);
+  },
+  onStreamsUpdated: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on('audio:streams-updated', handler);
+    return () => ipcRenderer.removeListener('audio:streams-updated', handler);
+  },
+  onEngineStatusUpdated: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on('audio:engine-status-updated', handler);
+    return () => ipcRenderer.removeListener('audio:engine-status-updated', handler);
   }
 });

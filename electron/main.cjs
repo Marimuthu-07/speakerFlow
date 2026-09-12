@@ -9,11 +9,39 @@ let mainWindow;
 const audioBackend = createAudioBackend();
 const streamRoutingService = new StreamRoutingService(audioBackend);
 const speakerEngineService = new SpeakerEngineService(audioBackend);
+
 speakerEngineService.onMasterVolumeChanged = (data) => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('audio:master-volume-updated', data);
   }
 };
+
+speakerEngineService.onSessionChanged = () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('audio:engine-status-updated');
+  }
+};
+
+audioBackend.on('devices-changed', () => {
+  if (speakerEngineService.session) {
+    speakerEngineService.reconcileSession().catch(() => {});
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('audio:devices-updated');
+    mainWindow.webContents.send('audio:engine-status-updated');
+  }
+});
+
+audioBackend.on('streams-changed', () => {
+  if (speakerEngineService.session) {
+    speakerEngineService.reconcileSession().catch(() => {});
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('audio:streams-updated');
+    mainWindow.webContents.send('audio:engine-status-updated');
+  }
+});
+
 const systemPowerService = createSystemPowerService();
 
 async function adjustMasterVolume(delta) {
@@ -22,8 +50,6 @@ async function adjustMasterVolume(delta) {
   const currentVol = currentStatus?.masterVolume ?? 100;
   const nextVol = Math.max(0, Math.min(100, currentVol + delta));
   const updatedStatus = await speakerEngineService.setMasterVolume(nextVol);
-  console.log(`[SpeakerFlow MediaKey] engine active: true`);
-  console.log(`[SpeakerFlow MediaKey] master volume: ${currentVol} -> ${nextVol}`);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('audio:master-volume-updated', {
       masterVolume: nextVol,
@@ -37,8 +63,6 @@ async function toggleMasterMute() {
   const currentStatus = await speakerEngineService.getWaveStatus();
   const nextMute = !(currentStatus?.masterMuted ?? false);
   const updatedStatus = await speakerEngineService.setMasterMute(nextMute);
-  console.log(`[SpeakerFlow MediaKey] engine active: true`);
-  console.log(`[SpeakerFlow MediaKey] master mute: ${currentStatus?.masterMuted ?? false} -> ${nextMute}`);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('audio:master-volume-updated', {
       masterVolume: updatedStatus?.masterVolume ?? currentStatus?.masterVolume ?? 100,
@@ -79,27 +103,19 @@ function registerMediaShortcuts() {
   unregisterMediaShortcuts();
   if (!speakerEngineService.session) return;
   try {
-    const upOk = globalShortcut.register('VolumeUp', () => {
-      console.log('[SpeakerFlow MediaKey] global shortcut: VolumeUp');
+    globalShortcut.register('VolumeUp', () => {
       if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
       handleVolumeUp().catch(() => {});
     });
-    const downOk = globalShortcut.register('VolumeDown', () => {
-      console.log('[SpeakerFlow MediaKey] global shortcut: VolumeDown');
+    globalShortcut.register('VolumeDown', () => {
       if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
       handleVolumeDown().catch(() => {});
     });
-    const muteOk = globalShortcut.register('VolumeMute', () => {
-      console.log('[SpeakerFlow MediaKey] global shortcut: VolumeMute');
+    globalShortcut.register('VolumeMute', () => {
       if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
       handleVolumeMute().catch(() => {});
     });
-    if (!upOk || !downOk || !muteOk) {
-      console.log(`[SpeakerFlow MediaKey] globalShortcut registration: VolumeUp=${upOk}, VolumeDown=${downOk}, VolumeMute=${muteOk} (expected on Wayland/GNOME where compositor owns media keys)`);
-    }
-  } catch (err) {
-    console.log('[SpeakerFlow MediaKey] globalShortcut registration error:', err.message);
-  }
+  } catch {}
 }
 
 function unregisterMediaShortcuts() {
@@ -135,19 +151,16 @@ function createWindow() {
     // Media Keys for SpeakerFlow Engine (Active Session Only)
     if (speakerEngineService.session) {
       if (input.key === 'AudioVolumeUp' || input.code === 'AudioVolumeUp' || input.key === 'VolumeUp' || input.code === 'VolumeUp') {
-        console.log(`[SpeakerFlow MediaKey] before-input-event: ${input.key || input.code}`);
         handleVolumeUp().catch(() => {});
         event.preventDefault();
         return;
       }
       if (input.key === 'AudioVolumeDown' || input.code === 'AudioVolumeDown' || input.key === 'VolumeDown' || input.code === 'VolumeDown') {
-        console.log(`[SpeakerFlow MediaKey] before-input-event: ${input.key || input.code}`);
         handleVolumeDown().catch(() => {});
         event.preventDefault();
         return;
       }
       if (input.key === 'AudioVolumeMute' || input.code === 'AudioVolumeMute' || input.key === 'VolumeMute' || input.code === 'VolumeMute') {
-        console.log(`[SpeakerFlow MediaKey] before-input-event: ${input.key || input.code}`);
         handleVolumeMute().catch(() => {});
         event.preventDefault();
         return;
@@ -201,9 +214,9 @@ ipcMain.handle('audio:set-stream-mute', async (_event, streamId, muted) => audio
 ipcMain.handle('audio:set-sink-volume', async (_event, sinkName, volume) => audioBackend.setSinkVolume(sinkName, volume));
 ipcMain.handle('audio:set-sink-mute', async (_event, sinkName, muted) => audioBackend.setSinkMute(sinkName, muted));
 ipcMain.handle('audio:get-speaker-engine-status', async () => speakerEngineService.getStatus());
-ipcMain.handle('audio:start-speaker-engine-session', async (_event, streamId, sinkIds) => {
+ipcMain.handle('audio:start-speaker-engine-session', async (_event, streamId, sinkIds, isManual = false) => {
   try {
-    const result = await speakerEngineService.startSession(streamId, sinkIds);
+    const result = await speakerEngineService.startSession(streamId, sinkIds, isManual);
     registerMediaShortcuts();
     return result;
   } catch (err) {
@@ -211,6 +224,7 @@ ipcMain.handle('audio:start-speaker-engine-session', async (_event, streamId, si
     throw err;
   }
 });
+ipcMain.handle('audio:set-session-stream', async (_event, streamId, isManual) => speakerEngineService.setSessionStream(streamId, isManual));
 ipcMain.handle('audio:stop-speaker-engine-session', async () => {
   unregisterMediaShortcuts();
   return speakerEngineService.stopSession();
@@ -228,6 +242,7 @@ ipcMain.handle('power:get-battery-status', async () => systemPowerService.getBat
 
 app.whenReady().then(() => {
   createWindow();
+  audioBackend.startMonitoring();
 
   systemPowerService.startMonitoring((status) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -242,17 +257,20 @@ app.whenReady().then(() => {
 
 app.on('before-quit', () => {
   unregisterMediaShortcuts();
+  audioBackend.stopMonitoring();
   systemPowerService.stopMonitoring();
   speakerEngineService.stopSession().catch(() => {});
 });
 
 app.on('will-quit', () => {
   unregisterMediaShortcuts();
+  audioBackend.stopMonitoring();
   systemPowerService.stopMonitoring();
 });
 
 app.on('window-all-closed', () => {
   unregisterMediaShortcuts();
+  audioBackend.stopMonitoring();
   systemPowerService.stopMonitoring();
   speakerEngineService.stopSession().catch(() => {});
   if (process.platform !== 'darwin') app.quit();

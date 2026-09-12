@@ -11,6 +11,9 @@ class SpeakerEngineService {
     this.waveController = new WaveEngineController(audioBackend);
     this.reconnectTimers = new Map(); // sinkId -> timeoutHandle
     this.onMasterVolumeChanged = null;
+    this.onSessionChanged = null;
+    this._isReconciling = false;
+    this._reconcilePending = false;
   }
 
   async getStatus() {
@@ -30,6 +33,8 @@ class SpeakerEngineService {
             state: this.session.state,
             streamId: this.session.streamId,
             streamName: this.session.streamName,
+            streamActive: this.session.streamActive !== false,
+            isManualStreamSelection: Boolean(this.session.isManualStreamSelection),
             originalSinkId: this.session.originalSinkId,
             originalSinkName: this.session.originalSinkName,
             previousDefaultSinkId: this.session.previousDefaultSinkId,
@@ -55,7 +60,7 @@ class SpeakerEngineService {
     };
   }
 
-  async startSession(streamId, selectedSinkIds) {
+  async startSession(streamId, selectedSinkIds, isManual = false) {
     if (this.session) {
       throw new Error('A Speaker Engine session is already active.');
     }
@@ -95,6 +100,13 @@ class SpeakerEngineService {
       throw new Error('None of the selected outputs are currently available physical sinks.');
     }
 
+    const allPhysicalSinksAtStartup = allSinks.filter(
+      (sink) =>
+        sink.properties?.['node.virtual'] !== 'true' &&
+        sink.name !== 'all_speakers' &&
+        !sink.name.startsWith('speakerflow.session.')
+    );
+
     const sessionId = randomUUID();
     const ingressSinkId = `speakerflow.session.${sessionId}.ingress`;
     const tapSourceId = `speakerflow.session.${sessionId}.tap`;
@@ -108,12 +120,17 @@ class SpeakerEngineService {
       tapStatus: 'starting',
       state: 'starting',
       streamId: stream.id,
-      streamName: stream.applicationName,
+      streamName: stream.streamName ? `${stream.applicationName} — ${stream.streamName}` : stream.applicationName,
+      streamActive: stream.isActive,
+      isManualStreamSelection: Boolean(isManual),
       originalSinkId: stream.currentSinkId,
       originalSinkName: stream.currentSinkName,
       previousDefaultSinkId,
       defaultOutputEstablished: false,
       branches: [],
+      branchSequence: validPhysicalSinks.length,
+      selectedSinkIds: new Set(validPhysicalSinks.map((s) => s.id)),
+      initialAvailableSinkIds: new Set(allPhysicalSinksAtStartup.map((s) => s.name)),
       stopping: false
     };
     this.session = session;
@@ -208,9 +225,13 @@ class SpeakerEngineService {
       await this.audioBackend.setDefaultOutput(ingressSinkId);
       await this.verifyDefaultOutput(ingressSinkId);
       session.defaultOutputEstablished = true;
+      session.state = 'running';
 
       this.reconcileSessionState();
       await this.waveController.updateBranches(session.branches);
+
+      // Perform final reconciliation pass in case device or stream events occurred during startup
+      await this.reconcileSession().catch(() => {});
 
       this.lastMessage = `Audio routed across ${successfulBranches} physical output branch${successfulBranches === 1 ? '' : 'es'}.`;
     } catch (error) {
@@ -316,6 +337,35 @@ class SpeakerEngineService {
   async setSpeakerMute(sinkId, muted) {
     await this.waveController.setSpeakerMute(sinkId, muted);
     return this.waveController.getStatus();
+  }
+
+  async setSessionStream(streamId, isManual = true) {
+    const session = this.session;
+    if (!session || session.stopping) {
+      throw new Error('No active Speaker Engine session.');
+    }
+
+    const stream = await this.findApplicationStream(streamId);
+    if (!stream) {
+      throw new Error(`The selected application stream ${streamId} was not found.`);
+    }
+
+    session.isManualStreamSelection = Boolean(isManual);
+    session.streamId = stream.id;
+    session.streamName = stream.streamName
+      ? `${stream.applicationName} — ${stream.streamName}`
+      : stream.applicationName;
+    session.streamActive = stream.isActive;
+
+    if (stream.currentSinkId !== session.ingressSinkId) {
+      await this.audioBackend.moveSinkInput(stream.id, session.ingressSinkId).catch(() => {});
+    }
+
+    if (typeof this.onSessionChanged === 'function') {
+      this.onSessionChanged();
+    }
+
+    return this.getStatus();
   }
 
   async disconnectBranch(sinkId) {
@@ -481,12 +531,39 @@ class SpeakerEngineService {
 
   async reconcileSession() {
     const session = this.session;
-    if (!session || session.stopping) return;
+    if (!session || session.stopping || session.state === 'starting') return;
+
+    if (this._isReconciling) {
+      this._reconcilePending = true;
+      return;
+    }
+
+    this._isReconciling = true;
+    try {
+      do {
+        this._reconcilePending = false;
+        await this._performReconciliation();
+      } while (this._reconcilePending && this.session && !this.session.stopping && this.session.state !== 'starting');
+    } finally {
+      this._isReconciling = false;
+      this._reconcilePending = false;
+    }
+  }
+
+  async _performReconciliation() {
+    const session = this.session;
+    if (!session || session.stopping || session.state === 'starting') return;
 
     const sinks = await this.audioBackend.listSinks();
-    const sinkNames = new Set(sinks.map((s) => s.name));
+    const validPhysicalSinks = sinks.filter(
+      (sink) =>
+        sink.properties?.['node.virtual'] !== 'true' &&
+        sink.name !== 'all_speakers' &&
+        !sink.name.startsWith('speakerflow.session.')
+    );
+    const validPhysicalMap = new Map(validPhysicalSinks.map((s) => [s.name, s]));
 
-    // Observe active session ingress sink volume and mute (OS / pavucontrol / Media key master control)
+    // 1. Observe active session ingress sink volume and mute (OS / pavucontrol / Media key master control)
     const ingressSink = sinks.find((s) => s.name === session.ingressSinkId);
     if (ingressSink) {
       const sinkVol = parseSinkVolumePercent(ingressSink.volume);
@@ -508,32 +585,181 @@ class SpeakerEngineService {
       }
     }
 
-    let changed = false;
-    for (const branch of session.branches) {
-      if (branch.state === 'active') {
-        if (!sinkNames.has(branch.sinkId)) {
+    // 2. Reconcile active application stream for session (Auto vs Manual mode)
+    let streamChanged = false;
+    try {
+      const streams = await this.audioBackend.listApplicationStreams();
+      const streamList = streams || [];
+      const streamMap = new Map(streamList.map((s) => [s.id, s]));
+      const currentStream = session.streamId ? streamMap.get(session.streamId) : null;
+
+      let targetStream = null;
+
+      if (session.isManualStreamSelection) {
+        if (currentStream) {
+          // Manual mode: keep user's stream locked while it exists
+          targetStream = currentStream;
+        } else {
+          // Manually selected stream disappeared: reset manual mode and fallback
+          session.isManualStreamSelection = false;
+          targetStream = streamList.find((s) => s.isActive) || streamList[0] || null;
+        }
+      } else {
+        // Auto mode:
+        if (currentStream && currentStream.isActive) {
+          // Current stream is active -> maintain stability (no jumping)
+          targetStream = currentStream;
+        } else {
+          // Current stream is inactive/paused or missing -> prefer active playing stream
+          const activeStream = streamList.find((s) => s.isActive);
+          if (activeStream) {
+            targetStream = activeStream;
+          } else if (currentStream) {
+            // If no stream is active, stay on current paused stream
+            targetStream = currentStream;
+          } else {
+            // Fallback to first stream or null
+            targetStream = streamList[0] || null;
+          }
+        }
+      }
+
+      if (targetStream) {
+        if (session.streamId !== targetStream.id) {
+          session.streamId = targetStream.id;
+          streamChanged = true;
+          // Direct newly targeted stream to engine ingress if not already there
+          if (targetStream.currentSinkId !== session.ingressSinkId) {
+            await this.audioBackend.moveSinkInput(targetStream.id, session.ingressSinkId).catch(() => {});
+          }
+        }
+
+        const freshName = targetStream.streamName
+          ? `${targetStream.applicationName} — ${targetStream.streamName}`
+          : targetStream.applicationName;
+        const freshActive = targetStream.isActive;
+
+        if (session.streamName !== freshName || session.streamActive !== freshActive) {
+          session.streamName = freshName;
+          session.streamActive = freshActive;
+          streamChanged = true;
+        }
+      } else {
+        if (session.streamActive !== false) {
+          session.streamActive = false;
+          streamChanged = true;
+        }
+      }
+    } catch {}
+
+    let branchesChanged = false;
+
+    // 3. Clean up branches for physical sinks that no longer exist in the system
+    for (let i = session.branches.length - 1; i >= 0; i--) {
+      const branch = session.branches[i];
+      const isPresent = validPhysicalMap.has(branch.sinkId);
+
+      if (!isPresent) {
+        if (branch.state === 'active') {
           branch.state = 'disconnected';
           branch.error = 'Physical sink disconnected.';
           if (branch.handle && session.pipeline) {
-            session.pipeline.destroyBranch(branch.handle).catch(() => {});
+            await session.pipeline.destroyBranch(branch.handle).catch(() => {});
             branch.handle = null;
           }
-          this.lastMessage = `Output "${branch.sinkName}" disconnected. Branch disabled.`;
-          changed = true;
-          if (!branch.intentionalDisconnect) {
-            this.scheduleAutoReconnect(branch.sinkId);
-          }
+          this.lastMessage = `Output "${branch.sinkName}" disconnected.`;
+          branchesChanged = true;
+        }
+        this.clearReconnectTimer(branch.sinkId);
+        if (!branch.intentionalDisconnect) {
+          session.branches.splice(i, 1);
+          branchesChanged = true;
         }
       } else if (branch.state === 'disconnected' && !branch.intentionalDisconnect && !branch.reconnecting) {
-        if (sinkNames.has(branch.sinkId)) {
-          this.scheduleAutoReconnect(branch.sinkId, 100);
+        this.scheduleAutoReconnect(branch.sinkId, 100);
+      }
+    }
+
+    // 4. Hot-plug newly connected eligible physical outputs into the running session
+    const existingSinkIds = new Set(session.branches.map((b) => b.sinkId));
+    for (const physicalSink of validPhysicalSinks) {
+      if (existingSinkIds.has(physicalSink.name)) continue;
+
+      // Target selection semantics:
+      // Must be explicitly selected by the user OR be a brand new device plugged in after session started
+      const isSelected = session.selectedSinkIds && session.selectedSinkIds.has(physicalSink.name);
+      const isNewlyConnectedDevice = session.initialAvailableSinkIds && !session.initialAvailableSinkIds.has(physicalSink.name);
+
+      if (!isSelected && !isNewlyConnectedDevice) {
+        // Device was available at startup but intentionally excluded by the user -> do not attach
+        continue;
+      }
+
+      existingSinkIds.add(physicalSink.name); // prevent duplicates within loop
+      if (session.selectedSinkIds) {
+        session.selectedSinkIds.add(physicalSink.name);
+      }
+
+      const branchIdx = typeof session.branchSequence === 'number' ? session.branchSequence++ : session.branches.length;
+      const branchSinkId = `speakerflow.session.${session.sessionId}.branch.${branchIdx}`;
+      const branchObj = {
+        sinkId: physicalSink.name,
+        sinkName: physicalSink.description || physicalSink.name,
+        branchSinkId,
+        handle: null,
+        state: 'starting',
+        error: null,
+        intentionalDisconnect: false,
+        retryCount: 0,
+        reconnecting: false
+      };
+      session.branches.push(branchObj);
+
+      if (session.pipeline) {
+        try {
+          const branchHandle = await session.pipeline.createBranch({
+            branchSinkId,
+            physicalSinkId: physicalSink.name,
+            onError: (error) => {
+              branchObj.state = 'failed';
+              branchObj.error = error.message;
+              if (this.session === session && !session.stopping) {
+                this.reconcileSessionState();
+                this.waveController.updateBranches(session.branches).catch(() => {});
+              }
+            },
+            onDisconnect: (reason) => {
+              if (this.session === session && !session.stopping && branchObj.state === 'active') {
+                branchObj.state = 'disconnected';
+                branchObj.handle = null;
+                this.lastMessage = `Branch for "${branchObj.sinkName}" stopped (${reason}).`;
+                this.reconcileSessionState();
+                this.waveController.updateBranches(session.branches).catch(() => {});
+                if (!branchObj.intentionalDisconnect) {
+                  this.scheduleAutoReconnect(branchObj.sinkId);
+                }
+              }
+            }
+          });
+          branchObj.handle = branchHandle;
+          branchObj.state = 'active';
+          this.lastMessage = `New output "${branchObj.sinkName}" connected and added to engine session.`;
+          branchesChanged = true;
+        } catch (branchErr) {
+          branchObj.state = 'failed';
+          branchObj.error = branchErr.message;
+          branchesChanged = true;
         }
       }
     }
 
-    if (changed) {
+    if (branchesChanged) {
       this.reconcileSessionState();
       await this.waveController.updateBranches(session.branches);
+    }
+
+    if ((branchesChanged || streamChanged) && typeof this.onSessionChanged === 'function') {
+      this.onSessionChanged();
     }
   }
 

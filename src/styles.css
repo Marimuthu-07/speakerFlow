@@ -129,6 +129,24 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
   border-radius: 6px;
   font-weight: 700;
 }
+.engine-active-stream-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #1a253a;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid #2d3f60;
+}
+.stream-app-name {
+  color: #f1f5f9;
+  font-weight: 600;
+}
+.stream-id-tag {
+  color: #7dd3fc;
+  font-size: 0.78rem;
+  font-family: monospace;
+}
 
 /* Audio Graph / Topology Card */
 .engine-topology-card {

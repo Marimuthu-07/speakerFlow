@@ -1,4 +1,6 @@
-class AudioBackend {
+const { EventEmitter } = require('node:events');
+
+class AudioBackend extends EventEmitter {
   async listOutputDevices() {
     throw new Error('Audio device discovery is not implemented for this platform.');
   }
@@ -46,6 +48,10 @@ class AudioBackend {
   async setDefaultOutput() {
     throw new Error('Default audio output control is not implemented for this platform.');
   }
+
+  startMonitoring() {}
+
+  stopMonitoring() {}
 }
 
 module.exports = { AudioBackend };
