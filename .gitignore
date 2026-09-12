@@ -1,0 +1,119 @@
+# ==============================
+# Dependencies
+# ==============================
+node_modules/
+.pnpm-store/
+.yarn/
+.yarn-cache/
+
+# ==============================
+# Build output
+# ==============================
+dist/
+build/
+out/
+.release/
+
+# ==============================
+# Environment / secrets
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# Logs
+# ==============================
+*.log
+logs/
+
+# ==============================
+# OS files
+# ==============================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================
+# IDE / Editors
+# ==============================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+.idea/
+*.iml
+
+# ==============================
+# Temporary files
+# ==============================
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# ==============================
+# Electron
+# ==============================
+electron-builder.yml
+electron-builder.yaml
+
+# ==============================
+# Runtime data
+# ==============================
+*.pid
+*.pid.lock
+
+# ==============================
+# Cache
+# ==============================
+.cache/
+.parcel-cache/
+.vite/
+
+# ==============================
+# Coverage
+# ==============================
+coverage/
+.nyc_output/
+
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ==============================
+# Java / Maven
+# ==============================
+target/
+*.class
+*.jar
+*.war
+*.ear
+
+# Maven wrapper JAR
+# Keep this commented if you want to commit Maven Wrapper files
+# .mvn/wrapper/maven-wrapper.jar
+
+# ==============================
+# Audio / generated files
+# ==============================
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.aac
+
+# ==============================
+# Local configuration
+# ==============================
+*.local
+config.local.*
