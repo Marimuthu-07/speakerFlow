@@ -10,6 +10,7 @@ class SpeakerEngineService {
     this.lastMessage = '';
     this.waveController = new WaveEngineController(audioBackend);
     this.reconnectTimers = new Map(); // sinkId -> timeoutHandle
+    this.onMasterVolumeChanged = null;
   }
 
   async getStatus() {
@@ -31,6 +32,8 @@ class SpeakerEngineService {
             streamName: this.session.streamName,
             originalSinkId: this.session.originalSinkId,
             originalSinkName: this.session.originalSinkName,
+            previousDefaultSinkId: this.session.previousDefaultSinkId,
+            defaultOutputEstablished: this.session.defaultOutputEstablished,
             ingressSinkId: this.session.ingressSinkId,
             ingressStatus: this.session.ingressStatus,
             tapSourceId: this.session.tapSourceId,
@@ -67,9 +70,10 @@ class SpeakerEngineService {
       throw new Error('At least one physical output must be selected to start the engine.');
     }
 
-    const [stream, allSinks] = await Promise.all([
+    const [stream, allSinks, previousDefaultSinkId] = await Promise.all([
       this.findApplicationStream(streamId),
-      this.audioBackend.listSinks()
+      this.audioBackend.listSinks(),
+      this.audioBackend.getDefaultOutputId().catch(() => null)
     ]);
 
     if (!stream) {
@@ -107,6 +111,8 @@ class SpeakerEngineService {
       streamName: stream.applicationName,
       originalSinkId: stream.currentSinkId,
       originalSinkName: stream.currentSinkName,
+      previousDefaultSinkId,
+      defaultOutputEstablished: false,
       branches: [],
       stopping: false
     };
@@ -198,6 +204,11 @@ class SpeakerEngineService {
       await this.audioBackend.moveSinkInput(stream.id, ingressSinkId);
       await this.verifyStreamSink(stream.id, ingressSinkId);
 
+      // Establish the temporary ingress sink as the system default output
+      await this.audioBackend.setDefaultOutput(ingressSinkId);
+      await this.verifyDefaultOutput(ingressSinkId);
+      session.defaultOutputEstablished = true;
+
       this.reconcileSessionState();
       await this.waveController.updateBranches(session.branches);
 
@@ -220,6 +231,18 @@ class SpeakerEngineService {
     await this.waveController.destroy().catch(() => {});
 
     if (options.restore !== false) {
+      // 1. Restore previous system default output BEFORE destroying temporary ingress sink
+      if (session.previousDefaultSinkId && session.defaultOutputEstablished) {
+        try {
+          await this.audioBackend.setDefaultOutput(session.previousDefaultSinkId);
+          await this.verifyDefaultOutput(session.previousDefaultSinkId);
+          session.defaultOutputEstablished = false;
+        } catch (error) {
+          if (!restoreError) restoreError = error;
+        }
+      }
+
+      // 2. Restore application stream to original output
       try {
         const originalSink = await this.audioBackend.findSinkByName(session.originalSinkId);
         if (!originalSink) {
@@ -231,7 +254,7 @@ class SpeakerEngineService {
           await this.verifyStreamSink(session.streamId, originalSink.id);
         }
       } catch (error) {
-        restoreError = error;
+        if (!restoreError) restoreError = error;
       }
     }
 
@@ -268,12 +291,20 @@ class SpeakerEngineService {
   }
 
   async setMasterVolume(volume) {
-    await this.waveController.setMasterVolume(volume);
+    const clamped = Math.max(0, Math.min(100, Math.round(volume)));
+    await this.waveController.setMasterVolume(clamped);
+    if (this.session && this.session.ingressSinkId) {
+      await this.audioBackend.setSinkVolume(this.session.ingressSinkId, clamped).catch(() => {});
+    }
     return this.waveController.getStatus();
   }
 
   async setMasterMute(muted) {
-    await this.waveController.setMasterMute(muted);
+    const isMuted = Boolean(muted);
+    await this.waveController.setMasterMute(isMuted);
+    if (this.session && this.session.ingressSinkId) {
+      await this.audioBackend.setSinkMute(this.session.ingressSinkId, isMuted).catch(() => {});
+    }
     return this.waveController.getStatus();
   }
 
@@ -455,6 +486,28 @@ class SpeakerEngineService {
     const sinks = await this.audioBackend.listSinks();
     const sinkNames = new Set(sinks.map((s) => s.name));
 
+    // Observe active session ingress sink volume and mute (OS / pavucontrol / Media key master control)
+    const ingressSink = sinks.find((s) => s.name === session.ingressSinkId);
+    if (ingressSink) {
+      const sinkVol = parseSinkVolumePercent(ingressSink.volume);
+      const sinkMuted = Boolean(ingressSink.mute);
+      const currentWave = this.waveController.getStatus();
+
+      let masterChanged = false;
+      if (currentWave.masterVolume !== sinkVol) {
+        await this.waveController.setMasterVolume(sinkVol);
+        masterChanged = true;
+      }
+      if (currentWave.masterMuted !== sinkMuted) {
+        await this.waveController.setMasterMute(sinkMuted);
+        masterChanged = true;
+      }
+
+      if (masterChanged && typeof this.onMasterVolumeChanged === 'function') {
+        this.onMasterVolumeChanged({ masterVolume: sinkVol, masterMuted: sinkMuted });
+      }
+    }
+
     let changed = false;
     for (const branch of session.branches) {
       if (branch.state === 'active') {
@@ -519,6 +572,41 @@ class SpeakerEngineService {
     }
     throw new Error(`The application stream did not reach the expected temporary audio path (current: ${stream.currentSinkId}, expected: ${expectedSinkId}).`);
   }
+
+  async verifyDefaultOutput(expectedSinkId, timeoutMs = 3000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const currentDefault = await this.audioBackend.getDefaultOutputId();
+        if (currentDefault === expectedSinkId) {
+          return;
+        }
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const currentDefault = await this.audioBackend.getDefaultOutputId().catch(() => 'unknown');
+    if (currentDefault !== expectedSinkId) {
+      throw new Error(`The system default output did not switch to the expected output (current: ${currentDefault}, expected: ${expectedSinkId}).`);
+    }
+  }
+}
+
+function parseSinkVolumePercent(volumeObj) {
+  if (!volumeObj || typeof volumeObj !== 'object') return 100;
+  const channels = Object.values(volumeObj);
+  if (channels.length === 0) return 100;
+  let totalPercent = 0;
+  let count = 0;
+  for (const ch of channels) {
+    if (ch && typeof ch.value_percent === 'string') {
+      totalPercent += parseInt(ch.value_percent.replace('%', ''), 10) || 0;
+      count++;
+    } else if (ch && typeof ch.value === 'number') {
+      totalPercent += Math.round((ch.value / 65536) * 100);
+      count++;
+    }
+  }
+  return count > 0 ? Math.round(totalPercent / count) : 100;
 }
 
 module.exports = { SpeakerEngineService };

@@ -72,6 +72,7 @@ async function runUXTests() {
     [1, { id: 1, applicationName: 'App 1', currentSinkId: 'sink1', currentSinkName: 'Sink 1' }]
   ]);
 
+  let simulatedDefaultSink2 = 'sink1';
   const mockBackend = {
     async setSinkInputVolume() {},
     async listSinkInputs() { return []; },
@@ -83,7 +84,18 @@ async function runUXTests() {
       if (stream) stream.currentSinkId = targetSinkId;
     },
     async findSinkByName(name) { return { id: name, name }; },
-    async setSinkVolume(sinkName, vol) { physicalSinkVolumeCalls.push({ sinkName, vol }); }
+    async setSinkVolume(sinkName, vol) {
+      if (!sinkName.startsWith('speakerflow.session.')) {
+        physicalSinkVolumeCalls.push({ sinkName, vol });
+      }
+    },
+    async setSinkMute(sinkName, muted) {
+      if (!sinkName.startsWith('speakerflow.session.')) {
+        physicalSinkVolumeCalls.push({ sinkName, muted });
+      }
+    },
+    async getDefaultOutputId() { return simulatedDefaultSink2; },
+    async setDefaultOutput(sinkId) { simulatedDefaultSink2 = String(sinkId); }
   };
 
   const section2PipelineSession = {
@@ -379,6 +391,257 @@ async function runUXTests() {
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
   console.log('✓ Host and Bluetooth device battery parsing and normalization verified.');
+
+  // 7. Testing External Session Sink Volume & Mute State Synchronization Lifecycle (Cases A - H)
+  console.log('\n7. Testing External Session Sink Volume & Mute State Synchronization Lifecycle (Cases A - H)...');
+  const sinkInputsMap = new Map();
+  const physicalSinkCalls = [];
+  const ingressSinkCalls = [];
+  let simulatedDefaultSink = 'physical_speaker_1';
+  let simulatedIngressSink = {
+    name: '',
+    volume: { 'front-left': { value: 65536, value_percent: '100%' }, 'front-right': { value: 65536, value_percent: '100%' } },
+    mute: false,
+    properties: { 'node.virtual': 'true' }
+  };
+
+  const syncTestStreamsMap = new Map([
+    [10, { id: 10, applicationName: 'Music Player', currentSinkId: 'physical_speaker_1', currentSinkName: 'Physical Speaker 1' }]
+  ]);
+
+  const syncMockBackend = {
+    async setSinkInputVolume(id, vol) {
+      sinkInputsMap.set(id, vol);
+    },
+    async listSinkInputs() {
+      return [
+        { index: 501, properties: { 'node.name': `${simulatedIngressSink.name?.replace('.ingress', '.branch.0')}.playback` } },
+        { index: 502, properties: { 'node.name': `${simulatedIngressSink.name?.replace('.ingress', '.branch.1')}.playback` } }
+      ];
+    },
+    async listSinks() {
+      return [
+        {
+          name: simulatedIngressSink.name,
+          description: 'SpeakerFlow Session',
+          volume: simulatedIngressSink.volume,
+          mute: simulatedIngressSink.mute,
+          properties: { 'node.virtual': 'true' }
+        },
+        {
+          name: 'physical_speaker_1',
+          description: 'Physical Speaker 1',
+          volume: { 'front-left': { value: 50000, value_percent: '76%' } },
+          mute: false,
+          properties: {}
+        },
+        {
+          name: 'physical_speaker_2',
+          description: 'Physical Speaker 2',
+          volume: { 'front-left': { value: 50000, value_percent: '76%' } },
+          mute: false,
+          properties: {}
+        }
+      ];
+    },
+    async listOutputDevicesWithStatus() {
+      return [
+        { id: 'physical_speaker_1', name: 'Physical Speaker 1', isVirtual: false, isDefault: true },
+        { id: 'physical_speaker_2', name: 'Physical Speaker 2', isVirtual: false, isDefault: false }
+      ];
+    },
+    async listApplicationStreams() { return Array.from(syncTestStreamsMap.values()); },
+    async moveSinkInput(streamId, targetSinkId) {
+      const stream = syncTestStreamsMap.get(streamId);
+      if (stream) stream.currentSinkId = targetSinkId;
+    },
+    async findSinkByName(name) {
+      if (name === simulatedIngressSink.name) {
+        const vLeft = simulatedIngressSink.volume['front-left'];
+        const volPercent = vLeft ? parseInt(vLeft.value_percent.replace('%', ''), 10) : 100;
+        return {
+          id: name,
+          name,
+          isVirtual: true,
+          volumePercent: volPercent,
+          mute: simulatedIngressSink.mute
+        };
+      }
+      return { id: name, name, isVirtual: false, volumePercent: 76, mute: false };
+    },
+    async setSinkVolume(sinkName, vol) {
+      if (sinkName.startsWith('speakerflow.session.')) {
+        ingressSinkCalls.push({ sinkName, vol });
+        simulatedIngressSink.volume = {
+          'front-left': { value_percent: `${vol}%` },
+          'front-right': { value_percent: `${vol}%` }
+        };
+      } else {
+        physicalSinkCalls.push({ sinkName, vol });
+      }
+    },
+    async setSinkMute(sinkName, muted) {
+      if (sinkName.startsWith('speakerflow.session.')) {
+        simulatedIngressSink.mute = Boolean(muted);
+      }
+    },
+    async getDefaultOutputId() {
+      return simulatedDefaultSink;
+    },
+    async setDefaultOutput(sinkId) {
+      simulatedDefaultSink = String(sinkId);
+    }
+  };
+
+  const syncPipelineSession = {
+    async createBranch({ branchSinkId, physicalSinkId, onDisconnect }) {
+      return { branchSinkId, physicalSinkId, triggerDisconnect: onDisconnect };
+    },
+    async destroyBranch() {},
+    async destroy() {}
+  };
+
+  const syncPipelineAdapter = {
+    async createPipeline({ ingressSinkId }) {
+      simulatedIngressSink.name = ingressSinkId;
+      simulatedIngressSink.volume = {
+        'front-left': { value_percent: '100%' },
+        'front-right': { value_percent: '100%' }
+      };
+      simulatedIngressSink.mute = false;
+      return syncPipelineSession;
+    }
+  };
+
+  const syncEngineService = new SpeakerEngineService(syncMockBackend, syncPipelineAdapter);
+
+  let uiNotifiedValues = null;
+  syncEngineService.onMasterVolumeChanged = (data) => {
+    uiNotifiedValues = data;
+  };
+
+  await syncEngineService.startSession(10, ['physical_speaker_1', 'physical_speaker_2']);
+  assert.strictEqual(syncEngineService.session.branches.length, 2);
+
+  // Helper to compute final digital level reaching physical sink:
+  // Final Level = (Ingress Volume / 100) * (Branch Target Gain / 100)
+  function computeFinalDigitalLevel(engineService, sinkId, dynamicGain = 1.0) {
+    const ingressVol = simulatedIngressSink.mute ? 0 : parseInt(simulatedIngressSink.volume['front-left'].value_percent.replace('%', ''), 10);
+    const { targetPercent } = engineService.waveController.calculateBranchTargetGain(sinkId, dynamicGain);
+    const finalLevelPercent = Math.round((ingressVol / 100) * (targetPercent / 100) * 100);
+    return { targetPercent, finalLevelPercent };
+  }
+
+  // --- Case A ---
+  // Ingress master = 50%, Speaker 1 user gain = 100%, Dynamic gain = 1.0
+  // Expected branch target = 100%, Expected final digital level = 50%
+  console.log('Testing Case A: Ingress master=50%, Speaker 1=100%, Dyn=1.0 -> Target=100%, Final=50%...');
+  simulatedIngressSink.volume = { 'front-left': { value_percent: '50%' }, 'front-right': { value_percent: '50%' } };
+  await syncEngineService.setSpeakerVolume('physical_speaker_1', 100);
+  await syncEngineService.reconcileSession();
+  const caseA = computeFinalDigitalLevel(syncEngineService, 'physical_speaker_1', 1.0);
+  assert.strictEqual(caseA.targetPercent, 100, 'Case A: Branch target gain must be 100% (not multiplied by master)');
+  assert.strictEqual(caseA.finalLevelPercent, 50, 'Case A: Final digital level must be 50% (50% ingress × 100% branch)');
+  console.log('✓ Case A passed.');
+
+  // --- Case B ---
+  // Ingress master = 50%, Speaker 1 user gain = 80%, Dynamic gain = 1.0
+  // Expected branch target = 80%, Expected final digital level = 40%
+  console.log('Testing Case B: Ingress master=50%, Speaker 1=80%, Dyn=1.0 -> Target=80%, Final=40%...');
+  simulatedIngressSink.volume = { 'front-left': { value_percent: '50%' }, 'front-right': { value_percent: '50%' } };
+  await syncEngineService.setSpeakerVolume('physical_speaker_1', 80);
+  await syncEngineService.reconcileSession();
+  const caseB = computeFinalDigitalLevel(syncEngineService, 'physical_speaker_1', 1.0);
+  assert.strictEqual(caseB.targetPercent, 80, 'Case B: Branch target gain must be 80%');
+  assert.strictEqual(caseB.finalLevelPercent, 40, 'Case B: Final digital level must be 40% (50% ingress × 80% branch)');
+  console.log('✓ Case B passed.');
+
+  // --- Case C ---
+  // Ingress master = 20%, Speaker 1 user gain = 100%, Dynamic gain = 1.0
+  // Expected branch target = 100%, Expected final digital level = 20%
+  console.log('Testing Case C: Ingress master=20%, Speaker 1=100%, Dyn=1.0 -> Target=100%, Final=20%...');
+  simulatedIngressSink.volume = { 'front-left': { value_percent: '20%' }, 'front-right': { value_percent: '20%' } };
+  await syncEngineService.setSpeakerVolume('physical_speaker_1', 100);
+  await syncEngineService.reconcileSession();
+  const caseC = computeFinalDigitalLevel(syncEngineService, 'physical_speaker_1', 1.0);
+  assert.strictEqual(caseC.targetPercent, 100, 'Case C: Branch target gain must be 100%');
+  assert.strictEqual(caseC.finalLevelPercent, 20, 'Case C: Final digital level must be 20% (20% ingress × 100% branch)');
+  console.log('✓ Case C passed.');
+
+  // --- Case D ---
+  // Ingress master = 50%, Speaker 1 user gain = 80%, Dynamic gain = 0.5
+  // Expected branch target = 40%, Expected final digital level = 20%
+  console.log('Testing Case D: Ingress master=50%, Speaker 1=80%, Dyn=0.5 -> Target=40%, Final=20%...');
+  simulatedIngressSink.volume = { 'front-left': { value_percent: '50%' }, 'front-right': { value_percent: '50%' } };
+  await syncEngineService.setSpeakerVolume('physical_speaker_1', 80);
+  await syncEngineService.reconcileSession();
+  const caseD = computeFinalDigitalLevel(syncEngineService, 'physical_speaker_1', 0.5);
+  assert.strictEqual(caseD.targetPercent, 40, 'Case D: Branch target gain must be 40% (80% × 0.5)');
+  assert.strictEqual(caseD.finalLevelPercent, 20, 'Case D: Final digital level must be 20% (50% ingress × 40% branch)');
+  console.log('✓ Case D passed.');
+
+  // --- Case E ---
+  // External ingress volume change: 100% -> 60%
+  // Expected: waveController.masterVolume = 60, UI receives 60, branch target gains remain based only on speaker gain × dynamic gain
+  console.log('Testing Case E: External ingress volume change 100% -> 60%...');
+  simulatedIngressSink.volume = { 'front-left': { value_percent: '60%' }, 'front-right': { value_percent: '60%' } };
+  uiNotifiedValues = null;
+  await syncEngineService.reconcileSession();
+  const statusAfterE = await syncEngineService.getWaveStatus();
+  assert.strictEqual(statusAfterE.masterVolume, 60, 'Case E: waveController.masterVolume must be 60');
+  assert.deepStrictEqual(uiNotifiedValues, { masterVolume: 60, masterMuted: false }, 'Case E: UI must receive 60%');
+  const branchE = syncEngineService.waveController.calculateBranchTargetGain('physical_speaker_1', 1.0);
+  assert.strictEqual(branchE.targetPercent, 80, 'Case E: Branch target gain remains 80% based solely on speaker × dynamic');
+  console.log('✓ Case E passed.');
+
+  // --- Case F ---
+  // External ingress mute: false -> true
+  // Expected: waveController.masterMuted = true, UI reflects mute, branch target gains are NOT additionally master-muted
+  console.log('Testing Case F: External ingress mute false -> true...');
+  simulatedIngressSink.mute = true;
+  uiNotifiedValues = null;
+  await syncEngineService.reconcileSession();
+  const statusAfterF = await syncEngineService.getWaveStatus();
+  assert.strictEqual(statusAfterF.masterMuted, true, 'Case F: waveController.masterMuted must be true');
+  assert.deepStrictEqual(uiNotifiedValues, { masterVolume: 60, masterMuted: true }, 'Case F: UI must receive mute true');
+  const branchF = syncEngineService.waveController.calculateBranchTargetGain('physical_speaker_1', 1.0);
+  assert.strictEqual(branchF.targetPercent, 80, 'Case F: Branch target gain is NOT additionally zeroed because ingress handles master mute');
+  console.log('✓ Case F passed.');
+
+  // --- Case G ---
+  // Restore ingress to 100% / unmute
+  // Expected branch gains return to user/dynamic values without master multiplication
+  console.log('Testing Case G: Restore ingress to 100% / unmute...');
+  simulatedIngressSink.volume = { 'front-left': { value_percent: '100%' }, 'front-right': { value_percent: '100%' } };
+  simulatedIngressSink.mute = false;
+  uiNotifiedValues = null;
+  await syncEngineService.reconcileSession();
+  const statusAfterG = await syncEngineService.getWaveStatus();
+  assert.strictEqual(statusAfterG.masterVolume, 100);
+  assert.strictEqual(statusAfterG.masterMuted, false);
+  const branchG = syncEngineService.waveController.calculateBranchTargetGain('physical_speaker_1', 1.0);
+  assert.strictEqual(branchG.targetPercent, 80);
+  console.log('✓ Case G passed.');
+
+  // --- Case H ---
+  // Physical sink volume must remain untouched
+  console.log('Testing Case H: Physical sink volume remains untouched...');
+  assert.strictEqual(physicalSinkCalls.length, 0, 'Case H: Physical sink volume was never called');
+  console.log('✓ Case H passed.');
+
+  // Verify Idempotency & Session Stop
+  console.log('Testing Idempotency & Session Stop cleanup...');
+  let loopTriggerCount = 0;
+  syncEngineService.onMasterVolumeChanged = () => { loopTriggerCount++; };
+  await syncEngineService.reconcileSession();
+  assert.strictEqual(loopTriggerCount, 0, 'Reconcile when in sync is an idempotent no-op');
+
+  await syncEngineService.stopSession();
+  assert.strictEqual(syncEngineService.session, null);
+  simulatedIngressSink.volume = { 'front-left': { value_percent: '10%' }, 'front-right': { value_percent: '10%' } };
+  await syncEngineService.reconcileSession();
+  assert.strictEqual(loopTriggerCount, 0, 'No updates or callbacks after stopSession');
+  console.log('✓ Idempotency and Session Stop cleanup verified.');
 
   console.log('\n=== ALL UX IMPROVEMENTS TESTS PASSED WITH 100% SUCCESS! ===\n');
 }

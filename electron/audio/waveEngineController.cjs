@@ -75,13 +75,12 @@ class WaveEngineController {
   }
 
   calculateBranchTargetGain(sinkId, dynamicEngineGain = 1.0) {
-    const masterMult = this.masterMuted ? 0.0 : this.masterVolume / 100.0;
     const spkMuted = this.userSpeakerMuted.get(sinkId) ?? false;
     const spkVol = this.userSpeakerVolumes.get(sinkId) ?? 100;
     const spkMult = spkMuted ? 0.0 : spkVol / 100.0;
     const dynGain = typeof dynamicEngineGain === 'number' ? dynamicEngineGain : 1.0;
 
-    const targetGain = masterMult * spkMult * dynGain;
+    const targetGain = spkMult * dynGain;
     const targetPercent = Math.max(0, Math.min(100, Math.round(targetGain * 100)));
     return { targetGain, targetPercent };
   }

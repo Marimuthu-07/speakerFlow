@@ -227,8 +227,9 @@ function runUnitTests() {
   // Calculate target gain with preserved 65% master volume
   const targetA = controller.calculateBranchTargetGain('sink_A', 1.0);
   const targetB = controller.calculateBranchTargetGain('sink_B', 1.0);
-  assert.strictEqual(targetA.targetPercent, 65, 'Active branch A must receive stored master volume (65%)');
-  assert.strictEqual(targetB.targetPercent, 65, 'Active branch B must receive stored master volume (65%)');
+  assert.strictEqual(targetA.targetPercent, 100, 'Branch target gain is speaker × dynamic gain (100%)');
+  assert.strictEqual(targetB.targetPercent, 100, 'Branch target gain is speaker × dynamic gain (100%)');
+  assert.strictEqual(controller.masterVolume, 65, 'Stored master volume must remain 65% for ingress sink');
 
   // C. Transition to STOP State (Engine Stops)
   controller.branches.clear();
@@ -248,7 +249,8 @@ function runUnitTests() {
     });
   }
   const reTargetA = controller.calculateBranchTargetGain('sink_A', 1.0);
-  assert.strictEqual(reTargetA.targetPercent, 65, 'Re-started session must continue using preserved master volume (65%)');
+  assert.strictEqual(reTargetA.targetPercent, 100, 'Re-started session branch target remains 100%');
+  assert.strictEqual(controller.masterVolume, 65, 'Re-started session preserves master volume (65%)');
   console.log('✓ Master Output lifecycle and state preservation verified (IDLE → ACTIVE → STOP → RE-START).');
 
   console.log('\n=== ALL PURE UNIT TESTS PASSED WITH 100% SUCCESS! ===\n');

@@ -38,6 +38,14 @@ class AudioBackend {
   async listSinkInputs() {
     throw new Error('Sink-input discovery is not implemented for this platform.');
   }
+
+  async getDefaultOutputId() {
+    throw new Error('Default audio output discovery is not implemented for this platform.');
+  }
+
+  async setDefaultOutput() {
+    throw new Error('Default audio output control is not implemented for this platform.');
+  }
 }
 
 module.exports = { AudioBackend };

@@ -9,6 +9,11 @@ let mainWindow;
 const audioBackend = createAudioBackend();
 const streamRoutingService = new StreamRoutingService(audioBackend);
 const speakerEngineService = new SpeakerEngineService(audioBackend);
+speakerEngineService.onMasterVolumeChanged = (data) => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('audio:master-volume-updated', data);
+  }
+};
 const systemPowerService = createSystemPowerService();
 
 async function adjustMasterVolume(delta) {

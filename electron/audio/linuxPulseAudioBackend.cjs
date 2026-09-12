@@ -145,6 +145,14 @@ class LinuxPulseAudioBackend extends AudioBackend {
     }
   }
 
+  async setDefaultOutput(sinkId) {
+    try {
+      await execFileAsync('pactl', ['set-default-sink', String(sinkId)]);
+    } catch (error) {
+      throw new Error(`Unable to set default output device to ${sinkId}: ${readableError(error)}`);
+    }
+  }
+
   async listOutputDevicesWithStatus() {
     const [devices, defaultOutputId] = await Promise.all([
       this.listOutputDevices(),
