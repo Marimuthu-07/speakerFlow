@@ -118,3 +118,4 @@ config.local.*
 # Local development data
 # ==============================
 scratch/
+release/
