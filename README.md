@@ -222,4 +222,38 @@ Phase 8 introduces a higher-level motion orchestration layer that makes a single
 - **Safe Dynamic Topology**: $N=0$ and $N=1$ topologies are safely handled across every mode without throwing or freezing. Hot-unplug, disconnect, and reconnect dynamically adjust the motion sequence while strictly preserving user volume, mute state, and spatial coordinates.
 - **Zero Invariant Violations**: Leaves `all_speakers`, WirePlumber, persistent PipeWire configurations, and system default sinks completely untouched.
 
+## Linux Support
 
+SpeakerFlow currently targets Linux systems using PipeWire with WirePlumber
+and the PulseAudio compatibility interface.
+
+### Tested
+
+- Arch Linux
+- PipeWire
+- WirePlumber
+- ALSA analog audio output
+- Bluetooth audio through BlueZ
+- Multiple Bluetooth audio outputs
+- Bluetooth + analog/AUX output simultaneously
+- Dynamic output connection and disconnection
+- Dynamic engine branch recovery
+- Multiple simultaneous playback streams
+
+### Linux audio requirements
+
+SpeakerFlow requires:
+
+- PipeWire
+- WirePlumber
+- PulseAudio compatibility (`pactl`)
+- BlueZ and a working Bluetooth adapter for Bluetooth audio
+
+### Compatibility note
+
+SpeakerFlow has been tested successfully on the configuration listed above.
+Linux audio behavior can vary between distributions, PipeWire/WirePlumber
+versions, hardware, Bluetooth adapters, and audio devices.
+
+The tested configurations should not be interpreted as a guarantee that every
+Linux distribution or audio device is supported.
