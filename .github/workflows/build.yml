@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        include:
+          - os: ubuntu-24.04
+            package: true
+          - os: ubuntu-22.04
+            package: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            python3 \
+            libpipewire-0.3-0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build native addon
+        run: npm run build:native
+
+      - name: Verify native addon compilation
+        run: |
+          test -f build/Release/speakerflow_pipewire.node
+          ldd build/Release/speakerflow_pipewire.node
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Build frontend & bundle
+        run: npm run build
+
+      - name: Package Linux .deb
+        if: matrix.package == true
+        run: npm run dist
+
+      - name: Verify .deb package
+        if: matrix.package == true
+        run: |
+          ls -lh release/*.deb
+          dpkg-deb -I release/*.deb
+          dpkg-deb -c release/*.deb | grep speakerflow_pipewire.node
