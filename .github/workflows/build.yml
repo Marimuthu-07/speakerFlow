@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install native build prerequisites
         run: |
@@ -38,7 +38,7 @@ jobs:
             libpipewire-0.3-0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: 'npm'
@@ -70,3 +70,11 @@ jobs:
           ls -lh release/*.deb
           dpkg-deb -I release/*.deb
           dpkg-deb -c release/*.deb | grep speakerflow_pipewire.node
+
+      - name: Upload Linux .deb
+        if: matrix.package == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: speakerflow-deb
+          path: release/*.deb
+          if-no-files-found: error
