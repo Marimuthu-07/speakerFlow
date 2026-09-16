@@ -10,7 +10,7 @@ const {
   calculateShuffleGains,
   calculatePathPosition,
   calculateSpatialPathGains
-} = require('/home/mari/Projects/speakerFlow/electron/audio/motionEngine.cjs');
+} = require('../electron/audio/motionEngine.cjs');
 
 function runUnitTests() {
   console.log('=== Running Motion Engine Pure Unit Test Suite ===\n');
