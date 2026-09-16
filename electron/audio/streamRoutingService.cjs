@@ -129,16 +129,21 @@ class StreamRoutingService {
     await this.verifySink(stream.id, targetSink.id, targetSink.name);
   }
 
-  async verifySink(streamId, expectedSinkId, expectedSinkName) {
-    const streams = await this.audioBackend.listApplicationStreams();
-    const stream = streams.find((item) => item.id === Number(streamId));
+  async verifySink(streamId, expectedSinkId, expectedSinkName, timeoutMs = 1500) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const streams = await this.audioBackend.listApplicationStreams();
+      const stream = streams.find((item) => item.id === Number(streamId));
 
-    if (!stream) {
-      throw new Error('The application stream disappeared before routing could be verified.');
+      if (!stream) {
+        throw new Error('The application stream disappeared before routing could be verified.');
+      }
+      if (stream.currentSinkId === expectedSinkId) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    if (stream.currentSinkId !== expectedSinkId) {
-      throw new Error(`Routing verification failed: the stream is not on ${expectedSinkName}.`);
-    }
+    throw new Error(`Routing verification failed: the stream is not on ${expectedSinkName}.`);
   }
 
   reconcileRoutedStreams(streamsById, aggregateSink) {

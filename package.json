@@ -6,7 +6,8 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:127.0.0.1:5173 && SPEAKERFLOW_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
-    "build": "vite build",
+    "build:native": "node-gyp rebuild",
+    "build": "npm run build:native && vite build",
     "test": "node scratch/test_motion_engine_unit.cjs",
     "start": "electron .",
     "preview": "vite preview",
@@ -22,6 +23,7 @@
     "concurrently": "10.0.5",
     "electron": "44.3.0",
     "electron-builder": "^26.15.3",
+    "node-gyp": "^12.4.0",
     "wait-on": "9.1.0"
   },
   "build": {
@@ -30,15 +32,37 @@
     "directories": {
       "output": "release"
     },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "build/Release/speakerflow_pipewire.node",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "build/Release/speakerflow_pipewire.node"
+    ],
     "linux": {
       "category": "AudioVideo",
       "target": [
-        "AppImage",
         "deb"
       ],
       "executableName": "speakerflow",
       "syncDesktopName": true,
       "icon": "assets/icons"
+    },
+    "deb": {
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0",
+        "libuuid1",
+        "libsecret-1-0",
+        "libpipewire-0.3-0"
+      ]
     }
   },
   "author": {

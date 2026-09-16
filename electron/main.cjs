@@ -260,12 +260,14 @@ app.on('before-quit', () => {
   audioBackend.stopMonitoring();
   systemPowerService.stopMonitoring();
   speakerEngineService.stopSession().catch(() => {});
+  audioBackend.destroy();
 });
 
 app.on('will-quit', () => {
   unregisterMediaShortcuts();
   audioBackend.stopMonitoring();
   systemPowerService.stopMonitoring();
+  audioBackend.destroy();
 });
 
 app.on('window-all-closed', () => {
@@ -273,5 +275,6 @@ app.on('window-all-closed', () => {
   audioBackend.stopMonitoring();
   systemPowerService.stopMonitoring();
   speakerEngineService.stopSession().catch(() => {});
+  audioBackend.destroy();
   if (process.platform !== 'darwin') app.quit();
 });

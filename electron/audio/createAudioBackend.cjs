@@ -1,9 +1,9 @@
-const { LinuxPulseAudioBackend } = require('./linuxPulseAudioBackend.cjs');
+const { LinuxPipeWireAudioBackend } = require('./linuxPipeWireAudioBackend.cjs');
 const { LinuxPipeWirePipelineAdapter } = require('./linuxPipeWirePipelineAdapter.cjs');
 
 function createAudioBackend(platform = process.platform) {
   if (platform === 'linux') {
-    return new LinuxPulseAudioBackend();
+    return new LinuxPipeWireAudioBackend();
   }
 
   throw new Error(`SpeakerFlow does not yet support audio discovery on ${platform}.`);

@@ -49,9 +49,19 @@ class AudioBackend extends EventEmitter {
     throw new Error('Default audio output control is not implemented for this platform.');
   }
 
+  loadModule() {
+    throw new Error('Module loading is not implemented for this platform.');
+  }
+
+  unloadModule() {
+    throw new Error('Module unloading is not implemented for this platform.');
+  }
+
   startMonitoring() {}
 
   stopMonitoring() {}
+
+  destroy() {}
 }
 
 module.exports = { AudioBackend };
