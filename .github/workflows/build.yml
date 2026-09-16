@@ -62,7 +62,7 @@ jobs:
 
       - name: Package Linux .deb
         if: matrix.package == true
-        run: npm run dist
+        run: npm run dist -- --publish never
 
       - name: Verify .deb package
         if: matrix.package == true
