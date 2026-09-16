@@ -191,7 +191,7 @@ function runUnitTests() {
 
   // 8. Master Output Lifecycle & State Preservation Regression Test
   console.log('\n8. Testing Master Output Lifecycle & State Preservation (IDLE → ACTIVE → STOP)...');
-  const { WaveEngineController } = require('/home/mari/Projects/speakerFlow/electron/audio/waveEngineController.cjs');
+  const { WaveEngineController } = require('../electron/audio/waveEngineController.cjs');
   const mockAudioBackend = {
     runPactlJson: async () => []
   };
