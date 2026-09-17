@@ -36,7 +36,8 @@
       "dist/**/*",
       "electron/**/*",
       "build/Release/speakerflow_pipewire.node",
-      "package.json"
+      "package.json",
+      "LICENSE"
     ],
     "asarUnpack": [
       "build/Release/speakerflow_pipewire.node"
