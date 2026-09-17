@@ -1,15 +1,15 @@
 # SpeakerFlow
 
-SpeakerFlow is an Electron desktop app for discovering PipeWire/PulseAudio output devices on Linux and selecting multiple outputs in one place. It refreshes device and application-stream state every five seconds and also offers a manual refresh control.
+SpeakerFlow is a Linux desktop audio output manager built with Electron and React for discovering PipeWire output devices and selecting multiple outputs in one place. It monitors PipeWire device, stream, and default-output changes through native PipeWire events.
 
 ## Run locally
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
-`npm run dev` starts Vite and opens Electron. The application reads real sink data using `pactl --format=json list sinks`; it does not create, remove, reroute, or otherwise modify PipeWire/PulseAudio configuration.
+`npm run dev` starts Vite and opens Electron. The audio engine reads real PipeWire sink and stream data directly through its native Node-API addon (`libpipewire-0.3`); it does not create, remove, reroute, or otherwise modify persistent PipeWire configuration.
 
 ## Build
 
@@ -24,11 +24,36 @@ This writes the renderer bundle to `dist/`. To open the built app, run `npm run 
 - `src/`: React/Vite renderer.
 - `electron/main.cjs`: Electron desktop shell and IPC registration.
 - `electron/preload.cjs`: minimal renderer API surface.
-- `electron/audio/`: platform audio backend abstraction; Linux uses PulseAudio-compatible PipeWire through `pactl`.
+- `electron/audio/`: platform audio backend abstraction (`LinuxPipeWireAudioBackend`), pipeline adapter, and motion controllers communicating directly with PipeWire via the native addon.
+- `native/`: Node-API C addon (`native/pipewire_binding.c`) compiling against `libpipewire-0.3` and `libspa-0.2`.
+
+### Audio Engine Architecture
+
+```text
+Electron main process
+        ↓
+LinuxPipeWireAudioBackend
+        ↓
+Node-API native addon (`speakerflow_pipewire.node`)
+        ↓
+libpipewire-0.3 / libspa
+        ↓
+PipeWire / WirePlumber
+```
+
+The native addon interfaces directly with PipeWire to provide:
+- `listSinks` & `listSinkInputs` (device and application stream discovery)
+- `getDefaultSink` & `setDefaultSink` (default audio output management)
+- `moveSinkInput` (direct stream routing)
+- `setNodeVolume` & `setNodeMute` (hardware & stream volume/mute control)
+- `loadModule` & `unloadModule` (in-process loopback pipeline creation)
+- Native PipeWire event callbacks (real-time device, stream, and default sink updates)
+
+The audio engine operates entirely in-process via `libpipewire-0.3` without depending on external audio CLI utilities (such as `pactl`, `pw-cli`, `pw-dump`, `pw-metadata`, or `pw-loopback`).
 
 `Connect All` intentionally selects every detected output in the user interface. It does not alter the system audio graph.
 
-`Route to All Speakers` moves a selected application stream to the already-existing `all_speakers` PipeWire sink using `pactl move-sink-input`. SpeakerFlow records the original sink in memory and can restore it with `Restore Original Output`. It never creates, unloads, edits, or makes the group the system default. The aggregate's configured members remain owned by PipeWire; individual UI output selection does not change them.
+`Route to All Speakers` moves a selected application stream to the already-existing `all_speakers` PipeWire sink using native stream routing (`moveSinkInput`). SpeakerFlow records the original sink in memory and can restore it with `Restore Original Output`. It does not modify, unload, or recreate the existing `all_speakers` configuration, and it does not make the group the system default. The aggregate's configured members remain owned by PipeWire; individual UI output selection does not change them.
 
 ## Multi-Speaker Engine prototype (Phase 4)
 
@@ -45,22 +70,22 @@ SpeakerFlow temporary tap (`Audio/Source`)
         ↓
  ┌──────────────┬──────────────┬──────────────┐
  ↓              ↓              ↓
-Branch 1       Branch 2       Branch 3 (`pw-loopback`)
+Branch 1       Branch 2       Branch 3 (`libpipewire-module-loopback`)
  ↓              ↓              ↓
 Physical 1     Physical 2     Physical 3
 ```
 
 - Exactly one temporary ingress virtual sink and one temporary tap virtual source per session.
-- Independent temporary `pw-loopback` branches per selected physical output sink.
+- Independent temporary loopback branches (`libpipewire-module-loopback`) loaded per selected physical output sink.
 - Per-branch error and disconnect isolation (hot-unplugging one speaker disables only that branch while keeping remaining branches, ingress, and tap alive).
-- All temporary processes and PipeWire nodes are cleanly destroyed when the session stops, and the application stream is safely restored to its original output.
+- All temporary PipeWire modules and nodes are cleanly destroyed when the session stops, and the application stream is safely restored to its original output.
 
 ## Spatial Wave Engine (Phase 6)
 
 The Spatial Wave Engine expands the wave controller into a configurable spatial movement engine supporting four distinct movement patterns with independent runtime branch gain crossfading:
 
 ```text
-WaveEngineController (30 Hz Coalesced Scheduler, Telemetry, pactl volume manager)
+WaveEngineController (30 Hz Coalesced Scheduler, Telemetry, Native Volume Dispatcher)
             ↓
 WavePattern Engine (`electron/audio/wavePatterns.cjs`)
     ├── CircularPattern ($A \to B \to C \to D \to A$)
@@ -97,7 +122,7 @@ WavePattern Engine (`electron/audio/wavePatterns.cjs`)
   $$\text{finalGain} = (1 - \text{intensity}) \times 1.0 + \text{intensity} \times \text{patternGain}$$
 - At $0\%$: all speakers receive equal gain ($100\%$).
 - At $100\%$: maximum pattern contrast and isolation.
-- Continuous session clock and non-blocking in-flight coalescing ensure smooth, click-free audio transitions without subprocess queue buildup.
+- Continuous session clock and non-blocking in-flight coalescing ensure smooth, click-free audio transitions without queue buildup.
 - Real-time PipeWire telemetry and branch gain meters provide authoritative visualization driven by the backend audio clock.
 
 ## True Spatial Audio Engine (Phase 7)
@@ -118,7 +143,7 @@ Pattern Wave Mode (Phase 6)     Spatial Position Mode (Phase 7)
                WaveEngineController
              (30 Hz Coalesced Loop)
                           ↓
-            pactl set-sink-input-volume
+             Native setNodeVolume
 ```
 
 ### Coordinate System & Acoustic Models
@@ -148,13 +173,13 @@ Pattern Wave Mode (Phase 6)     Spatial Position Mode (Phase 7)
 Phase 7.1 adds a multi-tier mixer and routing control layer modeled after `pavucontrol`:
 
 ```text
-Application Stream Volume (pactl set-sink-input-volume)
+Application Stream Volume (Native setNodeVolume)
                  │
                  ▼
       SpeakerFlow Engine Session Ingress
                  │
                  ▼
-       SpeakerFlow Engine Session Tap
+        SpeakerFlow Engine Session Tap
                  │
   ┌──────────────┼──────────────┐
   │              │              │
@@ -164,7 +189,7 @@ Branch 1       Branch 2       Branch 3
 targetGain = masterGain × userSpeakerGain × dynamicEngineGain
   │
   ▼
-pactl set-sink-input-volume <branch.sinkInputId> <targetPercent>%
+Native setNodeVolume <branch.sinkInputId> <targetPercent>%
 ```
 
 ### Mixer & Gain Rules
@@ -172,7 +197,7 @@ pactl set-sink-input-volume <branch.sinkInputId> <targetPercent>%
 - **Independent Multipliers**:
   $$\text{effectiveGain} = \begin{cases} 0, & \text{if } masterMuted \lor speakerMuted \\ masterGain \times userSpeakerGain \times dynamicEngineGain, & \text{otherwise} \end{cases}$$
 - **Mute & Unmute**: Muting zeroes the effective branch gain immediately while strictly preserving the slider value. Unmuting restores the exact previous volume.
-- **Branch Disconnect / Reconnect**: Disconnecting an output terminates only its `pw-loopback` process without interrupting playback on remaining branches. Reconnecting an output restores its stable identity, 2D coordinates, user volume, and mute state.
+- **Branch Disconnect / Reconnect**: Disconnecting an output unloads only its loopback module (`libpipewire-module-loopback`) without interrupting playback on remaining branches. Reconnecting an output restores its stable identity, 2D coordinates, user volume, and mute state.
 - **Application Output Routing**: Application stream dropdown enables routing streams directly to SpeakerFlow Ingress, `all_speakers`, or physical sinks.
 - **Safety Invariant**: Persistent PipeWire configurations, WirePlumber, `all_speakers`, and the system default sink remain untouched.
 
@@ -197,7 +222,7 @@ Phase 8 introduces a higher-level motion orchestration layer that makes a single
                          WaveEngineController
                         (30 Hz Coalesced Loop)
                                     ↓
-                   pactl set-sink-input-volume (pw-loopback)
+             Native setNodeVolume (libpipewire-module-loopback)
 ```
 
 ### Motion Modes
@@ -224,8 +249,7 @@ Phase 8 introduces a higher-level motion orchestration layer that makes a single
 
 ## Linux Support
 
-SpeakerFlow currently targets Linux systems using PipeWire with WirePlumber
-and the PulseAudio compatibility interface.
+SpeakerFlow targets Linux desktop systems running PipeWire with WirePlumber.
 
 ### Tested
 
@@ -244,9 +268,8 @@ and the PulseAudio compatibility interface.
 
 SpeakerFlow requires:
 
-- PipeWire
+- PipeWire (>= 0.3) with `libpipewire-0.3`
 - WirePlumber
-- PulseAudio compatibility (`pactl`)
 - BlueZ and a working Bluetooth adapter for Bluetooth audio
 
 ### Compatibility note
