@@ -69,5 +69,6 @@
     "name": "Marimuthu",
     "email": "amarimuthu5898@gmail.com"
   },
-  "desktopName": "speakerflow"
+  "desktopName": "speakerflow",
+  "license": "MIT"
 }

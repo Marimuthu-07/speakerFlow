@@ -280,3 +280,7 @@ versions, hardware, Bluetooth adapters, and audio devices.
 
 The tested configurations should not be interpreted as a guarantee that every
 Linux distribution or audio device is supported.
+
+## License
+
+SpeakerFlow is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
