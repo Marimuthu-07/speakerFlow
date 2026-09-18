@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:127.0.0.1:5173 && SPEAKERFLOW_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build:native": "node-gyp rebuild",
+    "build:native:electron": "node-gyp rebuild --target=44.3.0 --dist-url=https://electronjs.org/headers",
+    "rebuild": "electron-rebuild",
     "build": "npm run build:native && vite build",
     "test": "node scratch/test_motion_engine_unit.cjs",
     "start": "electron .",
@@ -20,6 +22,7 @@
     "vite": "8.3.0"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
     "concurrently": "10.0.5",
     "electron": "44.3.0",
     "electron-builder": "^26.15.3",
