@@ -45,14 +45,76 @@ class WindowsCoreAudioBackend extends AudioBackend {
       this._native.init();
     }
     this._monitoringActive = false;
+    this._debounceTimer = null;
+    this._pendingEvents = { devices: false, streams: false, defaultSink: false };
   }
 
   startMonitoring() {
+    if (this._monitoringActive) return;
     this._monitoringActive = true;
+
+    if (this._native && typeof this._native.startMonitoring === 'function') {
+      try {
+        this._native.startMonitoring((event) => this._handleNativeEvent(event));
+      } catch (err) {
+        console.error('Failed to start Windows Core Audio monitoring:', err);
+      }
+    }
+  }
+
+  _handleNativeEvent(event) {
+    if (!this._monitoringActive) return;
+    if (!event || !event.type) return;
+
+    if (event.type === 'default-device-changed') {
+      this._pendingEvents.defaultSink = true;
+    } else if (
+      event.type === 'device-added' ||
+      event.type === 'device-removed' ||
+      event.type === 'device-state-changed'
+    ) {
+      this._pendingEvents.devices = true;
+    } else if (
+      event.type === 'session-created' ||
+      event.type === 'session-state-changed' ||
+      event.type === 'session-disconnected' ||
+      event.type === 'session-volume-changed'
+    ) {
+      this._pendingEvents.streams = true;
+    }
+
+    if (this._debounceTimer) clearTimeout(this._debounceTimer);
+    this._debounceTimer = setTimeout(() => this._flushEvents(), 60);
+  }
+
+  _flushEvents() {
+    if (this._pendingEvents.devices) {
+      this.emit('devices-changed');
+    }
+    if (this._pendingEvents.streams) {
+      this.emit('streams-changed');
+    }
+    if (this._pendingEvents.defaultSink) {
+      this.emit('default-sink-changed');
+    }
+    this._pendingEvents = { devices: false, streams: false, defaultSink: false };
   }
 
   stopMonitoring() {
     this._monitoringActive = false;
+    if (this._debounceTimer) {
+      clearTimeout(this._debounceTimer);
+      this._debounceTimer = null;
+    }
+    this._pendingEvents = { devices: false, streams: false, defaultSink: false };
+
+    if (this._native && typeof this._native.stopMonitoring === 'function') {
+      try {
+        this._native.stopMonitoring();
+      } catch (err) {
+        console.error('Failed to stop Windows Core Audio monitoring:', err);
+      }
+    }
   }
 
   destroy() {
@@ -152,32 +214,62 @@ class WindowsCoreAudioBackend extends AudioBackend {
       : null;
   }
 
+  async setStreamVolume(streamId, volumePercent) {
+    if (!this._native || typeof this._native.setSessionVolume !== 'function') {
+      throw new Error('Windows Core Audio backend is not initialized.');
+    }
+    if (streamId === undefined || streamId === null) {
+      throw new Error('streamId is required for setStreamVolume');
+    }
+    const clamped = Math.max(0, Math.min(100, Math.round(Number(volumePercent) || 0)));
+    return this._native.setSessionVolume(String(streamId), clamped);
+  }
+
+  async setStreamMute(streamId, muted) {
+    if (!this._native || typeof this._native.setSessionMute !== 'function') {
+      throw new Error('Windows Core Audio backend is not initialized.');
+    }
+    if (streamId === undefined || streamId === null) {
+      throw new Error('streamId is required for setStreamMute');
+    }
+    return this._native.setSessionMute(String(streamId), Boolean(muted));
+  }
+
+  async setSinkVolume(sinkName, volumePercent) {
+    if (!this._native || typeof this._native.setEndpointVolume !== 'function') {
+      throw new Error('Windows Core Audio backend is not initialized.');
+    }
+    if (!sinkName) {
+      throw new Error('sinkName is required for setSinkVolume');
+    }
+    const sink = await this.findSinkByName(sinkName);
+    const deviceId = sink ? sink.id : String(sinkName);
+    const clamped = Math.max(0, Math.min(100, Math.round(Number(volumePercent) || 0)));
+    return this._native.setEndpointVolume(deviceId, clamped);
+  }
+
+  async setSinkMute(sinkName, muted) {
+    if (!this._native || typeof this._native.setEndpointMute !== 'function') {
+      throw new Error('Windows Core Audio backend is not initialized.');
+    }
+    if (!sinkName) {
+      throw new Error('sinkName is required for setSinkMute');
+    }
+    const sink = await this.findSinkByName(sinkName);
+    const deviceId = sink ? sink.id : String(sinkName);
+    return this._native.setEndpointMute(deviceId, Boolean(muted));
+  }
+
+  async setSinkInputVolume(sinkInputId, volumePercent) {
+    return this.setStreamVolume(sinkInputId, volumePercent);
+  }
+
   async moveSinkInput(_streamId, _sinkName) {
     throw new Error('Windows Core Audio routing is not implemented yet.');
   }
 
   async setDefaultOutput(_sinkId) {
     throw new Error('Default audio output control is not implemented yet on Windows.');
-  }
-
-  async setStreamVolume(_streamId, _volumePercent) {
-    throw new Error('Stream volume control is not implemented yet on Windows.');
-  }
-
-  async setStreamMute(_streamId, _muted) {
-    throw new Error('Stream mute control is not implemented yet on Windows.');
-  }
-
-  async setSinkVolume(_sinkName, _volumePercent) {
-    throw new Error('Sink volume control is not implemented yet on Windows.');
-  }
-
-  async setSinkMute(_sinkName, _muted) {
-    throw new Error('Sink mute control is not implemented yet on Windows.');
-  }
-
-  async setSinkInputVolume(_sinkInputId, _volumePercent) {
-    throw new Error('Sink-input volume control is not implemented yet on Windows.');
   }
 
   async listSinkInputs() {
