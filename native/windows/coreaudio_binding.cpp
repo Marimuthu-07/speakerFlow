@@ -476,6 +476,13 @@ private:
     LONG m_cRef;
     std::wstring m_sessionId;
     std::wstring m_deviceId;
+
+    // Per-session volume and mute state tracking for duplicate event suppression
+    std::mutex m_stateMutex;
+    bool m_hasLastState = false;
+    int m_lastVolume = -1;
+    bool m_lastMute = false;
+
 public:
     SessionEventsClient(const std::wstring& sessionId, const std::wstring& deviceId)
         : m_cRef(1), m_sessionId(sessionId), m_deviceId(deviceId) {}
@@ -511,13 +518,35 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE OnSimpleVolumeChanged(float NewVolume, BOOL NewMute, LPCGUID EventContext) override {
-        CoreAudioEventPayload payload;
-        payload.type = "session-volume-changed";
-        payload.sessionId = WideToUtf8(m_sessionId.c_str());
-        payload.deviceId = WideToUtf8(m_deviceId.c_str());
-        payload.volumePercent = (int)std::round(NewVolume * 100.0f);
-        payload.mute = (NewMute != FALSE);
-        DispatchEvent(payload);
+        int volumePercent = (int)std::round(NewVolume * 100.0f);
+        bool mute = (NewMute != FALSE);
+
+        bool shouldEmit = false;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            if (!m_hasLastState) {
+                m_hasLastState = true;
+                m_lastVolume = volumePercent;
+                m_lastMute = mute;
+                shouldEmit = true;
+            } else if (m_lastVolume != volumePercent || m_lastMute != mute) {
+                m_lastVolume = volumePercent;
+                m_lastMute = mute;
+                shouldEmit = true;
+            } else {
+                shouldEmit = false;
+            }
+        }
+
+        if (shouldEmit) {
+            CoreAudioEventPayload payload;
+            payload.type = "session-volume-changed";
+            payload.sessionId = WideToUtf8(m_sessionId.c_str());
+            payload.deviceId = WideToUtf8(m_deviceId.c_str());
+            payload.volumePercent = volumePercent;
+            payload.mute = mute;
+            DispatchEvent(payload);
+        }
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE OnChannelVolumeChanged(DWORD ChannelCount, float NewChannelVolumeArray[], DWORD ChangedChannel, LPCGUID EventContext) override {
@@ -617,17 +646,30 @@ public:
 
             for (auto& ep : g_monitoredEndpoints) {
                 if (ep.deviceId == m_deviceId) {
-                    SessionEventsClient* pEvents = new SessionEventsClient(sessionId, m_deviceId);
-                    if (SUCCEEDED(NewSession->RegisterAudioSessionNotification(pEvents))) {
-                        MonitoredSession sess;
-                        sess.sessionId = sessionId;
-                        sess.pControl = NewSession;
-                        sess.pControl->AddRef();
-                        sess.pEventsClient = pEvents;
-                        ep.sessions.push_back(sess);
-                    } else {
-                        pEvents->Release();
+                    bool alreadyRegistered = false;
+
+                    for (const auto& existing : ep.sessions) {
+                        if (existing.sessionId == sessionId) {
+                        alreadyRegistered = true;
+                        break;
+                        }
                     }
+
+                    if (!alreadyRegistered) {
+                        SessionEventsClient* pEvents = new SessionEventsClient(sessionId, m_deviceId);
+                        HRESULT hrReg = NewSession->RegisterAudioSessionNotification(pEvents);
+                        if (SUCCEEDED(hrReg)) {
+                            MonitoredSession sess;
+                            sess.sessionId = sessionId;
+                            sess.pControl = NewSession;
+                            sess.pControl->AddRef();
+                            sess.pEventsClient = pEvents;
+                            ep.sessions.push_back(sess);
+                        } else {
+                            pEvents->Release();
+                        }
+                    }
+
                     break;
                 }
             }
@@ -694,16 +736,28 @@ static void RegisterEndpointMonitoring(IMMDevice* pDevice, const std::wstring& d
                                 sessionId = deviceId + L":" + std::to_wstring(pid) + L":" + std::to_wstring(s);
                             }
 
-                            SessionEventsClient* pEvents = new SessionEventsClient(sessionId, deviceId);
-                            if (SUCCEEDED(pCtrl->RegisterAudioSessionNotification(pEvents))) {
-                                MonitoredSession sess;
-                                sess.sessionId = sessionId;
-                                sess.pControl = pCtrl;
-                                sess.pControl->AddRef();
-                                sess.pEventsClient = pEvents;
-                                ep.sessions.push_back(sess);
-                            } else {
-                                pEvents->Release();
+                            bool alreadyRegistered = false;
+
+                            for (const auto& existing : ep.sessions) {
+                                if (existing.sessionId == sessionId) {
+                                    alreadyRegistered = true;
+                                    break;
+                                }
+                            }
+
+                            if (!alreadyRegistered) {
+                                SessionEventsClient* pEvents = new SessionEventsClient(sessionId, deviceId);
+                                HRESULT hrReg = pCtrl->RegisterAudioSessionNotification(pEvents);
+                                if (SUCCEEDED(hrReg)) {
+                                    MonitoredSession sess;
+                                    sess.sessionId = sessionId;
+                                    sess.pControl = pCtrl;
+                                    sess.pControl->AddRef();
+                                    sess.pEventsClient = pEvents;
+                                    ep.sessions.push_back(sess);
+                                } else {
+                                    pEvents->Release();
+                                }
                             }
                         }
                     }
