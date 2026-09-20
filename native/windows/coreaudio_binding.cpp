@@ -9,6 +9,8 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <psapi.h>
 #include <node_api.h>
+#include "wasapi_capture_client.h"
+#include "wasapi_render_client.h"
 
 #include <string>
 #include <vector>
@@ -17,8 +19,13 @@
 #include <cmath>
 #include <sstream>
 #include <iomanip>
+#include <memory>
 
 static bool g_com_initialized_by_us = false;
+static std::unique_ptr<speakerflow::WasapiCaptureClient> g_captureClient;
+static std::mutex g_captureMutex;
+static std::unique_ptr<speakerflow::WasapiRenderClient> g_renderClient;
+static std::mutex g_renderMutex;
 
 static std::string WideToUtf8(const wchar_t* wstr) {
     if (!wstr || !*wstr) return "";
@@ -1053,6 +1060,22 @@ static napi_value Method_Init(napi_env env, napi_callback_info info) {
 }
 
 static napi_value Method_Destroy(napi_env env, napi_callback_info info) {
+    {
+        std::lock_guard<std::mutex> lock(g_renderMutex);
+        if (g_renderClient) {
+            g_renderClient->StopRender();
+            g_renderClient.reset();
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_captureMutex);
+        if (g_captureClient) {
+            g_captureClient->StopCapture();
+            g_captureClient.reset();
+        }
+    }
+
     StopAllMonitoringInternal();
 
     if (g_com_initialized_by_us) {
@@ -1686,6 +1709,350 @@ static napi_value Method_StopMonitoring(napi_env env, napi_callback_info info) {
     return result;
 }
 
+// -----------------------------------------------------------------------------
+// WASAPI Loopback Capture Node-API Methods
+// -----------------------------------------------------------------------------
+
+static napi_value Method_CaptureStart(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    std::wstring deviceId;
+    if (argc > 0 && args[0] != nullptr) {
+        napi_valuetype argType;
+        napi_typeof(env, args[0], &argType);
+        if (argType == napi_string) {
+            deviceId = GetWideStringFromNapi(env, args[0]);
+        } else if (argType == napi_object) {
+            napi_value devIdVal;
+            if (napi_get_named_property(env, args[0], "deviceId", &devIdVal) == napi_ok) {
+                napi_valuetype propType;
+                napi_typeof(env, devIdVal, &propType);
+                if (propType == napi_string) {
+                    deviceId = GetWideStringFromNapi(env, devIdVal);
+                }
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_captureMutex);
+    if (!g_captureClient) {
+        g_captureClient = std::make_unique<speakerflow::WasapiCaptureClient>();
+    }
+
+    std::string error;
+    bool success = g_captureClient->StartCapture(deviceId, error);
+    if (!success) {
+        napi_throw_error(env, NULL, error.c_str());
+        return NULL;
+    }
+
+    speakerflow::WasapiCaptureStats stats = g_captureClient->GetStats();
+
+    napi_value resObj;
+    napi_create_object(env, &resObj);
+
+    napi_value boolVal;
+    napi_get_boolean(env, true, &boolVal);
+    napi_set_named_property(env, resObj, "success", boolVal);
+
+    napi_value srVal, chVal, bpsVal;
+    napi_create_uint32(env, stats.sampleRate, &srVal);
+    napi_create_uint32(env, stats.channels, &chVal);
+    napi_create_uint32(env, stats.bitsPerSample, &bpsVal);
+    napi_set_named_property(env, resObj, "sampleRate", srVal);
+    napi_set_named_property(env, resObj, "channels", chVal);
+    napi_set_named_property(env, resObj, "bitsPerSample", bpsVal);
+
+    napi_value fmtVal, nameVal;
+    napi_create_string_utf8(env, stats.formatTag.c_str(), NAPI_AUTO_LENGTH, &fmtVal);
+    napi_create_string_utf8(env, stats.deviceFriendlyName.c_str(), NAPI_AUTO_LENGTH, &nameVal);
+    napi_set_named_property(env, resObj, "format", fmtVal);
+    napi_set_named_property(env, resObj, "deviceFriendlyName", nameVal);
+
+    napi_value evVal;
+    napi_get_boolean(env, stats.isEventDriven, &evVal);
+    napi_set_named_property(env, resObj, "isEventDriven", evVal);
+
+    return resObj;
+}
+
+static napi_value Method_CaptureStop(napi_env env, napi_callback_info info) {
+    std::lock_guard<std::mutex> lock(g_captureMutex);
+    if (g_captureClient) {
+        g_captureClient->StopCapture();
+    }
+    napi_value result;
+    napi_get_boolean(env, true, &result);
+    return result;
+}
+
+static napi_value Method_CaptureIsActive(napi_env env, napi_callback_info info) {
+    std::lock_guard<std::mutex> lock(g_captureMutex);
+    bool active = g_captureClient ? g_captureClient->IsCapturing() : false;
+    napi_value result;
+    napi_get_boolean(env, active, &result);
+    return result;
+}
+
+static napi_value Method_CaptureGetStats(napi_env env, napi_callback_info info) {
+    speakerflow::WasapiCaptureStats stats;
+    {
+        std::lock_guard<std::mutex> lock(g_captureMutex);
+        if (g_captureClient) {
+            stats = g_captureClient->GetStats();
+        }
+    }
+
+    napi_value obj;
+    napi_create_object(env, &obj);
+
+    napi_value isCapVal, isEvVal;
+    napi_get_boolean(env, stats.isCapturing, &isCapVal);
+    napi_get_boolean(env, stats.isEventDriven, &isEvVal);
+    napi_set_named_property(env, obj, "isCapturing", isCapVal);
+    napi_set_named_property(env, obj, "isEventDriven", isEvVal);
+
+    napi_value srVal, chVal, bpsVal;
+    napi_create_uint32(env, stats.sampleRate, &srVal);
+    napi_create_uint32(env, stats.channels, &chVal);
+    napi_create_uint32(env, stats.bitsPerSample, &bpsVal);
+    napi_set_named_property(env, obj, "sampleRate", srVal);
+    napi_set_named_property(env, obj, "channels", chVal);
+    napi_set_named_property(env, obj, "bitsPerSample", bpsVal);
+
+    napi_value fmtVal, devIdVal, devNameVal, lastErrVal;
+    napi_create_string_utf8(env, stats.formatTag.c_str(), NAPI_AUTO_LENGTH, &fmtVal);
+    napi_create_string_utf8(env, stats.deviceId.c_str(), NAPI_AUTO_LENGTH, &devIdVal);
+    napi_create_string_utf8(env, stats.deviceFriendlyName.c_str(), NAPI_AUTO_LENGTH, &devNameVal);
+    napi_create_string_utf8(env, stats.lastError.c_str(), NAPI_AUTO_LENGTH, &lastErrVal);
+    napi_set_named_property(env, obj, "formatTag", fmtVal);
+    napi_set_named_property(env, obj, "deviceId", devIdVal);
+    napi_set_named_property(env, obj, "deviceFriendlyName", devNameVal);
+    napi_set_named_property(env, obj, "lastError", lastErrVal);
+
+    napi_value framesVal, silentVal, packetsVal;
+    napi_create_int64(env, stats.framesCaptured, &framesVal);
+    napi_create_int64(env, stats.silentFramesCaptured, &silentVal);
+    napi_create_int64(env, stats.packetsCaptured, &packetsVal);
+    napi_set_named_property(env, obj, "framesCaptured", framesVal);
+    napi_set_named_property(env, obj, "silentFramesCaptured", silentVal);
+    napi_set_named_property(env, obj, "packetsCaptured", packetsVal);
+
+    napi_value peakVal, rmsVal;
+    napi_create_double(env, static_cast<double>(stats.peakLevel), &peakVal);
+    napi_create_double(env, static_cast<double>(stats.rmsLevel), &rmsVal);
+    napi_set_named_property(env, obj, "peakLevel", peakVal);
+    napi_set_named_property(env, obj, "rmsLevel", rmsVal);
+
+    napi_value underrunVal, overrunVal, ringFramesVal, ringCapVal;
+    napi_create_int64(env, stats.ringBufferUnderruns, &underrunVal);
+    napi_create_int64(env, stats.ringBufferOverruns, &overrunVal);
+    napi_create_int64(env, stats.ringBufferFrames, &ringFramesVal);
+    napi_create_int64(env, stats.ringBufferCapacity, &ringCapVal);
+    napi_set_named_property(env, obj, "ringBufferUnderruns", underrunVal);
+    napi_set_named_property(env, obj, "ringBufferOverruns", overrunVal);
+    napi_set_named_property(env, obj, "ringBufferFrames", ringFramesVal);
+    napi_set_named_property(env, obj, "ringBufferCapacity", ringCapVal);
+
+    return obj;
+}
+
+// -----------------------------------------------------------------------------
+// WASAPI Render Node-API Methods (Phase 2B)
+// -----------------------------------------------------------------------------
+
+static napi_value Method_RenderStart(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    std::wstring deviceId;
+    if (argc > 0 && args[0] != nullptr) {
+        napi_valuetype argType;
+        napi_typeof(env, args[0], &argType);
+        if (argType == napi_string) {
+            deviceId = GetWideStringFromNapi(env, args[0]);
+        } else if (argType == napi_object) {
+            napi_value devIdVal;
+            if (napi_get_named_property(env, args[0], "deviceId", &devIdVal) == napi_ok) {
+                napi_valuetype propType;
+                napi_typeof(env, devIdVal, &propType);
+                if (propType == napi_string) {
+                    deviceId = GetWideStringFromNapi(env, devIdVal);
+                }
+            }
+        }
+    }
+
+    // Must have active capture client to supply audio frames to the ring buffer
+    speakerflow::WasapiCaptureStats capStats;
+    speakerflow::AudioRingBuffer* pRingBuffer = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_captureMutex);
+        if (!g_captureClient || !g_captureClient->IsCapturing()) {
+            napi_throw_error(env, NULL, "Cannot start render: WASAPI loopback capture is not active.");
+            return NULL;
+        }
+        capStats = g_captureClient->GetStats();
+        pRingBuffer = g_captureClient->GetRingBuffer();
+    }
+
+    if (!pRingBuffer) {
+        napi_throw_error(env, NULL, "Capture ring buffer is not initialized.");
+        return NULL;
+    }
+
+    // Feedback-loop safety check:
+    // Rendering captured audio back to the same endpoint creates an acoustic/digital feedback loop.
+    std::string targetDeviceIdUtf8 = WideToUtf8(deviceId.c_str());
+    bool isSameEndpoint = false;
+    if (deviceId.empty() && capStats.deviceId.empty()) {
+        isSameEndpoint = true;
+    } else if (!deviceId.empty() && targetDeviceIdUtf8 == capStats.deviceId) {
+        isSameEndpoint = true;
+    }
+
+    if (isSameEndpoint) {
+        std::string err = "Feedback loop prevention: Cannot render to the same endpoint (" +
+                          (capStats.deviceFriendlyName.empty() ? "Default Endpoint" : capStats.deviceFriendlyName) +
+                          ") that is being captured via WASAPI loopback. Select a secondary physical or virtual output endpoint.";
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    if (!g_renderClient) {
+        g_renderClient = std::make_unique<speakerflow::WasapiRenderClient>();
+    }
+
+    std::string error;
+    bool success = g_renderClient->StartRender(deviceId,
+                                               pRingBuffer,
+                                               capStats.sampleRate,
+                                               capStats.channels,
+                                               error);
+    if (!success) {
+        napi_throw_error(env, NULL, error.c_str());
+        return NULL;
+    }
+
+    speakerflow::WasapiRenderStats renderStats = g_renderClient->GetStats();
+
+    napi_value resObj;
+    napi_create_object(env, &resObj);
+
+    napi_value boolVal;
+    napi_get_boolean(env, true, &boolVal);
+    napi_set_named_property(env, resObj, "success", boolVal);
+
+    napi_value srVal, chVal, bpsVal;
+    napi_create_uint32(env, renderStats.sampleRate, &srVal);
+    napi_create_uint32(env, renderStats.channels, &chVal);
+    napi_create_uint32(env, renderStats.bitsPerSample, &bpsVal);
+    napi_set_named_property(env, resObj, "sampleRate", srVal);
+    napi_set_named_property(env, resObj, "channels", chVal);
+    napi_set_named_property(env, resObj, "bitsPerSample", bpsVal);
+
+    napi_value fmtVal, nameVal, devIdVal;
+    napi_create_string_utf8(env, renderStats.formatTag.c_str(), NAPI_AUTO_LENGTH, &fmtVal);
+    napi_create_string_utf8(env, renderStats.deviceFriendlyName.c_str(), NAPI_AUTO_LENGTH, &nameVal);
+    napi_create_string_utf8(env, renderStats.deviceId.c_str(), NAPI_AUTO_LENGTH, &devIdVal);
+    napi_set_named_property(env, resObj, "format", fmtVal);
+    napi_set_named_property(env, resObj, "deviceFriendlyName", nameVal);
+    napi_set_named_property(env, resObj, "deviceId", devIdVal);
+
+    napi_value evVal;
+    napi_get_boolean(env, renderStats.isEventDriven, &evVal);
+    napi_set_named_property(env, resObj, "isEventDriven", evVal);
+
+    napi_value bufDurVal;
+    napi_create_double(env, renderStats.bufferDurationMs, &bufDurVal);
+    napi_set_named_property(env, resObj, "bufferDurationMs", bufDurVal);
+
+    return resObj;
+}
+
+static napi_value Method_RenderStop(napi_env env, napi_callback_info info) {
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    if (g_renderClient) {
+        g_renderClient->StopRender();
+    }
+    napi_value result;
+    napi_get_boolean(env, true, &result);
+    return result;
+}
+
+static napi_value Method_RenderIsActive(napi_env env, napi_callback_info info) {
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    bool active = g_renderClient ? g_renderClient->IsRendering() : false;
+    napi_value result;
+    napi_get_boolean(env, active, &result);
+    return result;
+}
+
+static napi_value Method_RenderGetStats(napi_env env, napi_callback_info info) {
+    speakerflow::WasapiRenderStats stats;
+    {
+        std::lock_guard<std::mutex> lock(g_renderMutex);
+        if (g_renderClient) {
+            stats = g_renderClient->GetStats();
+        }
+    }
+
+    napi_value obj;
+    napi_create_object(env, &obj);
+
+    napi_value isRenVal, isEvVal;
+    napi_get_boolean(env, stats.isRendering, &isRenVal);
+    napi_get_boolean(env, stats.isEventDriven, &isEvVal);
+    napi_set_named_property(env, obj, "isRendering", isRenVal);
+    napi_set_named_property(env, obj, "isEventDriven", isEvVal);
+
+    napi_value srVal, chVal, bpsVal;
+    napi_create_uint32(env, stats.sampleRate, &srVal);
+    napi_create_uint32(env, stats.channels, &chVal);
+    napi_create_uint32(env, stats.bitsPerSample, &bpsVal);
+    napi_set_named_property(env, obj, "sampleRate", srVal);
+    napi_set_named_property(env, obj, "channels", chVal);
+    napi_set_named_property(env, obj, "bitsPerSample", bpsVal);
+
+    napi_value fmtVal, devIdVal, devNameVal, lastErrVal;
+    napi_create_string_utf8(env, stats.formatTag.c_str(), NAPI_AUTO_LENGTH, &fmtVal);
+    napi_create_string_utf8(env, stats.deviceId.c_str(), NAPI_AUTO_LENGTH, &devIdVal);
+    napi_create_string_utf8(env, stats.deviceFriendlyName.c_str(), NAPI_AUTO_LENGTH, &devNameVal);
+    napi_create_string_utf8(env, stats.lastError.c_str(), NAPI_AUTO_LENGTH, &lastErrVal);
+    napi_set_named_property(env, obj, "formatTag", fmtVal);
+    napi_set_named_property(env, obj, "deviceId", devIdVal);
+    napi_set_named_property(env, obj, "deviceFriendlyName", devNameVal);
+    napi_set_named_property(env, obj, "lastError", lastErrVal);
+
+    napi_value framesVal, silentVal;
+    napi_create_int64(env, stats.framesRendered, &framesVal);
+    napi_create_int64(env, stats.silentFramesRendered, &silentVal);
+    napi_set_named_property(env, obj, "framesRendered", framesVal);
+    napi_set_named_property(env, obj, "silentFramesRendered", silentVal);
+
+    napi_value underrunVal, overrunVal, ringFramesVal, ringCapVal;
+    napi_create_int64(env, stats.bufferUnderruns, &underrunVal);
+    napi_create_int64(env, stats.bufferOverruns, &overrunVal);
+    napi_create_int64(env, stats.ringBufferFrames, &ringFramesVal);
+    napi_create_int64(env, stats.ringBufferCapacity, &ringCapVal);
+    napi_set_named_property(env, obj, "bufferUnderruns", underrunVal);
+    napi_set_named_property(env, obj, "bufferOverruns", overrunVal);
+    napi_set_named_property(env, obj, "ringBufferFrames", ringFramesVal);
+    napi_set_named_property(env, obj, "ringBufferCapacity", ringCapVal);
+
+    napi_value bufDurVal, ringOccVal;
+    napi_create_double(env, stats.bufferDurationMs, &bufDurVal);
+    napi_create_double(env, stats.ringBufferOccupancyMs, &ringOccVal);
+    napi_set_named_property(env, obj, "bufferDurationMs", bufDurVal);
+    napi_set_named_property(env, obj, "ringBufferOccupancyMs", ringOccVal);
+
+    return obj;
+}
+
 NAPI_MODULE_INIT() {
     napi_value fn;
 
@@ -1727,6 +2094,30 @@ NAPI_MODULE_INIT() {
 
     napi_create_function(env, NULL, 0, Method_Destroy, NULL, &fn);
     napi_set_named_property(env, exports, "destroy", fn);
+
+    napi_create_function(env, NULL, 0, Method_CaptureStart, NULL, &fn);
+    napi_set_named_property(env, exports, "captureStart", fn);
+
+    napi_create_function(env, NULL, 0, Method_CaptureStop, NULL, &fn);
+    napi_set_named_property(env, exports, "captureStop", fn);
+
+    napi_create_function(env, NULL, 0, Method_CaptureIsActive, NULL, &fn);
+    napi_set_named_property(env, exports, "captureIsActive", fn);
+
+    napi_create_function(env, NULL, 0, Method_CaptureGetStats, NULL, &fn);
+    napi_set_named_property(env, exports, "captureGetStats", fn);
+
+    napi_create_function(env, NULL, 0, Method_RenderStart, NULL, &fn);
+    napi_set_named_property(env, exports, "renderStart", fn);
+
+    napi_create_function(env, NULL, 0, Method_RenderStop, NULL, &fn);
+    napi_set_named_property(env, exports, "renderStop", fn);
+
+    napi_create_function(env, NULL, 0, Method_RenderIsActive, NULL, &fn);
+    napi_set_named_property(env, exports, "renderIsActive", fn);
+
+    napi_create_function(env, NULL, 0, Method_RenderGetStats, NULL, &fn);
+    napi_set_named_property(env, exports, "renderGetStats", fn);
 
     return exports;
 }

@@ -38,13 +38,16 @@
         }],
         ["OS=='win'", {
           "sources": [
-            "native/windows/coreaudio_binding.cpp"
+            "native/windows/coreaudio_binding.cpp",
+            "native/windows/wasapi_capture_client.cpp",
+            "native/windows/wasapi_render_client.cpp"
           ],
           "libraries": [
             "-lole32.lib",
             "-luuid.lib",
             "-lpropsys.lib",
-            "-lpsapi.lib"
+            "-lpsapi.lib",
+            "-lavrt.lib"
           ],
           "msvs_settings": {
             "VCCLCompilerTool": {
