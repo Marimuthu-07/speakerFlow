@@ -87,11 +87,17 @@ class SpeakerEngineService {
 
     const validPhysicalSinks = [];
     for (const sinkId of sinkIdList) {
-      const sink = allSinks.find((item) => item.name === sinkId);
-      if (sink && sink.properties?.['node.virtual'] !== 'true' && sink.name !== 'all_speakers') {
+      const sink = allSinks.find((item) => item.id === sinkId || item.name === sinkId);
+      if (
+        sink &&
+        !sink.isVirtual &&
+        sink.properties?.['node.virtual'] !== 'true' &&
+        sink.name !== 'all_speakers' &&
+        sink.id !== 'all_speakers'
+      ) {
         validPhysicalSinks.push({
-          id: sink.name,
-          name: sink.description || sink.name
+          id: sink.id || sink.name,
+          name: sink.name || sink.description || sink.id
         });
       }
     }
@@ -102,9 +108,12 @@ class SpeakerEngineService {
 
     const allPhysicalSinksAtStartup = allSinks.filter(
       (sink) =>
+        !sink.isVirtual &&
         sink.properties?.['node.virtual'] !== 'true' &&
         sink.name !== 'all_speakers' &&
-        !sink.name.startsWith('speakerflow.session.')
+        sink.id !== 'all_speakers' &&
+        !(sink.name && sink.name.startsWith('speakerflow.session.')) &&
+        !(sink.id && sink.id.startsWith('speakerflow.session.'))
     );
 
     const sessionId = randomUUID();
@@ -456,12 +465,12 @@ class SpeakerEngineService {
 
     try {
       const allSinks = await this.audioBackend.listSinks();
-      const physicalSink = allSinks.find((s) => s.name === sinkId);
+      const physicalSink = allSinks.find((s) => s.id === sinkId || s.name === sinkId);
 
-      if (!physicalSink || physicalSink.properties?.['node.virtual'] === 'true') {
+      if (!physicalSink || physicalSink.isVirtual || physicalSink.properties?.['node.virtual'] === 'true') {
         branch.reconnecting = false;
         if (!isAuto) {
-          throw new Error('The physical output is not currently available in PipeWire.');
+          throw new Error('The physical output is not currently available.');
         }
         branch.state = 'disconnected';
         branch.error = 'Physical sink is not available.';
@@ -557,14 +566,21 @@ class SpeakerEngineService {
     const sinks = await this.audioBackend.listSinks();
     const validPhysicalSinks = sinks.filter(
       (sink) =>
+        !sink.isVirtual &&
         sink.properties?.['node.virtual'] !== 'true' &&
         sink.name !== 'all_speakers' &&
-        !sink.name.startsWith('speakerflow.session.')
+        sink.id !== 'all_speakers' &&
+        !(sink.name && sink.name.startsWith('speakerflow.session.')) &&
+        !(sink.id && sink.id.startsWith('speakerflow.session.'))
     );
-    const validPhysicalMap = new Map(validPhysicalSinks.map((s) => [s.name, s]));
+    const validPhysicalMap = new Map();
+    for (const s of validPhysicalSinks) {
+      if (s.name) validPhysicalMap.set(s.name, s);
+      if (s.id) validPhysicalMap.set(s.id, s);
+    }
 
     // 1. Observe active session ingress sink volume and mute (OS / pavucontrol / Media key master control)
-    const ingressSink = sinks.find((s) => s.name === session.ingressSinkId);
+    const ingressSink = sinks.find((s) => s.id === session.ingressSinkId || s.name === session.ingressSinkId);
     if (ingressSink) {
       const sinkVol = parseSinkVolumePercent(ingressSink.volume);
       const sinkMuted = Boolean(ingressSink.mute);
@@ -780,7 +796,14 @@ class SpeakerEngineService {
 
   async findApplicationStream(streamId) {
     const streams = await this.audioBackend.listApplicationStreams();
-    return streams.find((stream) => stream.id === Number(streamId)) || null;
+    return (
+      streams.find(
+        (stream) =>
+          stream.id === streamId ||
+          String(stream.id) === String(streamId) ||
+          (typeof stream.id === 'number' && stream.id === Number(streamId))
+      ) || null
+    );
   }
 
   async verifyStreamSink(streamId, expectedSinkId, timeoutMs = 3000) {

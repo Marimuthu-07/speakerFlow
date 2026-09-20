@@ -1,5 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
@@ -137,6 +139,13 @@ static HRESULT FindSessionSimpleVolume(const std::wstring& targetSessionId, ISim
                     IAudioSessionControl2* pSessionControl2 = NULL;
                     if (SUCCEEDED(pSessionControl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&pSessionControl2)) && pSessionControl2) {
                         if (pSessionControl2->IsSystemSoundsSession() != S_OK) {
+                            AudioSessionState sessionState;
+                            if (SUCCEEDED(pSessionControl->GetState(&sessionState)) && sessionState == AudioSessionStateExpired) {
+                                pSessionControl2->Release();
+                                pSessionControl->Release();
+                                continue;
+                            }
+
                             DWORD pid = 0;
                             pSessionControl2->GetProcessId(&pid);
 
@@ -149,7 +158,7 @@ static HRESULT FindSessionSimpleVolume(const std::wstring& targetSessionId, ISim
                                 uniqueSessionId = deviceId + L":" + std::to_wstring(pid) + L":" + std::to_wstring(s);
                             }
 
-                            if (uniqueSessionId == targetSessionId) {
+                            if (uniqueSessionId == targetSessionId || (pid != 0 && std::to_wstring(pid) == targetSessionId)) {
                                 hr = pSessionControl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)ppVolume);
                                 if (SUCCEEDED(hr) && *ppVolume) {
                                     found = true;
@@ -218,7 +227,22 @@ static HRESULT FindEndpointVolume(const std::wstring& targetDeviceId, IAudioEndp
 
         LPWSTR pstrId = NULL;
         if (SUCCEEDED(pDev->GetId(&pstrId)) && pstrId) {
-            if (targetDeviceId == pstrId) {
+            bool matches = (targetDeviceId == pstrId);
+            if (!matches) {
+                IPropertyStore* pProps = NULL;
+                if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
+                    PROPVARIANT varName;
+                    PropVariantInit(&varName);
+                    if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName))) {
+                        if (varName.vt == VT_LPWSTR && varName.pwszVal && targetDeviceId == varName.pwszVal) {
+                            matches = true;
+                        }
+                    }
+                    PropVariantClear(&varName);
+                    pProps->Release();
+                }
+            }
+            if (matches) {
                 hr = pDev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)ppEndpointVolume);
                 if (SUCCEEDED(hr) && *ppEndpointVolume) {
                     found = true;
@@ -373,7 +397,18 @@ public:
         if (!pwstrDeviceId) return S_OK;
 
         bool isRender = false;
-        if (g_pDeviceEnumerator) {
+        {
+            std::lock_guard<std::mutex> lock(g_monitorMutex);
+            std::wstring devId = pwstrDeviceId;
+            for (const auto& ep : g_monitoredEndpoints) {
+                if (ep.deviceId == devId) {
+                    isRender = true;
+                    break;
+                }
+            }
+        }
+
+        if (!isRender && g_pDeviceEnumerator) {
             IMMDevice* pDev = NULL;
             if (SUCCEEDED(g_pDeviceEnumerator->GetDevice(pwstrDeviceId, &pDev)) && pDev) {
                 IMMEndpoint* pEp = NULL;
@@ -618,6 +653,12 @@ public:
                 return S_OK;
             }
 
+            AudioSessionState state;
+            if (SUCCEEDED(NewSession->GetState(&state)) && state == AudioSessionStateExpired) {
+                pSessionControl2->Release();
+                return S_OK;
+            }
+
             DWORD pid = 0;
             pSessionControl2->GetProcessId(&pid);
             if (pid == 0) {
@@ -724,6 +765,13 @@ static void RegisterEndpointMonitoring(IMMDevice* pDevice, const std::wstring& d
                 IAudioSessionControl2* pCtrl2 = NULL;
                 if (SUCCEEDED(pCtrl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&pCtrl2)) && pCtrl2) {
                     if (pCtrl2->IsSystemSoundsSession() != S_OK) {
+                        AudioSessionState state;
+                        if (SUCCEEDED(pCtrl->GetState(&state)) && state == AudioSessionStateExpired) {
+                            pCtrl2->Release();
+                            pCtrl->Release();
+                            continue;
+                        }
+
                         DWORD pid = 0;
                         pCtrl2->GetProcessId(&pid);
                         if (pid != 0) {
@@ -1118,6 +1166,21 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
 
         bool isDefault = (!defaultDeviceId.empty() && defaultDeviceId == deviceId);
 
+        int volPercent = 100;
+        bool isMuted = false;
+        IAudioEndpointVolume* pEpVol = NULL;
+        if (SUCCEEDED(pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)&pEpVol)) && pEpVol) {
+            float scalar = 1.0f;
+            if (SUCCEEDED(pEpVol->GetMasterVolumeLevelScalar(&scalar))) {
+                volPercent = (int)std::round(scalar * 100.0f);
+            }
+            BOOL muteVal = FALSE;
+            if (SUCCEEDED(pEpVol->GetMute(&muteVal))) {
+                isMuted = (muteVal != FALSE);
+            }
+            pEpVol->Release();
+        }
+
         napi_value jsDevice;
         napi_create_object(env, &jsDevice);
 
@@ -1130,6 +1193,14 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
         napi_value isDefaultVal;
         napi_get_boolean(env, isDefault, &isDefaultVal);
         napi_set_named_property(env, jsDevice, "isDefault", isDefaultVal);
+
+        napi_value volVal;
+        napi_create_int32(env, volPercent, &volVal);
+        napi_set_named_property(env, jsDevice, "volumePercent", volVal);
+
+        napi_value mutePropVal;
+        napi_get_boolean(env, isMuted, &mutePropVal);
+        napi_set_named_property(env, jsDevice, "mute", mutePropVal);
 
         napi_set_element(env, jsArray, i, jsDevice);
 
@@ -1224,6 +1295,14 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
                             continue;
                         }
 
+                        AudioSessionState state;
+                        if (FAILED(pSessionControl->GetState(&state)) || state == AudioSessionStateExpired) {
+                            pSessionControl2->Release();
+                            pSessionControl->Release();
+                            continue;
+                        }
+                        bool isActive = (state == AudioSessionStateActive);
+
                         LPWSTR pInstanceId = NULL;
                         std::wstring uniqueSessionId;
                         if (SUCCEEDED(pSessionControl2->GetSessionInstanceIdentifier(&pInstanceId)) && pInstanceId && wcslen(pInstanceId) > 0) {
@@ -1233,10 +1312,11 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
                             uniqueSessionId = deviceId + L":" + std::to_wstring(pid) + L":" + std::to_wstring(s);
                         }
 
-                        AudioSessionState state;
-                        bool isActive = false;
-                        if (SUCCEEDED(pSessionControl->GetState(&state))) {
-                            isActive = (state == AudioSessionStateActive);
+                        LPWSTR pSessionId = NULL;
+                        std::wstring sessionIdentifier;
+                        if (SUCCEEDED(pSessionControl2->GetSessionIdentifier(&pSessionId)) && pSessionId && wcslen(pSessionId) > 0) {
+                            sessionIdentifier = pSessionId;
+                            CoTaskMemFree(pSessionId);
                         }
 
                         ISimpleAudioVolume* pVolume = NULL;
@@ -1276,12 +1356,21 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
                         napi_value idVal = CreateNapiStringFromWide(env, uniqueSessionId.c_str());
                         napi_set_named_property(env, jsStream, "id", idVal);
 
+                        if (!sessionIdentifier.empty()) {
+                            napi_value sessIdVal = CreateNapiStringFromWide(env, sessionIdentifier.c_str());
+                            napi_set_named_property(env, jsStream, "sessionIdentifier", sessIdVal);
+                        }
+
                         napi_value pidVal;
                         napi_create_uint32(env, pid, &pidVal);
                         napi_set_named_property(env, jsStream, "processId", pidVal);
 
                         napi_value nameVal = CreateNapiStringFromWide(env, appName.c_str());
                         napi_set_named_property(env, jsStream, "name", nameVal);
+
+                        napi_value stateVal;
+                        napi_create_int32(env, (int)state, &stateVal);
+                        napi_set_named_property(env, jsStream, "state", stateVal);
 
                         napi_value isActiveVal;
                         napi_get_boolean(env, isActive, &isActiveVal);
@@ -1494,6 +1583,81 @@ static napi_value Method_SetEndpointMute(napi_env env, napi_callback_info info) 
     return result;
 }
 
+static napi_value Method_GetEndpointVolume(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc < 1) {
+        napi_throw_type_error(env, NULL, "getEndpointVolume requires 1 argument: (deviceId)");
+        return NULL;
+    }
+
+    std::wstring deviceId = GetWideStringFromNapi(env, args[0]);
+    if (deviceId.empty()) {
+        napi_throw_type_error(env, NULL, "deviceId must be a non-empty string");
+        return NULL;
+    }
+
+    IAudioEndpointVolume* pEndpointVolume = NULL;
+    HRESULT hr = FindEndpointVolume(deviceId, &pEndpointVolume);
+    if (FAILED(hr) || !pEndpointVolume) {
+        std::string err = FormatHresultError("FindEndpointVolume", hr);
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    float scalar = 1.0f;
+    hr = pEndpointVolume->GetMasterVolumeLevelScalar(&scalar);
+    pEndpointVolume->Release();
+
+    if (FAILED(hr)) {
+        std::string err = FormatHresultError("IAudioEndpointVolume::GetMasterVolumeLevelScalar", hr);
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    int volPercent = (int)std::round(scalar * 100.0f);
+    napi_value result;
+    napi_create_int32(env, volPercent, &result);
+    return result;
+}
+
+static napi_value Method_GetEndpointMute(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc < 1) {
+        napi_throw_type_error(env, NULL, "getEndpointMute requires 1 argument: (deviceId)");
+        return NULL;
+    }
+
+    std::wstring deviceId = GetWideStringFromNapi(env, args[0]);
+    if (deviceId.empty()) {
+        napi_throw_type_error(env, NULL, "deviceId must be a non-empty string");
+        return NULL;
+    }
+
+    IAudioEndpointVolume* pEndpointVolume = NULL;
+    HRESULT hr = FindEndpointVolume(deviceId, &pEndpointVolume);
+    if (FAILED(hr) || !pEndpointVolume) {
+        std::string err = FormatHresultError("FindEndpointVolume", hr);
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    BOOL muted = FALSE;
+    hr = pEndpointVolume->GetMute(&muted);
+    pEndpointVolume->Release();
+
+    if (FAILED(hr)) {
+        std::string err = FormatHresultError("IAudioEndpointVolume::GetMute", hr);
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    napi_value result;
+    napi_get_boolean(env, (muted != FALSE), &result);
+    return result;
+}
+
 static napi_value Method_StartMonitoring(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
@@ -1548,6 +1712,12 @@ NAPI_MODULE_INIT() {
 
     napi_create_function(env, NULL, 0, Method_SetEndpointMute, NULL, &fn);
     napi_set_named_property(env, exports, "setEndpointMute", fn);
+
+    napi_create_function(env, NULL, 0, Method_GetEndpointVolume, NULL, &fn);
+    napi_set_named_property(env, exports, "getEndpointVolume", fn);
+
+    napi_create_function(env, NULL, 0, Method_GetEndpointMute, NULL, &fn);
+    napi_set_named_property(env, exports, "getEndpointMute", fn);
 
     napi_create_function(env, NULL, 0, Method_StartMonitoring, NULL, &fn);
     napi_set_named_property(env, exports, "startMonitoring", fn);

@@ -140,9 +140,13 @@ class WindowsCoreAudioBackend extends AudioBackend {
       state: 'active',
       isDefault: Boolean(device.isDefault),
       isVirtual: false,
-      volumePercent: 100,
-      mute: false
+      volumePercent: typeof device.volumePercent === 'number' ? device.volumePercent : 100,
+      mute: Boolean(device.mute)
     }));
+  }
+
+  async listSinks() {
+    return this.listOutputDevices();
   }
 
   async getDefaultOutputId() {
@@ -181,7 +185,63 @@ class WindowsCoreAudioBackend extends AudioBackend {
 
     const defaultDevice = devices.find((d) => d.isDefault) || devices[0];
 
-    return (rawStreams || []).map((stream) => ({
+    // Filter out expired streams (AudioSessionStateExpired = 2)
+    const validStreams = (rawStreams || []).filter((s) => s.state !== 2);
+
+    // Track which endpoints have actively playing streams for each process
+    const activeEndpointsByPid = new Map();
+    for (const stream of validStreams) {
+      if (stream.isActive && stream.processId) {
+        if (!activeEndpointsByPid.has(stream.processId)) {
+          activeEndpointsByPid.set(stream.processId, new Set());
+        }
+        activeEndpointsByPid.get(stream.processId).add(stream.currentSinkId);
+      }
+    }
+
+    // Reconcile cross-endpoint stale streams:
+    // If an application process (PID) is actively playing on one endpoint, suppress any dormant
+    // inactive session left behind on a previous endpoint for the same process.
+    let reconciledStreams = validStreams.filter((stream) => {
+      if (!stream.isActive && stream.processId && activeEndpointsByPid.has(stream.processId)) {
+        const activeEndpoints = activeEndpointsByPid.get(stream.processId);
+        if (!activeEndpoints.has(stream.currentSinkId)) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    // If an application has multiple inactive streams across different endpoints (e.g. paused
+    // after a device migration) for the same PID, keep the one on the default endpoint.
+    const streamsByPid = new Map();
+    for (const s of reconciledStreams) {
+      if (s.processId) {
+        if (!streamsByPid.has(s.processId)) streamsByPid.set(s.processId, []);
+        streamsByPid.get(s.processId).push(s);
+      }
+    }
+    const suppressedIds = new Set();
+    for (const [_pid, pidStreams] of streamsByPid) {
+      if (pidStreams.length > 1) {
+        const uniqueEndpoints = new Set(pidStreams.map((s) => s.currentSinkId));
+        // Only if these streams span multiple different physical endpoints and all are inactive
+        if (uniqueEndpoints.size > 1 && pidStreams.every((s) => !s.isActive)) {
+          const onDefault = pidStreams.find((s) => s.currentSinkId === defaultDevice?.id);
+          const keeper = onDefault || pidStreams[pidStreams.length - 1];
+          for (const s of pidStreams) {
+            if (s !== keeper && s.id) {
+              suppressedIds.add(s.id);
+            }
+          }
+        }
+      }
+    }
+    if (suppressedIds.size > 0) {
+      reconciledStreams = reconciledStreams.filter((s) => !suppressedIds.has(s.id));
+    }
+
+    return reconciledStreams.map((stream) => ({
       id: stream.id || `${stream.processId}-${stream.currentSinkId}`,
       processId: stream.processId,
       applicationName: stream.name || `Process ${stream.processId}`,
@@ -258,6 +318,38 @@ class WindowsCoreAudioBackend extends AudioBackend {
     const sink = await this.findSinkByName(sinkName);
     const deviceId = sink ? sink.id : String(sinkName);
     return this._native.setEndpointMute(deviceId, Boolean(muted));
+  }
+
+  async getEndpointVolume(sinkName) {
+    if (!this._native || typeof this._native.getEndpointVolume !== 'function') {
+      throw new Error('Windows Core Audio backend is not initialized.');
+    }
+    if (!sinkName) {
+      throw new Error('sinkName is required for getEndpointVolume');
+    }
+    const sink = await this.findSinkByName(sinkName);
+    const deviceId = sink ? sink.id : String(sinkName);
+    return this._native.getEndpointVolume(deviceId);
+  }
+
+  async getEndpointMute(sinkName) {
+    if (!this._native || typeof this._native.getEndpointMute !== 'function') {
+      throw new Error('Windows Core Audio backend is not initialized.');
+    }
+    if (!sinkName) {
+      throw new Error('sinkName is required for getEndpointMute');
+    }
+    const sink = await this.findSinkByName(sinkName);
+    const deviceId = sink ? sink.id : String(sinkName);
+    return this._native.getEndpointMute(deviceId);
+  }
+
+  async getSinkVolume(sinkName) {
+    return this.getEndpointVolume(sinkName);
+  }
+
+  async getSinkMute(sinkName) {
+    return this.getEndpointMute(sinkName);
   }
 
   async setSinkInputVolume(sinkInputId, volumePercent) {

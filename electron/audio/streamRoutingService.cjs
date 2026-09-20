@@ -1,5 +1,10 @@
 const ALL_SPEAKERS_SINK = 'all_speakers';
 
+function matchesStreamId(item, streamId) {
+  if (!item) return false;
+  return item.id === streamId || String(item.id) === String(streamId) || (typeof item.id === 'number' && item.id === Number(streamId));
+}
+
 class StreamRoutingService {
   constructor(audioBackend, aggregateSinkName = ALL_SPEAKERS_SINK) {
     this.audioBackend = audioBackend;
@@ -42,7 +47,7 @@ class StreamRoutingService {
       throw new Error('The existing all_speakers output is unavailable. No audio routing was changed.');
     }
 
-    const stream = streams.find((item) => item.id === Number(streamId));
+    const stream = streams.find((item) => matchesStreamId(item, streamId));
     if (!stream) {
       throw new Error('The selected application stream is no longer available.');
     }
@@ -62,7 +67,7 @@ class StreamRoutingService {
   }
 
   async restoreOriginalOutput(streamId) {
-    const routedStream = this.routedStreams.get(Number(streamId));
+    const routedStream = this.routedStreams.get(streamId) || this.routedStreams.get(Number(streamId));
     if (!routedStream) {
       throw new Error('SpeakerFlow has no original-output record for this stream.');
     }
@@ -72,15 +77,16 @@ class StreamRoutingService {
       throw new Error(`The original output, ${routedStream.originalSinkName}, is unavailable. The stream was not moved.`);
     }
 
-    await this.verifySink(Number(streamId), this.aggregateSinkName, 'All Speakers');
-    await this.audioBackend.moveSinkInput(Number(streamId), originalSink.id);
-    await this.verifySink(Number(streamId), originalSink.id, routedStream.originalSinkName);
+    await this.verifySink(streamId, this.aggregateSinkName, 'All Speakers');
+    await this.audioBackend.moveSinkInput(streamId, originalSink.id);
+    await this.verifySink(streamId, originalSink.id, routedStream.originalSinkName);
+    this.routedStreams.delete(streamId);
     this.routedStreams.delete(Number(streamId));
   }
 
   async moveStreamOutput(streamId, targetSinkId, speakerEngineService) {
     const streams = await this.audioBackend.listApplicationStreams();
-    const stream = streams.find((item) => item.id === Number(streamId));
+    const stream = streams.find((item) => matchesStreamId(item, streamId));
     if (!stream) {
       throw new Error('The selected application stream is no longer available.');
     }
@@ -114,7 +120,7 @@ class StreamRoutingService {
     // Target is a specific physical or virtual sink
     const targetSink = await this.audioBackend.findSinkByName(targetSinkId);
     if (!targetSink) {
-      throw new Error(`Target audio sink "${targetSinkId}" was not found in PipeWire.`);
+      throw new Error(`Target audio sink "${targetSinkId}" was not found in the audio subsystem.`);
     }
 
     if (speakerEngineService?.session?.streamId === stream.id) {
@@ -133,7 +139,7 @@ class StreamRoutingService {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const streams = await this.audioBackend.listApplicationStreams();
-      const stream = streams.find((item) => item.id === Number(streamId));
+      const stream = streams.find((item) => matchesStreamId(item, streamId));
 
       if (!stream) {
         throw new Error('The application stream disappeared before routing could be verified.');

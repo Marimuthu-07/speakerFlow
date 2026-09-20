@@ -49,6 +49,26 @@ class AudioBackend extends EventEmitter {
     throw new Error('Default audio output control is not implemented for this platform.');
   }
 
+  async listSinks() {
+    return this.listOutputDevices();
+  }
+
+  async getEndpointVolume() {
+    throw new Error('Endpoint volume query is not implemented for this platform.');
+  }
+
+  async getEndpointMute() {
+    throw new Error('Endpoint mute query is not implemented for this platform.');
+  }
+
+  async getSinkVolume(sinkName) {
+    return this.getEndpointVolume(sinkName);
+  }
+
+  async getSinkMute(sinkName) {
+    return this.getEndpointMute(sinkName);
+  }
+
   loadModule() {
     throw new Error('Module loading is not implemented for this platform.');
   }
