@@ -14,6 +14,7 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <array>
 #include <mutex>
 
 #include "audio_ring_buffer.h"
@@ -87,6 +88,26 @@ public:
      */
     AudioRingBuffer* GetRingBuffer() const { return m_ringBuffer.get(); }
 
+    static constexpr size_t MAX_FANOUT_SLOTS = 8;
+
+    /**
+     * @brief Registers or unregisters a branch audio ring buffer to receive captured audio frames.
+     * @param slot Slot index [0 .. MAX_FANOUT_SLOTS - 1].
+     * @param pBuffer Pointer to branch ring buffer, or nullptr to unregister.
+     * @return true if slot index is valid, false otherwise.
+     */
+    bool SetBranchBuffer(size_t slot, AudioRingBuffer* pBuffer) {
+        if (slot >= MAX_FANOUT_SLOTS) return false;
+        m_branchBuffers[slot].store(pBuffer, std::memory_order_release);
+        return true;
+    }
+
+    void ClearBranchBuffers() {
+        for (size_t i = 0; i < MAX_FANOUT_SLOTS; ++i) {
+            m_branchBuffers[i].store(nullptr, std::memory_order_release);
+        }
+    }
+
 private:
     void CaptureThreadProc();
     static void ConvertRawToFloat(const BYTE* pSrc,
@@ -117,6 +138,7 @@ private:
     std::string m_lastError;
 
     std::unique_ptr<AudioRingBuffer> m_ringBuffer;
+    std::array<std::atomic<AudioRingBuffer*>, MAX_FANOUT_SLOTS> m_branchBuffers;
 
     HANDLE m_hStopEvent;
     HANDLE m_hAudioEvent;

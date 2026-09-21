@@ -40,7 +40,8 @@
           "sources": [
             "native/windows/coreaudio_binding.cpp",
             "native/windows/wasapi_capture_client.cpp",
-            "native/windows/wasapi_render_client.cpp"
+            "native/windows/wasapi_render_client.cpp",
+            "native/windows/wasapi_fanout_engine.cpp"
           ],
           "libraries": [
             "-lole32.lib",

@@ -47,6 +47,9 @@ WasapiCaptureClient::WasapiCaptureClient()
       m_pAudioClient(nullptr),
       m_pCaptureClient(nullptr),
       m_pMixFormat(nullptr) {
+    for (size_t i = 0; i < MAX_FANOUT_SLOTS; ++i) {
+        m_branchBuffers[i].store(nullptr, std::memory_order_relaxed);
+    }
 }
 
 WasapiCaptureClient::~WasapiCaptureClient() {
@@ -305,6 +308,8 @@ void WasapiCaptureClient::StopCapture() {
         CoTaskMemFree(m_pMixFormat);
         m_pMixFormat = nullptr;
     }
+
+    ClearBranchBuffers();
 }
 
 void WasapiCaptureClient::CaptureThreadProc() {
@@ -377,6 +382,14 @@ void WasapiCaptureClient::CaptureThreadProc() {
 
                 if (m_ringBuffer) {
                     m_ringBuffer->Write(stagingBuffer.data(), numFramesRead);
+                }
+
+                // Lock-free fan-out to registered branch buffers
+                for (size_t slot = 0; slot < MAX_FANOUT_SLOTS; ++slot) {
+                    AudioRingBuffer* pBranchBuf = m_branchBuffers[slot].load(std::memory_order_relaxed);
+                    if (pBranchBuf) {
+                        pBranchBuf->Write(stagingBuffer.data(), numFramesRead);
+                    }
                 }
 
                 m_packetsCaptured.fetch_add(1, std::memory_order_relaxed);
