@@ -260,8 +260,12 @@ bool WasapiCaptureClient::StartCapture(const std::wstring& targetDeviceId, std::
         return false;
     }
 
-    // Allocate ring buffer (65536 frames ≈ 1.36s at 48kHz)
-    m_ringBuffer = std::make_unique<AudioRingBuffer>(65536, m_channels);
+    // Allocate or reset ring buffer (65536 frames ≈ 1.36s at 48kHz)
+    if (!m_ringBuffer || m_ringBuffer->GetChannels() != m_channels) {
+        m_ringBuffer = std::make_unique<AudioRingBuffer>(65536, m_channels);
+    } else {
+        m_ringBuffer->Reset();
+    }
 
     // Launch dedicated capture worker thread
     m_isCapturing.store(true, std::memory_order_release);

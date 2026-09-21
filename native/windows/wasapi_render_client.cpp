@@ -42,6 +42,8 @@ WasapiRenderClient::WasapiRenderClient()
       m_captureChannels(2),
       m_framesRendered(0),
       m_silentFramesRendered(0),
+      m_underrunRecoveryCount(0),
+      m_resampleRatioMultiplier(1.0),
       m_pRingBuffer(nullptr),
       m_hStopEvent(NULL),
       m_hAudioEvent(NULL),
@@ -82,6 +84,8 @@ bool WasapiRenderClient::StartRender(const std::wstring& targetDeviceId,
 
     m_framesRendered.store(0, std::memory_order_relaxed);
     m_silentFramesRendered.store(0, std::memory_order_relaxed);
+    m_underrunRecoveryCount.store(0, std::memory_order_relaxed);
+    m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
 
     IMMDeviceEnumerator* pEnumerator = nullptr;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
@@ -273,6 +277,24 @@ bool WasapiRenderClient::StartRender(const std::wstring& targetDeviceId,
     m_bufferFrameCount = 0;
     m_pAudioClient->GetBufferSize(&m_bufferFrameCount);
 
+    const size_t maxFrames = std::max<size_t>(m_bufferFrameCount * 4, 8192);
+    if (!m_pipeline.Initialize(m_captureSampleRate,
+                               m_captureChannels,
+                               m_sampleRate,
+                               m_channels,
+                               m_formatType,
+                               maxFrames)) {
+        if (m_hAudioEvent) { CloseHandle(m_hAudioEvent); m_hAudioEvent = NULL; }
+        if (m_hStopEvent) { CloseHandle(m_hStopEvent); m_hStopEvent = NULL; }
+        if (m_pMixFormat) { CoTaskMemFree(m_pMixFormat); m_pMixFormat = nullptr; }
+        if (m_pRenderClient) { m_pRenderClient->Release(); m_pRenderClient = nullptr; }
+        if (m_pAudioClient) { m_pAudioClient->Release(); m_pAudioClient = nullptr; }
+        if (m_pDevice) { m_pDevice->Release(); m_pDevice = nullptr; }
+        outError = "Failed to initialize AudioFormatPipeline.";
+        m_lastError = outError;
+        return false;
+    }
+
     // Pre-roll: prime the WASAPI render buffer with initial silence
     BYTE* pPrimeData = nullptr;
     hr = m_pRenderClient->GetBuffer(m_bufferFrameCount, &pPrimeData);
@@ -349,18 +371,25 @@ void WasapiRenderClient::RenderThreadProc() {
         return;
     }
 
-    // Pre-allocate all staging buffers ONCE before entering the loop.
+    // Pre-allocate staging buffer ONCE before entering the real-time loop.
     // Zero heap allocations inside the audio real-time path.
     const size_t maxFrames = std::max<size_t>(m_bufferFrameCount * 4, 8192);
     std::vector<float> captureStaging(maxFrames * m_captureChannels, 0.0f);
-    std::vector<float> resampledStaging(maxFrames * m_captureChannels, 0.0f);
-    std::vector<float> channelMappedStaging(maxFrames * m_channels, 0.0f);
-    std::vector<float> lastFrameHistory(m_captureChannels, 0.0f);
 
-    double resamplePhase = 0.0;
-    bool hasPrerolled = false;
-    // Initial pre-roll watermark: 50ms of audio or 2x WASAPI buffer
-    const size_t prerollThresholdFrames = std::min<size_t>(m_bufferFrameCount * 2, 2400);
+    enum class RenderBufferState {
+        Preroll,
+        Running,
+        Recovery
+    };
+
+    RenderBufferState bufferState = RenderBufferState::Preroll;
+
+    // Watermarks for underrun recovery hysteresis:
+    // High watermark: 50ms of audio (or 2x WASAPI buffer)
+    const size_t highWatermarkFrames = std::min<size_t>(m_bufferFrameCount * 2,
+                                                        static_cast<size_t>(m_captureSampleRate * 0.050));
+    // Low watermark minimum: ~5ms
+    const size_t lowWatermarkMinFrames = static_cast<size_t>(m_captureSampleRate * 0.005);
 
     const bool isEventDriven = m_isEventDriven.load(std::memory_order_relaxed);
     HANDLE waitHandles[2] = { m_hStopEvent, m_hAudioEvent };
@@ -392,10 +421,25 @@ void WasapiRenderClient::RenderThreadProc() {
             continue;
         }
 
-        // Check if initial jitter-buffer watermark has been reached
-        if (!hasPrerolled) {
-            if (m_pRingBuffer && m_pRingBuffer->AvailableRead() < prerollThresholdFrames) {
-                // Not enough pre-roll yet: feed silence to WASAPI to avoid underrun click
+        // Apply ratio multiplier from thread-safe hook (Phase 2E ready)
+        double currentRatio = m_resampleRatioMultiplier.load(std::memory_order_relaxed);
+        if (currentRatio != m_pipeline.GetResampleRatioMultiplier()) {
+            m_pipeline.SetResampleRatioMultiplier(currentRatio);
+        }
+
+        // Calculate input frames needed by AudioFormatPipeline to synthesize framesNeeded
+        size_t framesToReadFromRing = m_pipeline.GetRequiredInFrames(framesNeeded);
+        if (framesToReadFromRing > maxFrames) {
+            framesToReadFromRing = maxFrames;
+        }
+
+        size_t available = (m_pRingBuffer != nullptr) ? m_pRingBuffer->AvailableRead() : 0;
+        const size_t lowWatermarkFrames = std::max(framesToReadFromRing, lowWatermarkMinFrames);
+
+        // State machine: Preroll -> Running <-> Recovery
+        if (bufferState == RenderBufferState::Preroll) {
+            if (available < highWatermarkFrames) {
+                // Prime buffer with silence until initial 50ms watermark is reached
                 BYTE* pData = nullptr;
                 HRESULT hrBuf = m_pRenderClient->GetBuffer(framesNeeded, &pData);
                 if (SUCCEEDED(hrBuf) && pData) {
@@ -404,9 +448,38 @@ void WasapiRenderClient::RenderThreadProc() {
                 }
                 continue;
             }
-            hasPrerolled = true;
+            bufferState = RenderBufferState::Running;
+        } else if (bufferState == RenderBufferState::Running) {
+            if (available < lowWatermarkFrames) {
+                // Genuine starvation detected: enter Recovery and pause consumption
+                bufferState = RenderBufferState::Recovery;
+                m_underrunRecoveryCount.fetch_add(1, std::memory_order_relaxed);
+                m_pipeline.Reset(); // Clear resampler history across silence gap
+
+                BYTE* pData = nullptr;
+                HRESULT hrBuf = m_pRenderClient->GetBuffer(framesNeeded, &pData);
+                if (SUCCEEDED(hrBuf) && pData) {
+                    m_pRenderClient->ReleaseBuffer(framesNeeded, AUDCLNT_BUFFERFLAGS_SILENT);
+                    m_silentFramesRendered.fetch_add(framesNeeded, std::memory_order_relaxed);
+                }
+                continue;
+            }
+        } else if (bufferState == RenderBufferState::Recovery) {
+            if (available < highWatermarkFrames) {
+                // In recovery: wait for ring buffer to refill to high watermark (50ms)
+                BYTE* pData = nullptr;
+                HRESULT hrBuf = m_pRenderClient->GetBuffer(framesNeeded, &pData);
+                if (SUCCEEDED(hrBuf) && pData) {
+                    m_pRenderClient->ReleaseBuffer(framesNeeded, AUDCLNT_BUFFERFLAGS_SILENT);
+                    m_silentFramesRendered.fetch_add(framesNeeded, std::memory_order_relaxed);
+                }
+                continue;
+            }
+            // Refilled to high watermark: resume steady-state rendering
+            bufferState = RenderBufferState::Running;
         }
 
+        // Running state with sufficient buffer: acquire render buffer
         BYTE* pRenderData = nullptr;
         HRESULT hrBuf = m_pRenderClient->GetBuffer(framesNeeded, &pRenderData);
         if (FAILED(hrBuf)) {
@@ -423,53 +496,16 @@ void WasapiRenderClient::RenderThreadProc() {
             continue;
         }
 
-        // 1. Calculate how many frames to read from the capture ring buffer
-        const bool ratesMatch = (m_captureSampleRate == m_sampleRate);
-        size_t framesToReadFromRing = framesNeeded;
-        if (!ratesMatch && m_sampleRate > 0) {
-            double ratio = static_cast<double>(m_captureSampleRate) / static_cast<double>(m_sampleRate);
-            framesToReadFromRing = static_cast<size_t>(std::ceil(framesNeeded * ratio + resamplePhase));
-        }
-
-        if (framesToReadFromRing > maxFrames) {
-            framesToReadFromRing = maxFrames;
-        }
-
-        // Lock-free read from ring buffer (auto-pads with silence on underflow)
+        // Lock-free read from ring buffer
         size_t framesRead = m_pRingBuffer->Read(captureStaging.data(), framesToReadFromRing);
 
-        // 2. Fractional resample if sample rates differ
-        const float* pFloatSource = captureStaging.data();
-        if (!ratesMatch) {
-            ResampleFloatInterleaved(captureStaging.data(),
-                                     framesToReadFromRing,
-                                     resampledStaging.data(),
-                                     framesNeeded,
-                                     m_captureChannels,
-                                     m_captureSampleRate,
-                                     m_sampleRate,
-                                     resamplePhase,
-                                     lastFrameHistory);
-            pFloatSource = resampledStaging.data();
-        }
-
-        // 3. Channel map if channel counts differ
-        const float* pChannelMapped = pFloatSource;
-        if (m_captureChannels != m_channels) {
-            MapChannelsFloat(pFloatSource,
-                             m_captureChannels,
-                             channelMappedStaging.data(),
-                             m_channels,
-                             framesNeeded);
-            pChannelMapped = channelMappedStaging.data();
-        }
-
-        // 4. Sample format conversion directly into WASAPI render buffer
-        ConvertFloatToRaw(pChannelMapped,
-                          pRenderData,
-                          framesNeeded,
-                          m_formatType,
-                          m_channels);
+        // Process through AudioFormatPipeline: Resample -> Channel Map -> Format Convert
+        size_t framesProduced = 0;
+        m_pipeline.Process(captureStaging.data(),
+                           framesRead,
+                           pRenderData,
+                           framesNeeded,
+                           framesProduced);
 
         m_pRenderClient->ReleaseBuffer(framesNeeded, 0);
         m_framesRendered.fetch_add(framesNeeded, std::memory_order_relaxed);
@@ -485,187 +521,6 @@ void WasapiRenderClient::RenderThreadProc() {
     }
 }
 
-void WasapiRenderClient::ResampleFloatInterleaved(const float* pIn,
-                                                  size_t inFrames,
-                                                  float* pOut,
-                                                  size_t outFrames,
-                                                  size_t channels,
-                                                  double inSampleRate,
-                                                  double outSampleRate,
-                                                  double& ioPhase,
-                                                  std::vector<float>& lastFrameHistory) {
-    if (inSampleRate == outSampleRate || inFrames == 0 || outFrames == 0) {
-        size_t framesToCopy = std::min(inFrames, outFrames);
-        std::memcpy(pOut, pIn, framesToCopy * channels * sizeof(float));
-        if (outFrames > framesToCopy) {
-            std::memset(pOut + framesToCopy * channels, 0, (outFrames - framesToCopy) * channels * sizeof(float));
-        }
-        if (framesToCopy > 0) {
-            for (size_t c = 0; c < channels; ++c) {
-                lastFrameHistory[c] = pIn[(framesToCopy - 1) * channels + c];
-            }
-        }
-        return;
-    }
-
-    const double ratio = inSampleRate / outSampleRate;
-    double pos = ioPhase;
-
-    for (size_t i = 0; i < outFrames; ++i) {
-        size_t idx = static_cast<size_t>(pos);
-        float frac = static_cast<float>(pos - idx);
-
-        for (size_t c = 0; c < channels; ++c) {
-            float s0 = 0.0f;
-            float s1 = 0.0f;
-
-            if (idx == 0) {
-                s0 = lastFrameHistory[c];
-                s1 = (inFrames > 0) ? pIn[0 * channels + c] : 0.0f;
-            } else if (idx < inFrames) {
-                s0 = pIn[(idx - 1) * channels + c];
-                s1 = pIn[idx * channels + c];
-            } else {
-                s0 = (inFrames > 0) ? pIn[(inFrames - 1) * channels + c] : 0.0f;
-                s1 = s0;
-            }
-
-            pOut[i * channels + c] = s0 + frac * (s1 - s0);
-        }
-
-        pos += ratio;
-    }
-
-    // Save history and update phase for seamless next chunk
-    if (inFrames > 0) {
-        for (size_t c = 0; c < channels; ++c) {
-            lastFrameHistory[c] = pIn[(inFrames - 1) * channels + c];
-        }
-    }
-    if (pos >= inFrames) {
-        ioPhase = pos - inFrames;
-    } else {
-        ioPhase = 0.0;
-    }
-}
-
-void WasapiRenderClient::MapChannelsFloat(const float* pIn,
-                                          size_t inChannels,
-                                          float* pOut,
-                                          size_t outChannels,
-                                          size_t frames) {
-    if (inChannels == outChannels) {
-        std::memcpy(pOut, pIn, frames * outChannels * sizeof(float));
-        return;
-    }
-
-    if (inChannels == 2 && outChannels == 1) {
-        // Stereo to Mono downmix
-        for (size_t i = 0; i < frames; ++i) {
-            pOut[i] = 0.5f * (pIn[i * 2] + pIn[i * 2 + 1]);
-        }
-        return;
-    }
-
-    if (inChannels == 1 && outChannels == 2) {
-        // Mono to Stereo duplication
-        for (size_t i = 0; i < frames; ++i) {
-            float s = pIn[i];
-            pOut[i * 2] = s;
-            pOut[i * 2 + 1] = s;
-        }
-        return;
-    }
-
-    if (inChannels == 2 && outChannels > 2) {
-        // Stereo to Multi-channel (5.1/7.1): L -> FL, R -> FR, rest zeroed
-        for (size_t i = 0; i < frames; ++i) {
-            pOut[i * outChannels] = pIn[i * 2];
-            pOut[i * outChannels + 1] = pIn[i * 2 + 1];
-            for (size_t c = 2; c < outChannels; ++c) {
-                pOut[i * outChannels + c] = 0.0f;
-            }
-        }
-        return;
-    }
-
-    if (inChannels > 2 && outChannels == 2) {
-        // Multi-channel to Stereo (take Front-Left and Front-Right)
-        for (size_t i = 0; i < frames; ++i) {
-            pOut[i * 2] = pIn[i * inChannels];
-            pOut[i * 2 + 1] = pIn[i * inChannels + 1];
-        }
-        return;
-    }
-
-    // General fallback: copy min channels, zero out remaining
-    size_t copyChannels = std::min(inChannels, outChannels);
-    for (size_t i = 0; i < frames; ++i) {
-        for (size_t c = 0; c < copyChannels; ++c) {
-            pOut[i * outChannels + c] = pIn[i * inChannels + c];
-        }
-        for (size_t c = copyChannels; c < outChannels; ++c) {
-            pOut[i * outChannels + c] = 0.0f;
-        }
-    }
-}
-
-void WasapiRenderClient::ConvertFloatToRaw(const float* pSrc,
-                                           BYTE* pDest,
-                                           size_t frames,
-                                           SampleFormatType fmt,
-                                           size_t channels) {
-    const size_t totalSamples = frames * channels;
-
-    switch (fmt) {
-        case SampleFormatType::Float32:
-            std::memcpy(pDest, pSrc, totalSamples * sizeof(float));
-            break;
-
-        case SampleFormatType::Pcm16: {
-            int16_t* p16 = reinterpret_cast<int16_t*>(pDest);
-            for (size_t i = 0; i < totalSamples; ++i) {
-                float f = std::clamp(pSrc[i], -1.0f, 1.0f);
-                p16[i] = static_cast<int16_t>(f * 32767.0f);
-            }
-            break;
-        }
-
-        case SampleFormatType::Pcm24In32: {
-            int32_t* p32 = reinterpret_cast<int32_t*>(pDest);
-            for (size_t i = 0; i < totalSamples; ++i) {
-                float f = std::clamp(pSrc[i], -1.0f, 1.0f);
-                p32[i] = static_cast<int32_t>(f * 8388607.0f) << 8;
-            }
-            break;
-        }
-
-        case SampleFormatType::Pcm24Packed: {
-            for (size_t i = 0; i < totalSamples; ++i) {
-                float f = std::clamp(pSrc[i], -1.0f, 1.0f);
-                int32_t val = static_cast<int32_t>(f * 8388607.0f);
-                pDest[i * 3]     = static_cast<BYTE>(val & 0xFF);
-                pDest[i * 3 + 1] = static_cast<BYTE>((val >> 8) & 0xFF);
-                pDest[i * 3 + 2] = static_cast<BYTE>((val >> 16) & 0xFF);
-            }
-            break;
-        }
-
-        case SampleFormatType::Pcm32: {
-            int32_t* p32 = reinterpret_cast<int32_t*>(pDest);
-            for (size_t i = 0; i < totalSamples; ++i) {
-                float f = std::clamp(pSrc[i], -1.0f, 1.0f);
-                p32[i] = static_cast<int32_t>(f * 2147483647.0f);
-            }
-            break;
-        }
-
-        default:
-            std::memset(pDest, 0, totalSamples * sizeof(float));
-            break;
-    }
-}
-
 WasapiRenderStats WasapiRenderClient::GetStats() const {
     WasapiRenderStats stats;
     stats.isRendering = m_isRendering.load(std::memory_order_acquire);
@@ -678,9 +533,11 @@ WasapiRenderStats WasapiRenderClient::GetStats() const {
     stats.deviceFriendlyName = m_deviceFriendlyName;
     stats.framesRendered = m_framesRendered.load(std::memory_order_relaxed);
     stats.silentFramesRendered = m_silentFramesRendered.load(std::memory_order_relaxed);
+    stats.underrunRecoveries = m_underrunRecoveryCount.load(std::memory_order_relaxed);
+    stats.bufferUnderruns = stats.underrunRecoveries;
 
     if (m_pRingBuffer) {
-        stats.bufferUnderruns = m_pRingBuffer->GetUnderrunCount();
+        stats.bufferUnderruns += m_pRingBuffer->GetUnderrunCount();
         stats.bufferOverruns = m_pRingBuffer->GetOverrunCount();
         stats.ringBufferFrames = m_pRingBuffer->AvailableRead();
         stats.ringBufferCapacity = m_pRingBuffer->GetCapacity();
@@ -696,6 +553,20 @@ WasapiRenderStats WasapiRenderClient::GetStats() const {
     std::lock_guard<std::mutex> lock(m_errorMutex);
     stats.lastError = m_lastError;
     return stats;
+}
+
+void WasapiRenderClient::SetResampleRatioMultiplier(double multiplier) {
+    if (multiplier > 0.01 && multiplier < 100.0) {
+        m_resampleRatioMultiplier.store(multiplier, std::memory_order_relaxed);
+    }
+}
+
+double WasapiRenderClient::GetResampleRatioMultiplier() const {
+    return m_resampleRatioMultiplier.load(std::memory_order_relaxed);
+}
+
+uint64_t WasapiRenderClient::GetUnderrunRecoveryCount() const {
+    return m_underrunRecoveryCount.load(std::memory_order_relaxed);
 }
 
 } // namespace speakerflow

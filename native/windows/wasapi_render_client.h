@@ -18,6 +18,7 @@
 
 #include "audio_ring_buffer.h"
 #include "wasapi_capture_client.h" // For SampleFormatType
+#include "audio_format_pipeline.h"
 
 namespace speakerflow {
 
@@ -34,6 +35,7 @@ struct WasapiRenderStats {
     uint64_t silentFramesRendered = 0;
     uint64_t bufferUnderruns = 0;
     uint64_t bufferOverruns = 0;
+    uint64_t underrunRecoveries = 0;
     size_t ringBufferFrames = 0;
     size_t ringBufferCapacity = 0;
     double bufferDurationMs = 0.0;
@@ -80,30 +82,23 @@ public:
      */
     WasapiRenderStats GetStats() const;
 
+    /**
+     * @brief Sets resampling ratio multiplier for fine clock-drift adjustments (Phase 2E ready).
+     */
+    void SetResampleRatioMultiplier(double multiplier);
+
+    /**
+     * @brief Gets current resampling ratio multiplier.
+     */
+    double GetResampleRatioMultiplier() const;
+
+    /**
+     * @brief Gets count of underrun recovery events experienced by this render branch.
+     */
+    uint64_t GetUnderrunRecoveryCount() const;
+
 private:
     void RenderThreadProc();
-
-    static void ResampleFloatInterleaved(const float* pIn,
-                                         size_t inFrames,
-                                         float* pOut,
-                                         size_t outFrames,
-                                         size_t channels,
-                                         double inSampleRate,
-                                         double outSampleRate,
-                                         double& ioPhase,
-                                         std::vector<float>& lastFrameHistory);
-
-    static void MapChannelsFloat(const float* pIn,
-                                 size_t inChannels,
-                                 float* pOut,
-                                 size_t outChannels,
-                                 size_t frames);
-
-    static void ConvertFloatToRaw(const float* pSrc,
-                                  BYTE* pDest,
-                                  size_t frames,
-                                  SampleFormatType fmt,
-                                  size_t channels);
 
     std::atomic<bool> m_isRendering;
     std::atomic<bool> m_isEventDriven;
@@ -122,6 +117,8 @@ private:
 
     std::atomic<uint64_t> m_framesRendered;
     std::atomic<uint64_t> m_silentFramesRendered;
+    std::atomic<uint64_t> m_underrunRecoveryCount;
+    std::atomic<double> m_resampleRatioMultiplier;
 
     mutable std::mutex m_errorMutex;
     std::string m_lastError;
@@ -136,6 +133,8 @@ private:
     IAudioClient* m_pAudioClient;
     IAudioRenderClient* m_pRenderClient;
     WAVEFORMATEX* m_pMixFormat;
+
+    AudioFormatPipeline m_pipeline;
 };
 
 } // namespace speakerflow
