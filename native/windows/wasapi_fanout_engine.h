@@ -16,6 +16,7 @@
 #include "wasapi_capture_client.h"
 #include "wasapi_render_client.h"
 #include "audio_ring_buffer.h"
+#include "audio_drift_estimator.h"
 
 namespace speakerflow {
 
@@ -25,6 +26,13 @@ struct WasapiBranchStats {
     std::string deviceFriendlyName;
     bool active = false;
     WasapiRenderStats renderStats;
+    size_t occupancyFrames = 0;
+    double occupancyMs = 0.0;
+    int64_t occupancyErrorFrames = 0;
+    double occupancySlope = 0.0;
+    double driftPpm = 0.0;
+    bool estimatorStable = false;
+    std::string renderState = "Preroll";
 };
 
 struct WasapiFanOutEngineStatus {
@@ -112,8 +120,12 @@ private:
         size_t slotIndex = 0;
         std::unique_ptr<AudioRingBuffer> ringBuffer;
         std::unique_ptr<WasapiRenderClient> renderClient;
+        std::unique_ptr<AudioDriftEstimator> driftEstimator;
         std::atomic<bool> active{false};
+        mutable uint64_t lastRecoveryCount = 0;
     };
+
+    void PopulateBranchStats(const BranchDescriptor& branch, WasapiBranchStats& bStats) const;
 
     mutable std::mutex m_engineMutex;
     WasapiCaptureClient m_captureClient;

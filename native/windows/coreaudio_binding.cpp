@@ -2426,6 +2426,24 @@ static napi_value Method_EngineGetOutputStats(napi_env env, napi_callback_info i
     napi_set_named_property(env, obj, "bufferDurationMs", bufDurVal);
     napi_set_named_property(env, obj, "ringBufferOccupancyMs", ringOccVal);
 
+    napi_value occFramesVal, occMsVal, driftVal, occErrVal, stableVal, slopeVal, stateVal, ratioVal;
+    napi_create_int64(env, static_cast<int64_t>(bStats.occupancyFrames), &occFramesVal);
+    napi_create_double(env, bStats.occupancyMs, &occMsVal);
+    napi_create_double(env, bStats.driftPpm, &driftVal);
+    napi_create_int64(env, bStats.occupancyErrorFrames, &occErrVal);
+    napi_get_boolean(env, bStats.estimatorStable, &stableVal);
+    napi_create_double(env, bStats.occupancySlope, &slopeVal);
+    napi_create_string_utf8(env, bStats.renderState.c_str(), NAPI_AUTO_LENGTH, &stateVal);
+    napi_create_double(env, bStats.renderStats.resampleRatioMultiplier, &ratioVal);
+    napi_set_named_property(env, obj, "occupancyFrames", occFramesVal);
+    napi_set_named_property(env, obj, "occupancyMs", occMsVal);
+    napi_set_named_property(env, obj, "driftPpm", driftVal);
+    napi_set_named_property(env, obj, "occupancyErrorFrames", occErrVal);
+    napi_set_named_property(env, obj, "estimatorStable", stableVal);
+    napi_set_named_property(env, obj, "occupancySlope", slopeVal);
+    napi_set_named_property(env, obj, "renderState", stateVal);
+    napi_set_named_property(env, obj, "resampleRatioMultiplier", ratioVal);
+
     return obj;
 }
 
@@ -2471,6 +2489,24 @@ static napi_value Method_EngineGetStatus(napi_env env, napi_callback_info info) 
         napi_set_named_property(env, bObj, "framesRendered", framesVal);
         napi_set_named_property(env, bObj, "bufferUnderruns", underVal);
         napi_set_named_property(env, bObj, "bufferOverruns", overVal);
+
+        napi_value occFramesVal, occMsVal, driftVal, occErrVal, stableVal, slopeVal, stateVal, bRatioVal;
+        napi_create_int64(env, static_cast<int64_t>(b.occupancyFrames), &occFramesVal);
+        napi_create_double(env, b.occupancyMs, &occMsVal);
+        napi_create_double(env, b.driftPpm, &driftVal);
+        napi_create_int64(env, b.occupancyErrorFrames, &occErrVal);
+        napi_get_boolean(env, b.estimatorStable, &stableVal);
+        napi_create_double(env, b.occupancySlope, &slopeVal);
+        napi_create_string_utf8(env, b.renderState.c_str(), NAPI_AUTO_LENGTH, &stateVal);
+        napi_create_double(env, b.renderStats.resampleRatioMultiplier, &bRatioVal);
+        napi_set_named_property(env, bObj, "occupancyFrames", occFramesVal);
+        napi_set_named_property(env, bObj, "occupancyMs", occMsVal);
+        napi_set_named_property(env, bObj, "driftPpm", driftVal);
+        napi_set_named_property(env, bObj, "occupancyErrorFrames", occErrVal);
+        napi_set_named_property(env, bObj, "estimatorStable", stableVal);
+        napi_set_named_property(env, bObj, "occupancySlope", slopeVal);
+        napi_set_named_property(env, bObj, "renderState", stateVal);
+        napi_set_named_property(env, bObj, "resampleRatioMultiplier", bRatioVal);
 
         napi_set_element(env, branchArr, (uint32_t)i, bObj);
     }

@@ -22,6 +22,12 @@
 
 namespace speakerflow {
 
+enum class RenderBufferState : uint32_t {
+    Preroll = 0,
+    Running = 1,
+    Recovery = 2
+};
+
 struct WasapiRenderStats {
     bool isRendering = false;
     bool isEventDriven = false;
@@ -40,6 +46,9 @@ struct WasapiRenderStats {
     size_t ringBufferCapacity = 0;
     double bufferDurationMs = 0.0;
     double ringBufferOccupancyMs = 0.0;
+    RenderBufferState bufferState = RenderBufferState::Preroll;
+    std::string bufferStateName = "Preroll";
+    double resampleRatioMultiplier = 1.0;
     std::string lastError;
 };
 
@@ -97,6 +106,16 @@ public:
      */
     uint64_t GetUnderrunRecoveryCount() const;
 
+    /**
+     * @brief Gets the current internal buffer state (Preroll, Running, Recovery).
+     */
+    RenderBufferState GetBufferState() const;
+
+    /**
+     * @brief Checks if rendering has reached the genuine steady Running state.
+     */
+    bool IsBufferRunning() const;
+
 private:
     void RenderThreadProc();
 
@@ -119,6 +138,7 @@ private:
     std::atomic<uint64_t> m_silentFramesRendered;
     std::atomic<uint64_t> m_underrunRecoveryCount;
     std::atomic<double> m_resampleRatioMultiplier;
+    std::atomic<RenderBufferState> m_bufferState{RenderBufferState::Preroll};
 
     mutable std::mutex m_errorMutex;
     std::string m_lastError;

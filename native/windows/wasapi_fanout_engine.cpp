@@ -157,6 +157,10 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
     // Atomically register ring buffer to receive captured frames
     m_captureClient.SetBranchBuffer(freeSlot, ringBuffer.get());
 
+    // Initialize drift estimator for this branch (reference = capture timeline)
+    const size_t targetOccupancy = static_cast<size_t>(capStats.sampleRate * 0.050);
+    auto driftEstimator = std::make_unique<AudioDriftEstimator>(capStats.sampleRate, targetOccupancy);
+
     // Register branch descriptor
     auto desc = std::make_unique<BranchDescriptor>();
     desc->branchId = branchId;
@@ -165,6 +169,7 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
     desc->slotIndex = freeSlot;
     desc->ringBuffer = std::move(ringBuffer);
     desc->renderClient = std::move(renderClient);
+    desc->driftEstimator = std::move(driftEstimator);
     desc->active.store(true, std::memory_order_release);
 
     m_branches[freeSlot] = std::move(desc);
@@ -204,16 +209,64 @@ bool WasapiFanOutEngine::IsBranchActive(const std::string& branchId) const {
     return false;
 }
 
+void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, WasapiBranchStats& bStats) const {
+    bStats.branchId = branch.branchId;
+    bStats.endpointId = WideToUtf8(branch.endpointId.c_str());
+    bStats.deviceFriendlyName = branch.deviceFriendlyName;
+    bStats.active = branch.active.load(std::memory_order_relaxed);
+    bStats.renderStats = branch.renderClient->GetStats();
+    bStats.renderState = bStats.renderStats.bufferStateName;
+
+    RenderBufferState rState = branch.renderClient->GetBufferState();
+    uint64_t currentRecoveries = bStats.renderStats.underrunRecoveries;
+    bool recoveryOccurred = (currentRecoveries != branch.lastRecoveryCount);
+
+    if (rState == RenderBufferState::Preroll) {
+        // While branch is in Preroll: estimator must remain reset / inactive
+        if (branch.driftEstimator) {
+            branch.driftEstimator->Reset();
+        }
+        branch.lastRecoveryCount = currentRecoveries;
+    } else if (rState == RenderBufferState::Recovery || recoveryOccurred) {
+        // Recovery in progress or underrun recovery occurred: reset/invalidate measurement window
+        if (branch.driftEstimator) {
+            branch.driftEstimator->Reset();
+        }
+        branch.lastRecoveryCount = currentRecoveries;
+    } else if (rState == RenderBufferState::Running) {
+        // Genuine running state: collect occupancy samples
+        if (branch.driftEstimator) {
+            branch.driftEstimator->Update(
+                bStats.renderStats.ringBufferFrames,
+                bStats.renderStats.framesRendered
+            );
+        }
+    }
+
+    if (branch.driftEstimator) {
+        DriftTelemetry telem = branch.driftEstimator->GetTelemetry();
+        bStats.occupancyFrames = bStats.renderStats.ringBufferFrames;
+        bStats.occupancyMs = bStats.renderStats.ringBufferOccupancyMs;
+        bStats.occupancyErrorFrames = static_cast<int64_t>(bStats.occupancyFrames) - static_cast<int64_t>(branch.driftEstimator->GetTargetOccupancy());
+        bStats.occupancySlope = telem.occupancySlope;
+        bStats.driftPpm = telem.driftPpm;
+        bStats.estimatorStable = telem.isStable;
+    } else {
+        bStats.occupancyFrames = bStats.renderStats.ringBufferFrames;
+        bStats.occupancyMs = bStats.renderStats.ringBufferOccupancyMs;
+        bStats.occupancyErrorFrames = 0;
+        bStats.occupancySlope = 0.0;
+        bStats.driftPpm = 0.0;
+        bStats.estimatorStable = false;
+    }
+}
+
 bool WasapiFanOutEngine::GetOutputStats(const std::string& branchId, WasapiBranchStats& outStats) const {
     std::lock_guard<std::mutex> lock(m_engineMutex);
 
     for (size_t i = 0; i < MAX_BRANCHES; ++i) {
         if (m_branches[i] && m_branches[i]->branchId == branchId) {
-            outStats.branchId = m_branches[i]->branchId;
-            outStats.endpointId = WideToUtf8(m_branches[i]->endpointId.c_str());
-            outStats.deviceFriendlyName = m_branches[i]->deviceFriendlyName;
-            outStats.active = m_branches[i]->active.load(std::memory_order_relaxed);
-            outStats.renderStats = m_branches[i]->renderClient->GetStats();
+            PopulateBranchStats(*m_branches[i], outStats);
             return true;
         }
     }
@@ -232,11 +285,7 @@ WasapiFanOutEngineStatus WasapiFanOutEngine::GetStatus() const {
     for (size_t i = 0; i < MAX_BRANCHES; ++i) {
         if (m_branches[i]) {
             WasapiBranchStats bStats;
-            bStats.branchId = m_branches[i]->branchId;
-            bStats.endpointId = WideToUtf8(m_branches[i]->endpointId.c_str());
-            bStats.deviceFriendlyName = m_branches[i]->deviceFriendlyName;
-            bStats.active = m_branches[i]->active.load(std::memory_order_relaxed);
-            bStats.renderStats = m_branches[i]->renderClient->GetStats();
+            PopulateBranchStats(*m_branches[i], bStats);
             status.branches.push_back(bStats);
         }
     }

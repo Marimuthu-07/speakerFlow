@@ -44,6 +44,7 @@ WasapiRenderClient::WasapiRenderClient()
       m_silentFramesRendered(0),
       m_underrunRecoveryCount(0),
       m_resampleRatioMultiplier(1.0),
+      m_bufferState(RenderBufferState::Preroll),
       m_pRingBuffer(nullptr),
       m_hStopEvent(NULL),
       m_hAudioEvent(NULL),
@@ -86,6 +87,7 @@ bool WasapiRenderClient::StartRender(const std::wstring& targetDeviceId,
     m_silentFramesRendered.store(0, std::memory_order_relaxed);
     m_underrunRecoveryCount.store(0, std::memory_order_relaxed);
     m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
+    m_bufferState.store(RenderBufferState::Preroll, std::memory_order_relaxed);
 
     IMMDeviceEnumerator* pEnumerator = nullptr;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
@@ -310,6 +312,8 @@ bool WasapiRenderClient::StartRender(const std::wstring& targetDeviceId,
 }
 
 void WasapiRenderClient::StopRender() {
+    m_bufferState.store(RenderBufferState::Preroll, std::memory_order_relaxed);
+
     if (!m_isRendering.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
@@ -376,17 +380,12 @@ void WasapiRenderClient::RenderThreadProc() {
     const size_t maxFrames = std::max<size_t>(m_bufferFrameCount * 4, 8192);
     std::vector<float> captureStaging(maxFrames * m_captureChannels, 0.0f);
 
-    enum class RenderBufferState {
-        Preroll,
-        Running,
-        Recovery
-    };
-
     RenderBufferState bufferState = RenderBufferState::Preroll;
+    m_bufferState.store(RenderBufferState::Preroll, std::memory_order_relaxed);
 
     // Watermarks for underrun recovery hysteresis:
     // High watermark: 50ms of audio (or 2x WASAPI buffer)
-    const size_t highWatermarkFrames = std::min<size_t>(m_bufferFrameCount * 2,
+    const size_t highWatermarkFrames = std::max<size_t>(m_bufferFrameCount * 2,
                                                         static_cast<size_t>(m_captureSampleRate * 0.050));
     // Low watermark minimum: ~5ms
     const size_t lowWatermarkMinFrames = static_cast<size_t>(m_captureSampleRate * 0.005);
@@ -449,10 +448,12 @@ void WasapiRenderClient::RenderThreadProc() {
                 continue;
             }
             bufferState = RenderBufferState::Running;
+            m_bufferState.store(RenderBufferState::Running, std::memory_order_relaxed);
         } else if (bufferState == RenderBufferState::Running) {
             if (available < lowWatermarkFrames) {
                 // Genuine starvation detected: enter Recovery and pause consumption
                 bufferState = RenderBufferState::Recovery;
+                m_bufferState.store(RenderBufferState::Recovery, std::memory_order_relaxed);
                 m_underrunRecoveryCount.fetch_add(1, std::memory_order_relaxed);
                 m_pipeline.Reset(); // Clear resampler history across silence gap
 
@@ -477,6 +478,7 @@ void WasapiRenderClient::RenderThreadProc() {
             }
             // Refilled to high watermark: resume steady-state rendering
             bufferState = RenderBufferState::Running;
+            m_bufferState.store(RenderBufferState::Running, std::memory_order_relaxed);
         }
 
         // Running state with sufficient buffer: acquire render buffer
@@ -535,6 +537,14 @@ WasapiRenderStats WasapiRenderClient::GetStats() const {
     stats.silentFramesRendered = m_silentFramesRendered.load(std::memory_order_relaxed);
     stats.underrunRecoveries = m_underrunRecoveryCount.load(std::memory_order_relaxed);
     stats.bufferUnderruns = stats.underrunRecoveries;
+    stats.bufferState = m_bufferState.load(std::memory_order_relaxed);
+    switch (stats.bufferState) {
+        case RenderBufferState::Preroll:  stats.bufferStateName = "Preroll"; break;
+        case RenderBufferState::Running:  stats.bufferStateName = "Running"; break;
+        case RenderBufferState::Recovery: stats.bufferStateName = "Recovery"; break;
+        default: stats.bufferStateName = "Unknown"; break;
+    }
+    stats.resampleRatioMultiplier = m_resampleRatioMultiplier.load(std::memory_order_relaxed);
 
     if (m_pRingBuffer) {
         stats.bufferUnderruns += m_pRingBuffer->GetUnderrunCount();
@@ -567,6 +577,14 @@ double WasapiRenderClient::GetResampleRatioMultiplier() const {
 
 uint64_t WasapiRenderClient::GetUnderrunRecoveryCount() const {
     return m_underrunRecoveryCount.load(std::memory_order_relaxed);
+}
+
+RenderBufferState WasapiRenderClient::GetBufferState() const {
+    return m_bufferState.load(std::memory_order_relaxed);
+}
+
+bool WasapiRenderClient::IsBufferRunning() const {
+    return m_bufferState.load(std::memory_order_relaxed) == RenderBufferState::Running;
 }
 
 } // namespace speakerflow
