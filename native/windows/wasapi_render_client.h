@@ -19,6 +19,8 @@
 #include "audio_ring_buffer.h"
 #include "wasapi_capture_client.h" // For SampleFormatType
 #include "audio_format_pipeline.h"
+#include "audio_drift_estimator.h"
+#include "audio_drift_controller.h"
 
 namespace speakerflow {
 
@@ -116,6 +118,16 @@ public:
      */
     bool IsBufferRunning() const;
 
+    /**
+     * @brief Gets a copy of the latest DriftTelemetry snapshot from the render-thread estimator.
+     */
+    DriftTelemetry GetDriftTelemetry() const;
+
+    /**
+     * @brief Gets a copy of the latest DriftControllerStatus snapshot from the render-thread controller.
+     */
+    DriftControllerStatus GetDriftControllerStatus() const;
+
 private:
     void RenderThreadProc();
 
@@ -155,6 +167,23 @@ private:
     WAVEFORMATEX* m_pMixFormat;
 
     AudioFormatPipeline m_pipeline;
+
+    AudioDriftEstimator m_driftEstimator;
+    AudioDriftController m_driftController;
+
+    // Multi-slot lock-free snapshot publication with reader lifetime protection.
+    // Guaranteed zero data races: writer never overwrites a slot while readerCount > 0.
+    struct DriftSnapshot {
+        DriftTelemetry telemetry{};
+        DriftControllerStatus controllerStatus{};
+    };
+
+    static constexpr size_t NUM_SNAPSHOT_SLOTS = 4;
+    DriftSnapshot m_snapshots[NUM_SNAPSHOT_SLOTS]{};
+    mutable std::atomic<uint32_t> m_readerCounts[NUM_SNAPSHOT_SLOTS]{};
+    std::atomic<uint32_t> m_publishedSlot{0};
+
+    void PublishTelemetrySnapshot(const DriftTelemetry& telemetry, const DriftControllerStatus& status);
 };
 
 } // namespace speakerflow
