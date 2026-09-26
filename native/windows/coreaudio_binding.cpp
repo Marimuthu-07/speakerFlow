@@ -1742,8 +1742,14 @@ static napi_value Method_CaptureStart(napi_env env, napi_callback_info info) {
                 napi_typeof(env, devIdVal, &propType);
                 if (propType == napi_string) {
                     deviceId = GetWideStringFromNapi(env, devIdVal);
+                } else if (propType != napi_undefined && propType != napi_null) {
+                    napi_throw_type_error(env, NULL, "Invalid argument: options.deviceId must be a string.");
+                    return NULL;
                 }
             }
+        } else if (argType != napi_undefined && argType != napi_null) {
+            napi_throw_type_error(env, NULL, "Invalid argument: endpointId must be a string or options object.");
+            return NULL;
         }
     }
 
@@ -1776,11 +1782,13 @@ static napi_value Method_CaptureStart(napi_env env, napi_callback_info info) {
     napi_set_named_property(env, resObj, "channels", chVal);
     napi_set_named_property(env, resObj, "bitsPerSample", bpsVal);
 
-    napi_value fmtVal, nameVal;
+    napi_value fmtVal, nameVal, devIdVal;
     napi_create_string_utf8(env, stats.formatTag.c_str(), NAPI_AUTO_LENGTH, &fmtVal);
     napi_create_string_utf8(env, stats.deviceFriendlyName.c_str(), NAPI_AUTO_LENGTH, &nameVal);
+    napi_create_string_utf8(env, stats.deviceId.c_str(), NAPI_AUTO_LENGTH, &devIdVal);
     napi_set_named_property(env, resObj, "format", fmtVal);
     napi_set_named_property(env, resObj, "deviceFriendlyName", nameVal);
+    napi_set_named_property(env, resObj, "deviceId", devIdVal);
 
     napi_value evVal;
     napi_get_boolean(env, stats.isEventDriven, &evVal);

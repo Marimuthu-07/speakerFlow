@@ -188,71 +188,70 @@ class WindowsCoreAudioBackend extends AudioBackend {
     // Filter out expired streams (AudioSessionStateExpired = 2)
     const validStreams = (rawStreams || []).filter((s) => s.state !== 2);
 
-    // Track which endpoints have actively playing streams for each process
-    const activeEndpointsByPid = new Map();
+    // Group valid audio sessions by processId into unified application streams.
+    // If processId is absent or 0, group by session ID so isolated streams are not dropped.
+    const streamsByProcess = new Map();
     for (const stream of validStreams) {
-      if (stream.isActive && stream.processId) {
-        if (!activeEndpointsByPid.has(stream.processId)) {
-          activeEndpointsByPid.set(stream.processId, new Set());
-        }
-        activeEndpointsByPid.get(stream.processId).add(stream.currentSinkId);
+      const groupKey = (stream.processId && stream.processId !== 0)
+        ? `pid:${stream.processId}`
+        : `id:${stream.id || Math.random()}`;
+      if (!streamsByProcess.has(groupKey)) {
+        streamsByProcess.set(groupKey, []);
       }
+      streamsByProcess.get(groupKey).push(stream);
     }
 
-    // Reconcile cross-endpoint stale streams:
-    // If an application process (PID) is actively playing on one endpoint, suppress any dormant
-    // inactive session left behind on a previous endpoint for the same process.
-    let reconciledStreams = validStreams.filter((stream) => {
-      if (!stream.isActive && stream.processId && activeEndpointsByPid.has(stream.processId)) {
-        const activeEndpoints = activeEndpointsByPid.get(stream.processId);
-        if (!activeEndpoints.has(stream.currentSinkId)) {
-          return false;
-        }
-      }
-      return true;
-    });
+    const groupedStreams = [];
+    for (const [_key, pidStreams] of streamsByProcess) {
+      if (pidStreams.length === 0) continue;
 
-    // If an application has multiple inactive streams across different endpoints (e.g. paused
-    // after a device migration) for the same PID, keep the one on the default endpoint.
-    const streamsByPid = new Map();
-    for (const s of reconciledStreams) {
-      if (s.processId) {
-        if (!streamsByPid.has(s.processId)) streamsByPid.set(s.processId, []);
-        streamsByPid.get(s.processId).push(s);
+      // Identify all active sessions for this process
+      const activeSessions = pidStreams.filter((s) => Boolean(s.isActive));
+      const hasActiveSession = activeSessions.length > 0;
+
+      // Select representative session deterministically:
+      // 1. If any session is active, select an active session (prefer active session with non-zero volume or first active).
+      // 2. If all sessions are inactive, prefer session on default device if present, else fallback to the last enumerated session.
+      let representative = null;
+      if (hasActiveSession) {
+        representative = activeSessions.find((s) => (s.volumePercent || 0) > 0) || activeSessions[0];
+      } else {
+        const onDefault = pidStreams.find((s) => s.currentSinkId === defaultDevice?.id);
+        representative = onDefault || pidStreams[pidStreams.length - 1];
       }
-    }
-    const suppressedIds = new Set();
-    for (const [_pid, pidStreams] of streamsByPid) {
-      if (pidStreams.length > 1) {
-        const uniqueEndpoints = new Set(pidStreams.map((s) => s.currentSinkId));
-        // Only if these streams span multiple different physical endpoints and all are inactive
-        if (uniqueEndpoints.size > 1 && pidStreams.every((s) => !s.isActive)) {
-          const onDefault = pidStreams.find((s) => s.currentSinkId === defaultDevice?.id);
-          const keeper = onDefault || pidStreams[pidStreams.length - 1];
-          for (const s of pidStreams) {
-            if (s !== keeper && s.id) {
-              suppressedIds.add(s.id);
-            }
-          }
-        }
+
+      if (!representative) {
+        representative = pidStreams[0];
       }
-    }
-    if (suppressedIds.size > 0) {
-      reconciledStreams = reconciledStreams.filter((s) => !suppressedIds.has(s.id));
+
+      groupedStreams.push({
+        id: representative.id || `${representative.processId}-${representative.currentSinkId}`,
+        processId: representative.processId,
+        applicationName: representative.name || `Process ${representative.processId}`,
+        streamName: representative.name || '',
+        currentSinkId: representative.currentSinkId || defaultDevice?.id || null,
+        currentSinkName: representative.currentSinkName || defaultDevice?.name || 'Default Output',
+        isActive: Boolean(hasActiveSession),
+        volumePercent: typeof representative.volumePercent === 'number' ? representative.volumePercent : 100,
+        mute: Boolean(representative.mute),
+        state: representative.state !== undefined ? representative.state : (hasActiveSession ? 1 : 0),
+        iconName: 'audio-x-generic',
+        sessions: pidStreams.map((s) => ({
+          id: s.id,
+          sessionIdentifier: s.sessionIdentifier || null,
+          processId: s.processId,
+          name: s.name,
+          state: s.state,
+          isActive: Boolean(s.isActive),
+          volumePercent: typeof s.volumePercent === 'number' ? s.volumePercent : 100,
+          mute: Boolean(s.mute),
+          currentSinkId: s.currentSinkId,
+          currentSinkName: s.currentSinkName
+        }))
+      });
     }
 
-    return reconciledStreams.map((stream) => ({
-      id: stream.id || `${stream.processId}-${stream.currentSinkId}`,
-      processId: stream.processId,
-      applicationName: stream.name || `Process ${stream.processId}`,
-      streamName: stream.name || '',
-      currentSinkId: stream.currentSinkId || defaultDevice?.id || null,
-      currentSinkName: stream.currentSinkName || defaultDevice?.name || 'Default Output',
-      isActive: Boolean(stream.isActive),
-      volumePercent: typeof stream.volumePercent === 'number' ? stream.volumePercent : 100,
-      mute: Boolean(stream.mute),
-      iconName: 'audio-x-generic'
-    }));
+    return groupedStreams;
   }
 
   async findSinkByName(sinkName) {
