@@ -52,7 +52,7 @@ WasapiRenderClient::WasapiRenderClient()
       m_pAudioClient(nullptr),
       m_pRenderClient(nullptr),
       m_pMixFormat(nullptr),
-      m_publishedSlot(0) {
+      m_publishedVersion(0) {
     m_driftEstimator.Reset();
     m_driftController.Reset();
     for (size_t i = 0; i < NUM_SNAPSHOT_SLOTS; ++i) {
@@ -660,13 +660,14 @@ bool WasapiRenderClient::IsBufferRunning() const {
 
 void WasapiRenderClient::PublishTelemetrySnapshot(const DriftTelemetry& telemetry,
                                                  const DriftControllerStatus& status) {
-    uint32_t currentPublished = m_publishedSlot.load(std::memory_order_relaxed);
+    uint32_t currentVer = m_publishedVersion.load(std::memory_order_seq_cst);
+    uint32_t currentSlot = currentVer % NUM_SNAPSHOT_SLOTS;
 
     // Find a free slot that is NOT currently published and has NO active readers
     int writeSlot = -1;
     for (size_t i = 1; i < NUM_SNAPSHOT_SLOTS; ++i) {
-        size_t candidate = (currentPublished + i) % NUM_SNAPSHOT_SLOTS;
-        if (m_readerCounts[candidate].load(std::memory_order_acquire) == 0) {
+        size_t candidate = (currentSlot + i) % NUM_SNAPSHOT_SLOTS;
+        if (m_readerCounts[candidate].load(std::memory_order_seq_cst) == 0) {
             writeSlot = static_cast<int>(candidate);
             break;
         }
@@ -674,7 +675,7 @@ void WasapiRenderClient::PublishTelemetrySnapshot(const DriftTelemetry& telemetr
 
     if (writeSlot < 0) {
         // All alternate slots currently held by readers; skip publishing this cycle.
-        // Wait-free, zero blocking for the real-time audio thread.
+        // Non-blocking, bounded publication attempt for the real-time audio thread.
         return;
     }
 
@@ -682,33 +683,53 @@ void WasapiRenderClient::PublishTelemetrySnapshot(const DriftTelemetry& telemetr
     m_snapshots[writeSlot].telemetry = telemetry;
     m_snapshots[writeSlot].controllerStatus = status;
 
-    // Atomically publish writeSlot with release ordering
-    m_publishedSlot.store(static_cast<uint32_t>(writeSlot), std::memory_order_release);
+    // Advance monotonic version counter such that (currentVer + offset) % NUM_SNAPSHOT_SLOTS == writeSlot
+    uint32_t offset = (static_cast<uint32_t>(writeSlot) + NUM_SNAPSHOT_SLOTS - (currentVer % NUM_SNAPSHOT_SLOTS)) % NUM_SNAPSHOT_SLOTS;
+    if (offset == 0) offset = NUM_SNAPSHOT_SLOTS;
+    m_publishedVersion.store(currentVer + offset, std::memory_order_seq_cst);
 }
 
 DriftTelemetry WasapiRenderClient::GetDriftTelemetry() const {
     while (true) {
-        uint32_t slot = m_publishedSlot.load(std::memory_order_acquire) % NUM_SNAPSHOT_SLOTS;
-        m_readerCounts[slot].fetch_add(1, std::memory_order_acquire);
-        if (m_publishedSlot.load(std::memory_order_acquire) % NUM_SNAPSHOT_SLOTS == slot) {
+        uint32_t ver = m_publishedVersion.load(std::memory_order_seq_cst);
+        uint32_t slot = ver % NUM_SNAPSHOT_SLOTS;
+        m_readerCounts[slot].fetch_add(1, std::memory_order_seq_cst);
+        if (m_publishedVersion.load(std::memory_order_seq_cst) == ver) {
             DriftTelemetry result = m_snapshots[slot].telemetry;
-            m_readerCounts[slot].fetch_sub(1, std::memory_order_release);
+            m_readerCounts[slot].fetch_sub(1, std::memory_order_seq_cst);
             return result;
         }
-        m_readerCounts[slot].fetch_sub(1, std::memory_order_release);
+        m_readerCounts[slot].fetch_sub(1, std::memory_order_seq_cst);
     }
 }
 
 DriftControllerStatus WasapiRenderClient::GetDriftControllerStatus() const {
     while (true) {
-        uint32_t slot = m_publishedSlot.load(std::memory_order_acquire) % NUM_SNAPSHOT_SLOTS;
-        m_readerCounts[slot].fetch_add(1, std::memory_order_acquire);
-        if (m_publishedSlot.load(std::memory_order_acquire) % NUM_SNAPSHOT_SLOTS == slot) {
+        uint32_t ver = m_publishedVersion.load(std::memory_order_seq_cst);
+        uint32_t slot = ver % NUM_SNAPSHOT_SLOTS;
+        m_readerCounts[slot].fetch_add(1, std::memory_order_seq_cst);
+        if (m_publishedVersion.load(std::memory_order_seq_cst) == ver) {
             DriftControllerStatus result = m_snapshots[slot].controllerStatus;
-            m_readerCounts[slot].fetch_sub(1, std::memory_order_release);
+            m_readerCounts[slot].fetch_sub(1, std::memory_order_seq_cst);
             return result;
         }
-        m_readerCounts[slot].fetch_sub(1, std::memory_order_release);
+        m_readerCounts[slot].fetch_sub(1, std::memory_order_seq_cst);
+    }
+}
+
+void WasapiRenderClient::GetDriftSnapshot(DriftTelemetry& outTelemetry,
+                                         DriftControllerStatus& outStatus) const {
+    while (true) {
+        uint32_t ver = m_publishedVersion.load(std::memory_order_seq_cst);
+        uint32_t slot = ver % NUM_SNAPSHOT_SLOTS;
+        m_readerCounts[slot].fetch_add(1, std::memory_order_seq_cst);
+        if (m_publishedVersion.load(std::memory_order_seq_cst) == ver) {
+            outTelemetry = m_snapshots[slot].telemetry;
+            outStatus = m_snapshots[slot].controllerStatus;
+            m_readerCounts[slot].fetch_sub(1, std::memory_order_seq_cst);
+            return;
+        }
+        m_readerCounts[slot].fetch_sub(1, std::memory_order_seq_cst);
     }
 }
 

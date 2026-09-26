@@ -157,10 +157,6 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
     // Atomically register ring buffer to receive captured frames
     m_captureClient.SetBranchBuffer(freeSlot, ringBuffer.get());
 
-    // Initialize drift estimator for this branch (reference = capture timeline)
-    const size_t targetOccupancy = static_cast<size_t>(capStats.sampleRate * 0.050);
-    auto driftEstimator = std::make_unique<AudioDriftEstimator>(capStats.sampleRate, targetOccupancy);
-
     // Register branch descriptor
     auto desc = std::make_unique<BranchDescriptor>();
     desc->branchId = branchId;
@@ -169,7 +165,6 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
     desc->slotIndex = freeSlot;
     desc->ringBuffer = std::move(ringBuffer);
     desc->renderClient = std::move(renderClient);
-    desc->driftEstimator = std::move(driftEstimator);
     desc->active.store(true, std::memory_order_release);
 
     m_branches[freeSlot] = std::move(desc);
@@ -214,50 +209,43 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
     bStats.endpointId = WideToUtf8(branch.endpointId.c_str());
     bStats.deviceFriendlyName = branch.deviceFriendlyName;
     bStats.active = branch.active.load(std::memory_order_relaxed);
-    bStats.renderStats = branch.renderClient->GetStats();
-    bStats.renderState = bStats.renderStats.bufferStateName;
 
-    RenderBufferState rState = branch.renderClient->GetBufferState();
-    uint64_t currentRecoveries = bStats.renderStats.underrunRecoveries;
-    bool recoveryOccurred = (currentRecoveries != branch.lastRecoveryCount);
+    if (branch.renderClient) {
+        bStats.renderStats = branch.renderClient->GetStats();
+        bStats.renderState = bStats.renderStats.bufferStateName;
 
-    if (rState == RenderBufferState::Preroll) {
-        // While branch is in Preroll: estimator must remain reset / inactive
-        if (branch.driftEstimator) {
-            branch.driftEstimator->Reset();
-        }
-        branch.lastRecoveryCount = currentRecoveries;
-    } else if (rState == RenderBufferState::Recovery || recoveryOccurred) {
-        // Recovery in progress or underrun recovery occurred: reset/invalidate measurement window
-        if (branch.driftEstimator) {
-            branch.driftEstimator->Reset();
-        }
-        branch.lastRecoveryCount = currentRecoveries;
-    } else if (rState == RenderBufferState::Running) {
-        // Genuine running state: collect occupancy samples
-        if (branch.driftEstimator) {
-            branch.driftEstimator->Update(
-                bStats.renderStats.ringBufferFrames,
-                bStats.renderStats.framesRendered
-            );
-        }
-    }
+        DriftTelemetry telem{};
+        DriftControllerStatus ctrlStatus{};
+        branch.renderClient->GetDriftSnapshot(telem, ctrlStatus);
 
-    if (branch.driftEstimator) {
-        DriftTelemetry telem = branch.driftEstimator->GetTelemetry();
         bStats.occupancyFrames = bStats.renderStats.ringBufferFrames;
         bStats.occupancyMs = bStats.renderStats.ringBufferOccupancyMs;
-        bStats.occupancyErrorFrames = static_cast<int64_t>(bStats.occupancyFrames) - static_cast<int64_t>(branch.driftEstimator->GetTargetOccupancy());
+        bStats.occupancyErrorFrames = telem.occupancyError;
         bStats.occupancySlope = telem.occupancySlope;
         bStats.driftPpm = telem.driftPpm;
         bStats.estimatorStable = telem.isStable;
+
+        bStats.trueDriftPpm = ctrlStatus.trueDriftPpm;
+        bStats.filteredDriftPpm = ctrlStatus.filteredDriftPpm;
+        bStats.feedforwardCorrection = ctrlStatus.feedforwardCorrection;
+        bStats.feedbackCorrection = ctrlStatus.feedbackCorrection;
+        bStats.targetMultiplier = ctrlStatus.targetMultiplier;
+        bStats.isClamped = ctrlStatus.isClamped;
     } else {
-        bStats.occupancyFrames = bStats.renderStats.ringBufferFrames;
-        bStats.occupancyMs = bStats.renderStats.ringBufferOccupancyMs;
+        bStats.renderStats = WasapiRenderStats{};
+        bStats.renderState = "Stopped";
+        bStats.occupancyFrames = 0;
+        bStats.occupancyMs = 0.0;
         bStats.occupancyErrorFrames = 0;
         bStats.occupancySlope = 0.0;
         bStats.driftPpm = 0.0;
         bStats.estimatorStable = false;
+        bStats.trueDriftPpm = 0.0;
+        bStats.filteredDriftPpm = 0.0;
+        bStats.feedforwardCorrection = 0.0;
+        bStats.feedbackCorrection = 0.0;
+        bStats.targetMultiplier = 1.0;
+        bStats.isClamped = false;
     }
 }
 

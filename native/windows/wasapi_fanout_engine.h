@@ -17,6 +17,7 @@
 #include "wasapi_render_client.h"
 #include "audio_ring_buffer.h"
 #include "audio_drift_estimator.h"
+#include "audio_drift_controller.h"
 
 namespace speakerflow {
 
@@ -33,6 +34,14 @@ struct WasapiBranchStats {
     double driftPpm = 0.0;
     bool estimatorStable = false;
     std::string renderState = "Preroll";
+
+    // Closed-loop drift controller telemetry from render client
+    double trueDriftPpm = 0.0;
+    double filteredDriftPpm = 0.0;
+    double feedforwardCorrection = 0.0;
+    double feedbackCorrection = 0.0;
+    double targetMultiplier = 1.0;
+    bool isClamped = false;
 };
 
 struct WasapiFanOutEngineStatus {
@@ -120,9 +129,7 @@ private:
         size_t slotIndex = 0;
         std::unique_ptr<AudioRingBuffer> ringBuffer;
         std::unique_ptr<WasapiRenderClient> renderClient;
-        std::unique_ptr<AudioDriftEstimator> driftEstimator;
         std::atomic<bool> active{false};
-        mutable uint64_t lastRecoveryCount = 0;
     };
 
     void PopulateBranchStats(const BranchDescriptor& branch, WasapiBranchStats& bStats) const;

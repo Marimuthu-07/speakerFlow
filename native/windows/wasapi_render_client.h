@@ -128,6 +128,12 @@ public:
      */
     DriftControllerStatus GetDriftControllerStatus() const;
 
+    /**
+     * @brief Gets a coherent combined snapshot of both DriftTelemetry and DriftControllerStatus
+     *        from the render thread in a single atomic reader lease (lock-free, non-blocking reader).
+     */
+    void GetDriftSnapshot(DriftTelemetry& outTelemetry, DriftControllerStatus& outStatus) const;
+
 private:
     void RenderThreadProc();
 
@@ -181,7 +187,7 @@ private:
     static constexpr size_t NUM_SNAPSHOT_SLOTS = 4;
     DriftSnapshot m_snapshots[NUM_SNAPSHOT_SLOTS]{};
     mutable std::atomic<uint32_t> m_readerCounts[NUM_SNAPSHOT_SLOTS]{};
-    std::atomic<uint32_t> m_publishedSlot{0};
+    std::atomic<uint32_t> m_publishedVersion{0};
 
     void PublishTelemetrySnapshot(const DriftTelemetry& telemetry, const DriftControllerStatus& status);
 };

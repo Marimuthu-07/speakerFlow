@@ -2444,6 +2444,20 @@ static napi_value Method_EngineGetOutputStats(napi_env env, napi_callback_info i
     napi_set_named_property(env, obj, "renderState", stateVal);
     napi_set_named_property(env, obj, "resampleRatioMultiplier", ratioVal);
 
+    napi_value trueDriftVal, filtDriftVal, ffVal, fbVal, targetRatioVal, clampedVal;
+    napi_create_double(env, bStats.trueDriftPpm, &trueDriftVal);
+    napi_create_double(env, bStats.filteredDriftPpm, &filtDriftVal);
+    napi_create_double(env, bStats.feedforwardCorrection, &ffVal);
+    napi_create_double(env, bStats.feedbackCorrection, &fbVal);
+    napi_create_double(env, bStats.targetMultiplier, &targetRatioVal);
+    napi_get_boolean(env, bStats.isClamped, &clampedVal);
+    napi_set_named_property(env, obj, "trueDriftPpm", trueDriftVal);
+    napi_set_named_property(env, obj, "filteredDriftPpm", filtDriftVal);
+    napi_set_named_property(env, obj, "feedforwardCorrection", ffVal);
+    napi_set_named_property(env, obj, "feedbackCorrection", fbVal);
+    napi_set_named_property(env, obj, "targetMultiplier", targetRatioVal);
+    napi_set_named_property(env, obj, "isClamped", clampedVal);
+
     return obj;
 }
 
@@ -2507,6 +2521,20 @@ static napi_value Method_EngineGetStatus(napi_env env, napi_callback_info info) 
         napi_set_named_property(env, bObj, "occupancySlope", slopeVal);
         napi_set_named_property(env, bObj, "renderState", stateVal);
         napi_set_named_property(env, bObj, "resampleRatioMultiplier", bRatioVal);
+
+        napi_value bTrueDriftVal, bFiltDriftVal, bFfVal, bFbVal, bTargetRatioVal, bClampedVal;
+        napi_create_double(env, b.trueDriftPpm, &bTrueDriftVal);
+        napi_create_double(env, b.filteredDriftPpm, &bFiltDriftVal);
+        napi_create_double(env, b.feedforwardCorrection, &bFfVal);
+        napi_create_double(env, b.feedbackCorrection, &bFbVal);
+        napi_create_double(env, b.targetMultiplier, &bTargetRatioVal);
+        napi_get_boolean(env, b.isClamped, &bClampedVal);
+        napi_set_named_property(env, bObj, "trueDriftPpm", bTrueDriftVal);
+        napi_set_named_property(env, bObj, "filteredDriftPpm", bFiltDriftVal);
+        napi_set_named_property(env, bObj, "feedforwardCorrection", bFfVal);
+        napi_set_named_property(env, bObj, "feedbackCorrection", bFbVal);
+        napi_set_named_property(env, bObj, "targetMultiplier", bTargetRatioVal);
+        napi_set_named_property(env, bObj, "isClamped", bClampedVal);
 
         napi_set_element(env, branchArr, (uint32_t)i, bObj);
     }
