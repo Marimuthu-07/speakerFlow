@@ -70,7 +70,8 @@ WasapiCaptureStats WasapiFanOutEngine::GetCaptureStats() const {
 
 bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
                                    const std::wstring& endpointId,
-                                   std::string& outError) {
+                                   std::string& outError,
+                                   bool driftCorrectionEnabled) {
     std::lock_guard<std::mutex> lock(m_engineMutex);
     m_lastError.clear();
 
@@ -144,6 +145,7 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
 
     // Initialize and start render client on the target endpoint
     auto renderClient = std::make_unique<WasapiRenderClient>();
+    renderClient->SetDriftCorrectionEnabled(driftCorrectionEnabled);
     bool renderOk = renderClient->StartRender(endpointId,
                                               ringBuffer.get(),
                                               capStats.sampleRate,
@@ -204,6 +206,35 @@ bool WasapiFanOutEngine::IsBranchActive(const std::string& branchId) const {
     return false;
 }
 
+bool WasapiFanOutEngine::SetBranchDriftCorrectionEnabled(const std::string& branchId, bool enabled) {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->branchId == branchId) {
+            if (m_branches[i]->renderClient) {
+                m_branches[i]->renderClient->SetDriftCorrectionEnabled(enabled);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool WasapiFanOutEngine::IsBranchDriftCorrectionEnabled(const std::string& branchId) const {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->branchId == branchId) {
+            if (m_branches[i]->renderClient) {
+                return m_branches[i]->renderClient->IsDriftCorrectionEnabled();
+            }
+        }
+    }
+
+    return false;
+}
+
 void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, WasapiBranchStats& bStats) const {
     bStats.branchId = branch.branchId;
     bStats.endpointId = WideToUtf8(branch.endpointId.c_str());
@@ -231,6 +262,7 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
         bStats.feedbackCorrection = ctrlStatus.feedbackCorrection;
         bStats.targetMultiplier = ctrlStatus.targetMultiplier;
         bStats.isClamped = ctrlStatus.isClamped;
+        bStats.driftCorrectionEnabled = ctrlStatus.driftCorrectionEnabled;
     } else {
         bStats.renderStats = WasapiRenderStats{};
         bStats.renderState = "Stopped";
@@ -246,6 +278,7 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
         bStats.feedbackCorrection = 0.0;
         bStats.targetMultiplier = 1.0;
         bStats.isClamped = false;
+        bStats.driftCorrectionEnabled = true;
     }
 }
 

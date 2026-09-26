@@ -58,6 +58,7 @@ struct DriftControllerStatus {
     double maxRatioBound = 1.0020;         // Upper ratio clamp bound
     bool isClamped = false;                // True if target multiplier reached clamp bounds
     bool isReset = true;                   // True if controller is in neutral/reset state
+    bool driftCorrectionEnabled = true;    // True if real-time drift correction is enabled
 };
 
 /**

@@ -320,7 +320,9 @@ bool WasapiRenderClient::StartRender(const std::wstring& targetDeviceId,
     m_driftController.Reset();
     m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
 
-    PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), m_driftController.GetStatus());
+    DriftControllerStatus initStatus = m_driftController.GetStatus();
+    initStatus.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+    PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), initStatus);
 
     // Launch dedicated render worker thread
     m_isRendering.store(true, std::memory_order_release);
@@ -349,7 +351,9 @@ void WasapiRenderClient::StopRender() {
     m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
     m_pipeline.Reset();
 
-    PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), m_driftController.GetStatus());
+    DriftControllerStatus stopStatus = m_driftController.GetStatus();
+    stopStatus.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+    PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), stopStatus);
 
     if (m_hAudioEvent) {
         CloseHandle(m_hAudioEvent);
@@ -413,7 +417,9 @@ void WasapiRenderClient::RenderThreadProc() {
     m_driftController.Reset();
     m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
     m_pipeline.SetResampleRatioMultiplier(1.0);
-    PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), m_driftController.GetStatus());
+    DriftControllerStatus startupStatus = m_driftController.GetStatus();
+    startupStatus.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+    PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), startupStatus);
 
     // Watermarks for underrun recovery hysteresis:
     // High watermark: 50ms of audio (or 2x WASAPI buffer)
@@ -425,6 +431,7 @@ void WasapiRenderClient::RenderThreadProc() {
     const bool isEventDriven = m_isEventDriven.load(std::memory_order_relaxed);
     HANDLE waitHandles[2] = { m_hStopEvent, m_hAudioEvent };
     const DWORD waitCount = isEventDriven ? 2 : 1;
+    bool prevCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
 
     while (m_isRendering.load(std::memory_order_relaxed)) {
         DWORD waitRes = WaitForMultipleObjects(waitCount, waitHandles, FALSE, isEventDriven ? 100 : 10);
@@ -473,7 +480,10 @@ void WasapiRenderClient::RenderThreadProc() {
                 m_driftController.Reset();
                 m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
                 m_pipeline.SetResampleRatioMultiplier(1.0);
-                PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), m_driftController.GetStatus());
+                DriftControllerStatus status = m_driftController.GetStatus();
+                status.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+                PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), status);
+                prevCorrectionEnabled = status.driftCorrectionEnabled;
                 continue;
             }
             bufferState = RenderBufferState::Running;
@@ -482,7 +492,10 @@ void WasapiRenderClient::RenderThreadProc() {
             m_driftController.Reset();
             m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
             m_pipeline.SetResampleRatioMultiplier(1.0);
-            PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), m_driftController.GetStatus());
+            DriftControllerStatus status = m_driftController.GetStatus();
+            status.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+            PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), status);
+            prevCorrectionEnabled = status.driftCorrectionEnabled;
         } else if (bufferState == RenderBufferState::Running) {
             if (available < lowWatermarkFrames) {
                 // Genuine starvation detected: enter Recovery and pause consumption
@@ -496,7 +509,10 @@ void WasapiRenderClient::RenderThreadProc() {
                 m_driftController.Reset();
                 m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
                 m_pipeline.SetResampleRatioMultiplier(1.0);
-                PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), m_driftController.GetStatus());
+                DriftControllerStatus status = m_driftController.GetStatus();
+                status.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+                PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), status);
+                prevCorrectionEnabled = status.driftCorrectionEnabled;
 
                 BYTE* pData = nullptr;
                 HRESULT hrBuf = m_pRenderClient->GetBuffer(framesNeeded, &pData);
@@ -519,7 +535,10 @@ void WasapiRenderClient::RenderThreadProc() {
                 m_driftController.Reset();
                 m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
                 m_pipeline.SetResampleRatioMultiplier(1.0);
-                PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), m_driftController.GetStatus());
+                DriftControllerStatus status = m_driftController.GetStatus();
+                status.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+                PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), status);
+                prevCorrectionEnabled = status.driftCorrectionEnabled;
                 continue;
             }
             // Refilled to high watermark: resume steady-state rendering
@@ -529,22 +548,59 @@ void WasapiRenderClient::RenderThreadProc() {
             m_driftController.Reset();
             m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
             m_pipeline.SetResampleRatioMultiplier(1.0);
-            PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), m_driftController.GetStatus());
+            DriftControllerStatus status = m_driftController.GetStatus();
+            status.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+            PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), status);
+            prevCorrectionEnabled = status.driftCorrectionEnabled;
         }
 
-        // Running state with sufficient buffer: update closed-loop drift estimator & controller
-        m_driftEstimator.Update(available, m_framesRendered.load(std::memory_order_relaxed));
-        DriftTelemetry tel = m_driftEstimator.GetTelemetry();
-        double currentRatio = m_driftController.Update(tel);
-
-        // Apply ratio multiplier through existing atomic hook and pipeline
-        m_resampleRatioMultiplier.store(currentRatio, std::memory_order_relaxed);
-        if (currentRatio != m_pipeline.GetResampleRatioMultiplier()) {
-            m_pipeline.SetResampleRatioMultiplier(currentRatio);
+        // Check runtime drift-correction enable/disable state (Phase 2E.3-C)
+        const bool correctionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+        if (!prevCorrectionEnabled && correctionEnabled) {
+            // Re-enabled transition (false -> true):
+            // Reset both estimator and controller to start observation from fresh state
+            // and smoothly re-arm correction via the existing slew limiter from 1.0.
+            m_driftEstimator.Reset();
+            m_driftController.Reset();
+            m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
+            if (m_pipeline.GetResampleRatioMultiplier() != 1.0) {
+                m_pipeline.SetResampleRatioMultiplier(1.0);
+            }
         }
+        prevCorrectionEnabled = correctionEnabled;
 
-        // Publish lock-free telemetry snapshot to inactive slot and publish atomically
-        PublishTelemetrySnapshot(tel, m_driftController.GetStatus());
+        if (correctionEnabled) {
+            // Running state with active correction: update closed-loop drift estimator & controller
+            m_driftEstimator.Update(available, m_framesRendered.load(std::memory_order_relaxed));
+            DriftTelemetry tel = m_driftEstimator.GetTelemetry();
+            double currentRatio = m_driftController.Update(tel);
+
+            // Apply ratio multiplier through existing atomic hook and pipeline
+            m_resampleRatioMultiplier.store(currentRatio, std::memory_order_relaxed);
+            if (currentRatio != m_pipeline.GetResampleRatioMultiplier()) {
+                m_pipeline.SetResampleRatioMultiplier(currentRatio);
+            }
+
+            // Publish lock-free telemetry snapshot to inactive slot and publish atomically
+            DriftControllerStatus ctrlStatus = m_driftController.GetStatus();
+            ctrlStatus.driftCorrectionEnabled = true;
+            PublishTelemetrySnapshot(tel, ctrlStatus);
+        } else {
+            // Disabled: estimator continues passive tracking to report physical clock drift
+            m_driftEstimator.Update(available, m_framesRendered.load(std::memory_order_relaxed));
+            DriftTelemetry tel = m_driftEstimator.GetTelemetry();
+
+            // Controller is held in neutral reset state to prevent integral/filter windup
+            m_driftController.Reset();
+            m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
+            if (m_pipeline.GetResampleRatioMultiplier() != 1.0) {
+                m_pipeline.SetResampleRatioMultiplier(1.0);
+            }
+
+            DriftControllerStatus ctrlStatus = m_driftController.GetStatus();
+            ctrlStatus.driftCorrectionEnabled = false;
+            PublishTelemetrySnapshot(tel, ctrlStatus);
+        }
 
         // Calculate input frames needed by AudioFormatPipeline with updated ratio
         size_t framesToReadFromRing = m_pipeline.GetRequiredInFrames(framesNeeded);
@@ -616,6 +672,7 @@ WasapiRenderStats WasapiRenderClient::GetStats() const {
         default: stats.bufferStateName = "Unknown"; break;
     }
     stats.resampleRatioMultiplier = m_resampleRatioMultiplier.load(std::memory_order_relaxed);
+    stats.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
 
     if (m_pRingBuffer) {
         stats.bufferUnderruns += m_pRingBuffer->GetUnderrunCount();
@@ -644,6 +701,14 @@ void WasapiRenderClient::SetResampleRatioMultiplier(double multiplier) {
 
 double WasapiRenderClient::GetResampleRatioMultiplier() const {
     return m_resampleRatioMultiplier.load(std::memory_order_relaxed);
+}
+
+void WasapiRenderClient::SetDriftCorrectionEnabled(bool enabled) {
+    m_driftCorrectionEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool WasapiRenderClient::IsDriftCorrectionEnabled() const {
+    return m_driftCorrectionEnabled.load(std::memory_order_relaxed);
 }
 
 uint64_t WasapiRenderClient::GetUnderrunRecoveryCount() const {

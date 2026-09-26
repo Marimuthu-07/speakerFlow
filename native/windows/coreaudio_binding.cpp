@@ -2223,12 +2223,13 @@ static napi_value Method_EngineAddOutput(napi_env env, napi_callback_info info) 
 
     std::string branchId;
     std::wstring endpointId;
+    bool driftCorrectionEnabled = true;
 
     if (argc >= 1 && args[0] != nullptr) {
         napi_valuetype t0;
         napi_typeof(env, args[0], &t0);
         if (t0 == napi_object) {
-            napi_value bIdVal, devIdVal;
+            napi_value bIdVal, devIdVal, dcVal;
             if (napi_get_named_property(env, args[0], "branchId", &bIdVal) == napi_ok) {
                 size_t len = 0;
                 napi_get_value_string_utf8(env, bIdVal, NULL, 0, &len);
@@ -2239,6 +2240,13 @@ static napi_value Method_EngineAddOutput(napi_env env, napi_callback_info info) 
             }
             if (napi_get_named_property(env, args[0], "deviceId", &devIdVal) == napi_ok) {
                 endpointId = GetWideStringFromNapi(env, devIdVal);
+            }
+            if (napi_get_named_property(env, args[0], "driftCorrectionEnabled", &dcVal) == napi_ok) {
+                napi_valuetype dcType;
+                napi_typeof(env, dcVal, &dcType);
+                if (dcType == napi_boolean) {
+                    napi_get_value_bool(env, dcVal, &driftCorrectionEnabled);
+                }
             }
         } else if (t0 == napi_string) {
             size_t len = 0;
@@ -2265,7 +2273,7 @@ static napi_value Method_EngineAddOutput(napi_env env, napi_callback_info info) 
     }
 
     std::string error;
-    bool success = g_fanoutEngine->AddOutput(branchId, endpointId, error);
+    bool success = g_fanoutEngine->AddOutput(branchId, endpointId, error, driftCorrectionEnabled);
     if (!success) {
         napi_throw_error(env, NULL, error.c_str());
         return NULL;
@@ -2334,6 +2342,65 @@ static napi_value Method_EngineRemoveOutput(napi_env env, napi_callback_info inf
     bool removed = g_fanoutEngine ? g_fanoutEngine->RemoveOutput(branchId) : false;
     napi_value result;
     napi_get_boolean(env, removed, &result);
+    return result;
+}
+
+static napi_value Method_EngineSetDriftCorrectionEnabled(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = { nullptr, nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    std::string branchId;
+    if (argc > 0 && args[0] != nullptr) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
+        if (len > 0) {
+            branchId.resize(len);
+            napi_get_value_string_utf8(env, args[0], &branchId[0], len + 1, &len);
+        }
+    }
+
+    if (branchId.empty()) {
+        napi_throw_error(env, NULL, "branchId is required for engineSetDriftCorrectionEnabled");
+        return NULL;
+    }
+
+    bool enabled = true;
+    if (argc > 1 && args[1] != nullptr) {
+        napi_get_value_bool(env, args[1], &enabled);
+    }
+
+    std::lock_guard<std::mutex> lock(g_fanoutMutex);
+    bool success = g_fanoutEngine ? g_fanoutEngine->SetBranchDriftCorrectionEnabled(branchId, enabled) : false;
+    napi_value result;
+    napi_get_boolean(env, success, &result);
+    return result;
+}
+
+static napi_value Method_EngineIsDriftCorrectionEnabled(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    std::string branchId;
+    if (argc > 0 && args[0] != nullptr) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
+        if (len > 0) {
+            branchId.resize(len);
+            napi_get_value_string_utf8(env, args[0], &branchId[0], len + 1, &len);
+        }
+    }
+
+    if (branchId.empty()) {
+        napi_throw_error(env, NULL, "branchId is required for engineIsDriftCorrectionEnabled");
+        return NULL;
+    }
+
+    std::lock_guard<std::mutex> lock(g_fanoutMutex);
+    bool enabled = g_fanoutEngine ? g_fanoutEngine->IsBranchDriftCorrectionEnabled(branchId) : false;
+    napi_value result;
+    napi_get_boolean(env, enabled, &result);
     return result;
 }
 
@@ -2444,19 +2511,21 @@ static napi_value Method_EngineGetOutputStats(napi_env env, napi_callback_info i
     napi_set_named_property(env, obj, "renderState", stateVal);
     napi_set_named_property(env, obj, "resampleRatioMultiplier", ratioVal);
 
-    napi_value trueDriftVal, filtDriftVal, ffVal, fbVal, targetRatioVal, clampedVal;
+    napi_value trueDriftVal, filtDriftVal, ffVal, fbVal, targetRatioVal, clampedVal, driftCorrVal;
     napi_create_double(env, bStats.trueDriftPpm, &trueDriftVal);
     napi_create_double(env, bStats.filteredDriftPpm, &filtDriftVal);
     napi_create_double(env, bStats.feedforwardCorrection, &ffVal);
     napi_create_double(env, bStats.feedbackCorrection, &fbVal);
     napi_create_double(env, bStats.targetMultiplier, &targetRatioVal);
     napi_get_boolean(env, bStats.isClamped, &clampedVal);
+    napi_get_boolean(env, bStats.driftCorrectionEnabled, &driftCorrVal);
     napi_set_named_property(env, obj, "trueDriftPpm", trueDriftVal);
     napi_set_named_property(env, obj, "filteredDriftPpm", filtDriftVal);
     napi_set_named_property(env, obj, "feedforwardCorrection", ffVal);
     napi_set_named_property(env, obj, "feedbackCorrection", fbVal);
     napi_set_named_property(env, obj, "targetMultiplier", targetRatioVal);
     napi_set_named_property(env, obj, "isClamped", clampedVal);
+    napi_set_named_property(env, obj, "driftCorrectionEnabled", driftCorrVal);
 
     return obj;
 }
@@ -2522,19 +2591,21 @@ static napi_value Method_EngineGetStatus(napi_env env, napi_callback_info info) 
         napi_set_named_property(env, bObj, "renderState", stateVal);
         napi_set_named_property(env, bObj, "resampleRatioMultiplier", bRatioVal);
 
-        napi_value bTrueDriftVal, bFiltDriftVal, bFfVal, bFbVal, bTargetRatioVal, bClampedVal;
+        napi_value bTrueDriftVal, bFiltDriftVal, bFfVal, bFbVal, bTargetRatioVal, bClampedVal, bDriftCorrVal;
         napi_create_double(env, b.trueDriftPpm, &bTrueDriftVal);
         napi_create_double(env, b.filteredDriftPpm, &bFiltDriftVal);
         napi_create_double(env, b.feedforwardCorrection, &bFfVal);
         napi_create_double(env, b.feedbackCorrection, &bFbVal);
         napi_create_double(env, b.targetMultiplier, &bTargetRatioVal);
         napi_get_boolean(env, b.isClamped, &bClampedVal);
+        napi_get_boolean(env, b.driftCorrectionEnabled, &bDriftCorrVal);
         napi_set_named_property(env, bObj, "trueDriftPpm", bTrueDriftVal);
         napi_set_named_property(env, bObj, "filteredDriftPpm", bFiltDriftVal);
         napi_set_named_property(env, bObj, "feedforwardCorrection", bFfVal);
         napi_set_named_property(env, bObj, "feedbackCorrection", bFbVal);
         napi_set_named_property(env, bObj, "targetMultiplier", bTargetRatioVal);
         napi_set_named_property(env, bObj, "isClamped", bClampedVal);
+        napi_set_named_property(env, bObj, "driftCorrectionEnabled", bDriftCorrVal);
 
         napi_set_element(env, branchArr, (uint32_t)i, bObj);
     }
@@ -2638,6 +2709,12 @@ NAPI_MODULE_INIT() {
 
     napi_create_function(env, NULL, 0, Method_EngineRemoveOutput, NULL, &fn);
     napi_set_named_property(env, exports, "engineRemoveOutput", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineSetDriftCorrectionEnabled, NULL, &fn);
+    napi_set_named_property(env, exports, "engineSetDriftCorrectionEnabled", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineIsDriftCorrectionEnabled, NULL, &fn);
+    napi_set_named_property(env, exports, "engineIsDriftCorrectionEnabled", fn);
 
     napi_create_function(env, NULL, 0, Method_EngineGetOutputStats, NULL, &fn);
     napi_set_named_property(env, exports, "engineGetOutputStats", fn);

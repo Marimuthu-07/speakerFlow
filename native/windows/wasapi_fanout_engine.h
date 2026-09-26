@@ -42,6 +42,7 @@ struct WasapiBranchStats {
     double feedbackCorrection = 0.0;
     double targetMultiplier = 1.0;
     bool isClamped = false;
+    bool driftCorrectionEnabled = true;
 };
 
 struct WasapiFanOutEngineStatus {
@@ -92,7 +93,10 @@ public:
      * @param outError Receives error description if start fails.
      * @return true if branch was added and started successfully, false otherwise.
      */
-    bool AddOutput(const std::string& branchId, const std::wstring& endpointId, std::string& outError);
+    bool AddOutput(const std::string& branchId,
+                   const std::wstring& endpointId,
+                   std::string& outError,
+                   bool driftCorrectionEnabled = true);
 
     /**
      * @brief Removes and stops an active render output branch.
@@ -105,6 +109,21 @@ public:
      * @brief Checks if a specific branch is currently active.
      */
     bool IsBranchActive(const std::string& branchId) const;
+
+    /**
+     * @brief Enables or disables real-time drift correction for a specific branch (Phase 2E.3-C).
+     * @param branchId Identifier of branch.
+     * @param enabled True to enable closed-loop correction, false to disable.
+     * @return true if branch was found and updated, false otherwise.
+     */
+    bool SetBranchDriftCorrectionEnabled(const std::string& branchId, bool enabled);
+
+    /**
+     * @brief Checks if real-time drift correction is enabled for a specific branch (Phase 2E.3-C).
+     * @param branchId Identifier of branch.
+     * @return true if enabled (or false if disabled or branch not found).
+     */
+    bool IsBranchDriftCorrectionEnabled(const std::string& branchId) const;
 
     /**
      * @brief Retrieves diagnostics for a specific branch.

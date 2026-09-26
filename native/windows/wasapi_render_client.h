@@ -51,6 +51,7 @@ struct WasapiRenderStats {
     RenderBufferState bufferState = RenderBufferState::Preroll;
     std::string bufferStateName = "Preroll";
     double resampleRatioMultiplier = 1.0;
+    bool driftCorrectionEnabled = true;
     std::string lastError;
 };
 
@@ -129,6 +130,16 @@ public:
     DriftControllerStatus GetDriftControllerStatus() const;
 
     /**
+     * @brief Enables or disables real-time drift correction for this render branch (Phase 2E.3-C).
+     */
+    void SetDriftCorrectionEnabled(bool enabled);
+
+    /**
+     * @brief Checks if real-time drift correction is enabled for this render branch (Phase 2E.3-C).
+     */
+    bool IsDriftCorrectionEnabled() const;
+
+    /**
      * @brief Gets a coherent combined snapshot of both DriftTelemetry and DriftControllerStatus
      *        from the render thread in a single atomic reader lease (lock-free, non-blocking reader).
      */
@@ -156,6 +167,7 @@ private:
     std::atomic<uint64_t> m_silentFramesRendered;
     std::atomic<uint64_t> m_underrunRecoveryCount;
     std::atomic<double> m_resampleRatioMultiplier;
+    std::atomic<bool> m_driftCorrectionEnabled{true};
     std::atomic<RenderBufferState> m_bufferState{RenderBufferState::Preroll};
 
     mutable std::mutex m_errorMutex;
