@@ -2,7 +2,22 @@ const ALL_SPEAKERS_SINK = 'all_speakers';
 
 function matchesStreamId(item, streamId) {
   if (!item) return false;
-  return item.id === streamId || String(item.id) === String(streamId) || (typeof item.id === 'number' && item.id === Number(streamId));
+  if (
+    item.id === streamId ||
+    String(item.id) === String(streamId) ||
+    (typeof item.id === 'number' && item.id === Number(streamId))
+  ) {
+    return true;
+  }
+  if (Array.isArray(item.sessions)) {
+    return item.sessions.some(
+      (s) =>
+        s.id === streamId ||
+        String(s.id) === String(streamId) ||
+        (typeof s.id === 'number' && s.id === Number(streamId))
+    );
+  }
+  return false;
 }
 
 class StreamRoutingService {

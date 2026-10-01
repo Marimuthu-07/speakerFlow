@@ -37,6 +37,26 @@ function getNativeBinding() {
   }
 }
 
+function matchesStreamId(item, streamId) {
+  if (!item) return false;
+  if (
+    item.id === streamId ||
+    String(item.id) === String(streamId) ||
+    (typeof item.id === 'number' && item.id === Number(streamId))
+  ) {
+    return true;
+  }
+  if (Array.isArray(item.sessions)) {
+    return item.sessions.some(
+      (s) =>
+        s.id === streamId ||
+        String(s.id) === String(streamId) ||
+        (typeof s.id === 'number' && s.id === Number(streamId))
+    );
+  }
+  return false;
+}
+
 class WindowsCoreAudioBackend extends AudioBackend {
   constructor(nativeBinding = null) {
     super();
@@ -209,11 +229,20 @@ class WindowsCoreAudioBackend extends AudioBackend {
       const activeSessions = pidStreams.filter((s) => Boolean(s.isActive));
       const hasActiveSession = activeSessions.length > 0;
 
+      // Check if this process has an explicit persisted output device configured in Windows
+      const persistedSinkId = pidStreams.find((s) => s.persistedSinkId)?.persistedSinkId || null;
+      const persistedSink = persistedSinkId ? devices.find((d) => d.id === persistedSinkId) : null;
+
       // Select representative session deterministically:
-      // 1. If any session is active, select an active session (prefer active session with non-zero volume or first active).
-      // 2. If all sessions are inactive, prefer session on default device if present, else fallback to the last enumerated session.
+      // 1. If process has an explicit persisted sink configured in Windows, prefer session on that sink if present,
+      //    else fallback to active session or first session.
+      // 2. If any session is active, select an active session (prefer active session with non-zero volume or first active).
+      // 3. If all sessions are inactive, prefer session on default device if present, else fallback to the last enumerated session.
       let representative = null;
-      if (hasActiveSession) {
+      if (persistedSink) {
+        const onPersisted = pidStreams.find((s) => s.currentSinkId === persistedSink.id);
+        representative = onPersisted || (hasActiveSession ? activeSessions[0] : pidStreams[0]);
+      } else if (hasActiveSession) {
         representative = activeSessions.find((s) => (s.volumePercent || 0) > 0) || activeSessions[0];
       } else {
         const onDefault = pidStreams.find((s) => s.currentSinkId === defaultDevice?.id);
@@ -224,13 +253,17 @@ class WindowsCoreAudioBackend extends AudioBackend {
         representative = pidStreams[0];
       }
 
+      const effectiveSinkId = persistedSink ? persistedSink.id : (representative.currentSinkId || defaultDevice?.id || null);
+      const effectiveSinkName = persistedSink ? persistedSink.name : (representative.currentSinkName || defaultDevice?.name || 'Default Output');
+
       groupedStreams.push({
-        id: representative.id || `${representative.processId}-${representative.currentSinkId}`,
+        id: representative.id || `${representative.processId}-${effectiveSinkId}`,
         processId: representative.processId,
         applicationName: representative.name || `Process ${representative.processId}`,
         streamName: representative.name || '',
-        currentSinkId: representative.currentSinkId || defaultDevice?.id || null,
-        currentSinkName: representative.currentSinkName || defaultDevice?.name || 'Default Output',
+        currentSinkId: effectiveSinkId,
+        currentSinkName: effectiveSinkName,
+        persistedSinkId: persistedSinkId,
         isActive: Boolean(hasActiveSession),
         volumePercent: typeof representative.volumePercent === 'number' ? representative.volumePercent : 100,
         mute: Boolean(representative.mute),
@@ -246,7 +279,8 @@ class WindowsCoreAudioBackend extends AudioBackend {
           volumePercent: typeof s.volumePercent === 'number' ? s.volumePercent : 100,
           mute: Boolean(s.mute),
           currentSinkId: s.currentSinkId,
-          currentSinkName: s.currentSinkName
+          currentSinkName: s.currentSinkName,
+          persistedSinkId: s.persistedSinkId || null
         }))
       });
     }
@@ -355,8 +389,75 @@ class WindowsCoreAudioBackend extends AudioBackend {
     return this.setStreamVolume(sinkInputId, volumePercent);
   }
 
-  async moveSinkInput(_streamId, _sinkName) {
-    throw new Error('Windows Core Audio routing is not implemented yet.');
+  async moveSinkInput(streamId, sinkName) {
+    if (!this._native || typeof this._native.setApplicationOutput !== 'function') {
+      throw new Error('Windows Core Audio backend is not initialized.');
+    }
+    if (streamId === undefined || streamId === null) {
+      throw new Error('streamId is required for moveSinkInput');
+    }
+    if (!sinkName) {
+      throw new Error('sinkName is required for moveSinkInput');
+    }
+
+    const devices = await this.listOutputDevices();
+    const targetDevice = devices.find(
+      (d) => d.id === sinkName || d.name === sinkName || d.technicalName === sinkName
+    );
+    if (!targetDevice) {
+      throw new Error(`Target audio endpoint not found: ${sinkName}`);
+    }
+
+    const streams = await this.listApplicationStreams();
+    const stream = streams.find(
+      (s) =>
+        matchesStreamId(s, streamId) ||
+        String(s.processId) === String(streamId) ||
+        (Array.isArray(s.sessions) && s.sessions.some((sess) => matchesStreamId(sess, streamId)))
+    );
+
+    if (!stream && !Number.isInteger(Number(streamId))) {
+      throw new Error(`Application session not found: ${streamId}`);
+    }
+
+    const target = stream ? stream.processId : streamId;
+    return this._native.setApplicationOutput(target, targetDevice.id);
+  }
+
+  async getApplicationOutput(streamId) {
+    if (!this._native || typeof this._native.getApplicationOutput !== 'function') {
+      throw new Error('Windows Core Audio backend is not initialized.');
+    }
+    if (streamId === undefined || streamId === null) {
+      throw new Error('streamId is required for getApplicationOutput');
+    }
+    const streams = await this.listApplicationStreams();
+    const stream = streams.find(
+      (s) =>
+        matchesStreamId(s, streamId) ||
+        String(s.processId) === String(streamId) ||
+        (Array.isArray(s.sessions) && s.sessions.some((sess) => matchesStreamId(sess, streamId)))
+    );
+    const target = stream ? stream.processId : streamId;
+    return this._native.getApplicationOutput(target);
+  }
+
+  async clearApplicationOutput(streamId) {
+    if (!this._native || typeof this._native.clearApplicationOutput !== 'function') {
+      throw new Error('Windows Core Audio backend is not initialized.');
+    }
+    if (streamId === undefined || streamId === null) {
+      throw new Error('streamId is required for clearApplicationOutput');
+    }
+    const streams = await this.listApplicationStreams();
+    const stream = streams.find(
+      (s) =>
+        matchesStreamId(s, streamId) ||
+        String(s.processId) === String(streamId) ||
+        (Array.isArray(s.sessions) && s.sessions.some((sess) => matchesStreamId(sess, streamId)))
+    );
+    const target = stream ? stream.processId : streamId;
+    return this._native.clearApplicationOutput(target);
   }
 
   async setDefaultOutput(_sinkId) {

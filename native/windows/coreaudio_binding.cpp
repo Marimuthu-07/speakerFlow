@@ -3,6 +3,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <objbase.h>
+#include <unknwn.h>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #include <endpointvolume.h>
@@ -94,6 +96,254 @@ static std::string FormatHresultError(const char* action, HRESULT hr) {
     ss << action << " failed with HRESULT 0x"
        << std::hex << std::uppercase << std::setfill('0') << std::setw(8) << (uint32_t)hr;
     return ss.str();
+}
+
+// -----------------------------------------------------------------------------
+// COM Apartment & WinRT AudioPolicyConfig Helpers
+// -----------------------------------------------------------------------------
+
+class ScopedCoInitialize {
+public:
+    ScopedCoInitialize() {
+        m_hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    }
+    ~ScopedCoInitialize() {
+        if (SUCCEEDED(m_hr)) {
+            CoUninitialize();
+        }
+    }
+    bool isModeChanged() const { return m_hr == RPC_E_CHANGED_MODE; }
+private:
+    HRESULT m_hr;
+};
+
+typedef HRESULT (WINAPI *pfn_WindowsCreateStringReference)(
+    PCWSTR sourceString,
+    UINT32 length,
+    void* hstringHeader,
+    void** string
+);
+
+typedef HRESULT (WINAPI *pfn_WindowsCreateString)(
+    PCWSTR sourceString,
+    UINT32 length,
+    void** string
+);
+
+typedef HRESULT (WINAPI *pfn_WindowsDeleteString)(
+    void* string
+);
+
+typedef PCWSTR (WINAPI *pfn_WindowsGetStringRawBuffer)(
+    void* string,
+    UINT32* length
+);
+
+typedef HRESULT (WINAPI *pfn_RoGetActivationFactory)(
+    void* activatableClassId,
+    REFIID iid,
+    void** factory
+);
+
+// Method 25: SetPersistedDefaultAudioEndpoint
+typedef HRESULT (STDMETHODCALLTYPE *SetPersistedDefaultAudioEndpointFunc)(
+    void* thisPtr,
+    DWORD processId,
+    EDataFlow flow,
+    ERole role,
+    void* hstringDeviceId
+);
+
+// Method 26: GetPersistedDefaultAudioEndpoint
+typedef HRESULT (STDMETHODCALLTYPE *GetPersistedDefaultAudioEndpointFunc)(
+    void* thisPtr,
+    DWORD processId,
+    EDataFlow flow,
+    ERole role,
+    void** phstringDeviceId
+);
+
+struct WinRtApi {
+    pfn_WindowsCreateString WindowsCreateString = nullptr;
+    pfn_WindowsDeleteString WindowsDeleteString = nullptr;
+    pfn_WindowsGetStringRawBuffer WindowsGetStringRawBuffer = nullptr;
+    pfn_WindowsCreateStringReference WindowsCreateStringReference = nullptr;
+    pfn_RoGetActivationFactory RoGetActivationFactory = nullptr;
+    bool loaded = false;
+
+    static WinRtApi& Instance() {
+        static WinRtApi s_instance;
+        return s_instance;
+    }
+
+    WinRtApi() {
+        HMODULE hComBase = LoadLibraryW(L"combase.dll");
+        if (hComBase) {
+            WindowsCreateString = (pfn_WindowsCreateString)GetProcAddress(hComBase, "WindowsCreateString");
+            WindowsDeleteString = (pfn_WindowsDeleteString)GetProcAddress(hComBase, "WindowsDeleteString");
+            WindowsGetStringRawBuffer = (pfn_WindowsGetStringRawBuffer)GetProcAddress(hComBase, "WindowsGetStringRawBuffer");
+            WindowsCreateStringReference = (pfn_WindowsCreateStringReference)GetProcAddress(hComBase, "WindowsCreateStringReference");
+            RoGetActivationFactory = (pfn_RoGetActivationFactory)GetProcAddress(hComBase, "RoGetActivationFactory");
+            loaded = (WindowsCreateString && WindowsDeleteString && WindowsGetStringRawBuffer &&
+                      WindowsCreateStringReference && RoGetActivationFactory);
+        }
+    }
+};
+
+static HRESULT GetAudioPolicyConfig(void** ppPolicyConfig) {
+    if (!ppPolicyConfig) return E_POINTER;
+    *ppPolicyConfig = NULL;
+
+    auto& api = WinRtApi::Instance();
+    if (!api.loaded) {
+        return E_FAIL;
+    }
+
+    LPCWSTR className = L"Windows.Media.Internal.AudioPolicyConfig";
+    char header[64] = {0};
+    void* hClassString = nullptr;
+    HRESULT hr = api.WindowsCreateStringReference(className, (UINT32)wcslen(className), header, &hClassString);
+    if (FAILED(hr)) return hr;
+
+    // Windows 11 and Windows 10 >= 21390 IID
+    const GUID iidWin11 = {0xab3d4648, 0xe242, 0x459f, {0xb0, 0x2f, 0x54, 0x1c, 0x70, 0x30, 0x63, 0x24}};
+    hr = api.RoGetActivationFactory(hClassString, iidWin11, ppPolicyConfig);
+    if (SUCCEEDED(hr) && *ppPolicyConfig) {
+        return S_OK;
+    }
+
+    // Windows 10 fallback IID (< 21390)
+    const GUID iidWin10 = {0x2a59116d, 0x6c4f, 0x45e0, {0xa7, 0x4f, 0x70, 0x7e, 0x3f, 0xef, 0x92, 0x58}};
+    hr = api.RoGetActivationFactory(hClassString, iidWin10, ppPolicyConfig);
+    return hr;
+}
+
+static std::wstring ExtractEndpointIdFromPath(const std::wstring& path) {
+    if (path.rfind(L"{0.0.0.", 0) == 0 && path.find(L"#") == std::wstring::npos) {
+        return path;
+    }
+    size_t start = path.find(L"{0.0.0.");
+    if (start == std::wstring::npos) return L"";
+    size_t secondBrace = path.find(L"}.{", start);
+    if (secondBrace == std::wstring::npos) return L"";
+    size_t end = path.find(L"}", secondBrace + 3);
+    if (end == std::wstring::npos) return L"";
+    return path.substr(start, end - start + 1);
+}
+
+static std::wstring GetFullDevicePath(IMMDevice* pDevice, const std::wstring& endpointId) {
+    if (pDevice) {
+        IPropertyStore* pStore = NULL;
+        if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &pStore)) && pStore) {
+            PROPERTYKEY keyDevicePath = { {0x9c119480, 0xddc2, 0x4954, {0xa1, 0x50, 0x5b, 0xd2, 0x40, 0xd4, 0x54, 0xad}}, 1 };
+            PROPVARIANT pvPath;
+            PropVariantInit(&pvPath);
+            if (SUCCEEDED(pStore->GetValue(keyDevicePath, &pvPath)) && pvPath.vt == VT_LPWSTR && pvPath.pwszVal) {
+                std::wstring path = pvPath.pwszVal;
+                PropVariantClear(&pvPath);
+                pStore->Release();
+                return path;
+            }
+            PropVariantClear(&pvPath);
+            pStore->Release();
+        }
+    }
+    return L"\\\\?\\SWD#MMDEVAPI#" + endpointId + L"#{e6327cad-dcec-4949-ae8a-991e976a79d2}";
+}
+
+static DWORD FindProcessIdFromSession(const std::wstring& targetSessionId) {
+    if (targetSessionId.empty()) return 0;
+
+    bool isNumeric = true;
+    for (wchar_t c : targetSessionId) {
+        if (!iswdigit(c)) { isNumeric = false; break; }
+    }
+    if (isNumeric) {
+        try {
+            return (DWORD)std::stoul(targetSessionId);
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    IMMDeviceEnumerator* pEnumerator = NULL;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
+    if (FAILED(hr) || !pEnumerator) return 0;
+
+    IMMDeviceCollection* pCollection = NULL;
+    hr = pEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &pCollection);
+    pEnumerator->Release();
+    if (FAILED(hr) || !pCollection) return 0;
+
+    UINT devCount = 0;
+    pCollection->GetCount(&devCount);
+    DWORD foundPid = 0;
+
+    for (UINT d = 0; d < devCount && foundPid == 0; d++) {
+        IMMDevice* pDevice = NULL;
+        if (FAILED(pCollection->Item(d, &pDevice)) || !pDevice) continue;
+
+        LPWSTR pstrDevId = NULL;
+        std::wstring deviceId;
+        if (SUCCEEDED(pDevice->GetId(&pstrDevId)) && pstrDevId) {
+            deviceId = pstrDevId;
+            CoTaskMemFree(pstrDevId);
+        }
+
+        IAudioSessionManager2* pSessionManager = NULL;
+        hr = pDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, NULL, (void**)&pSessionManager);
+        if (SUCCEEDED(hr) && pSessionManager) {
+            IAudioSessionEnumerator* pSessionEnum = NULL;
+            hr = pSessionManager->GetSessionEnumerator(&pSessionEnum);
+            if (SUCCEEDED(hr) && pSessionEnum) {
+                int sessionCount = 0;
+                pSessionEnum->GetCount(&sessionCount);
+
+                for (int s = 0; s < sessionCount; s++) {
+                    IAudioSessionControl* pSessionControl = NULL;
+                    if (FAILED(pSessionEnum->GetSession(s, &pSessionControl)) || !pSessionControl) continue;
+
+                    IAudioSessionControl2* pSessionControl2 = NULL;
+                    if (SUCCEEDED(pSessionControl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&pSessionControl2)) && pSessionControl2) {
+                        DWORD pid = 0;
+                        pSessionControl2->GetProcessId(&pid);
+
+                        LPWSTR pInstanceId = NULL;
+                        std::wstring uniqueSessionId;
+                        if (SUCCEEDED(pSessionControl2->GetSessionInstanceIdentifier(&pInstanceId)) && pInstanceId && wcslen(pInstanceId) > 0) {
+                            uniqueSessionId = pInstanceId;
+                            CoTaskMemFree(pInstanceId);
+                        } else {
+                            uniqueSessionId = deviceId + L":" + std::to_wstring(pid) + L":" + std::to_wstring(s);
+                        }
+
+                        LPWSTR pSessId = NULL;
+                        std::wstring sessionIdentifier;
+                        if (SUCCEEDED(pSessionControl2->GetSessionIdentifier(&pSessId)) && pSessId && wcslen(pSessId) > 0) {
+                            sessionIdentifier = pSessId;
+                            CoTaskMemFree(pSessId);
+                        }
+
+                        if (uniqueSessionId == targetSessionId ||
+                            sessionIdentifier == targetSessionId ||
+                            (pid != 0 && std::to_wstring(pid) == targetSessionId)) {
+                            foundPid = pid;
+                        }
+                        pSessionControl2->Release();
+                    }
+                    pSessionControl->Release();
+                    if (foundPid != 0) break;
+                }
+                pSessionEnum->Release();
+            }
+            pSessionManager->Release();
+        }
+        pDevice->Release();
+    }
+
+    pCollection->Release();
+    return foundPid;
 }
 
 // -----------------------------------------------------------------------------
@@ -1274,10 +1524,14 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
 }
 
 static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info info) {
+    void* pPolicyConfig = NULL;
+    GetAudioPolicyConfig(&pPolicyConfig);
+
     IMMDeviceEnumerator* pEnumerator = NULL;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
                                   __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
     if (FAILED(hr) || !pEnumerator) {
+        if (pPolicyConfig) ((IUnknown*)pPolicyConfig)->Release();
         napi_throw_error(env, NULL, "Failed to create MMDeviceEnumerator.");
         return NULL;
     }
@@ -1287,6 +1541,7 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
     pEnumerator->Release();
 
     if (FAILED(hr) || !pCollection) {
+        if (pPolicyConfig) ((IUnknown*)pPolicyConfig)->Release();
         napi_value emptyArr;
         napi_create_array_with_length(env, 0, &emptyArr);
         return emptyArr;
@@ -1452,6 +1707,31 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
                         napi_value sinkNameVal = CreateNapiStringFromWide(env, devFriendlyName.c_str());
                         napi_set_named_property(env, jsStream, "currentSinkName", sinkNameVal);
 
+                        std::wstring persistedSinkId;
+                        if (pPolicyConfig && pid != 0) {
+                            void** vtable = *(void***)pPolicyConfig;
+                            auto GetPersistedDefaultAudioEndpoint = (GetPersistedDefaultAudioEndpointFunc)vtable[26];
+                            void* hPersisted = NULL;
+                            if (SUCCEEDED(GetPersistedDefaultAudioEndpoint(pPolicyConfig, pid, eRender, eConsole, &hPersisted)) && hPersisted) {
+                                UINT32 rawLen = 0;
+                                auto& api = WinRtApi::Instance();
+                                PCWSTR rawStr = api.WindowsGetStringRawBuffer ? api.WindowsGetStringRawBuffer(hPersisted, &rawLen) : NULL;
+                                if (rawStr) {
+                                    persistedSinkId = ExtractEndpointIdFromPath(rawStr);
+                                }
+                                if (api.WindowsDeleteString) api.WindowsDeleteString(hPersisted);
+                            }
+                        }
+
+                        if (!persistedSinkId.empty()) {
+                            napi_value persistedSinkVal = CreateNapiStringFromWide(env, persistedSinkId.c_str());
+                            napi_set_named_property(env, jsStream, "persistedSinkId", persistedSinkVal);
+                        } else {
+                            napi_value nullVal;
+                            napi_get_null(env, &nullVal);
+                            napi_set_named_property(env, jsStream, "persistedSinkId", nullVal);
+                        }
+
                         napi_set_element(env, jsArray, streamIndex++, jsStream);
 
                         pSessionControl2->Release();
@@ -1463,6 +1743,11 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
             pSessionManager->Release();
         }
         pDevice->Release();
+    }
+
+    if (pPolicyConfig) {
+        ((IUnknown*)pPolicyConfig)->Release();
+        pPolicyConfig = NULL;
     }
 
     pCollection->Release();
@@ -1717,6 +2002,251 @@ static napi_value Method_GetEndpointMute(napi_env env, napi_callback_info info) 
 
     napi_value result;
     napi_get_boolean(env, (muted != FALSE), &result);
+    return result;
+}
+
+static napi_value Method_SetApplicationOutput(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2];
+    if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc < 2) {
+        napi_throw_type_error(env, NULL, "setApplicationOutput requires 2 arguments: (processIdOrSessionId, endpointId)");
+        return NULL;
+    }
+
+    DWORD processId = 0;
+    napi_valuetype arg0Type;
+    napi_typeof(env, args[0], &arg0Type);
+    if (arg0Type == napi_number) {
+        uint32_t pidVal = 0;
+        napi_get_value_uint32(env, args[0], &pidVal);
+        processId = pidVal;
+    } else if (arg0Type == napi_string) {
+        std::wstring strArg = GetWideStringFromNapi(env, args[0]);
+        processId = FindProcessIdFromSession(strArg);
+    }
+
+    if (processId == 0) {
+        napi_throw_error(env, NULL, "Target application session not found or has invalid process ID.");
+        return NULL;
+    }
+
+    std::wstring targetDeviceId = GetWideStringFromNapi(env, args[1]);
+
+    ScopedCoInitialize scopedCo;
+
+    auto& api = WinRtApi::Instance();
+    if (!api.loaded) {
+        napi_throw_error(env, NULL, "Failed to load WinRT functions from combase.dll.");
+        return NULL;
+    }
+
+    void* pPolicyConfig = NULL;
+    HRESULT hr = GetAudioPolicyConfig(&pPolicyConfig);
+    if (FAILED(hr) || !pPolicyConfig) {
+        std::string err = FormatHresultError("AudioPolicyConfig activation", hr);
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    void** vtable = *(void***)pPolicyConfig;
+    auto SetPersistedDefaultAudioEndpoint = (SetPersistedDefaultAudioEndpointFunc)vtable[25];
+
+    // If targetDeviceId is empty or "default", clear the override
+    if (targetDeviceId.empty() || targetDeviceId == L"default" || targetDeviceId == L"Default") {
+        hr = SetPersistedDefaultAudioEndpoint(pPolicyConfig, processId, eRender, eConsole, nullptr);
+        if (SUCCEEDED(hr)) {
+            SetPersistedDefaultAudioEndpoint(pPolicyConfig, processId, eRender, eMultimedia, nullptr);
+        }
+        ((IUnknown*)pPolicyConfig)->Release();
+        if (FAILED(hr)) {
+            std::string err = FormatHresultError("SetPersistedDefaultAudioEndpoint(clear)", hr);
+            napi_throw_error(env, NULL, err.c_str());
+            return NULL;
+        }
+        napi_value result;
+        napi_get_boolean(env, true, &result);
+        return result;
+    }
+
+    // Validate target device endpoint
+    IMMDeviceEnumerator* pEnumerator = NULL;
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+                          __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
+    if (FAILED(hr) || !pEnumerator) {
+        ((IUnknown*)pPolicyConfig)->Release();
+        napi_throw_error(env, NULL, "Failed to create MMDeviceEnumerator.");
+        return NULL;
+    }
+
+    IMMDevice* pTargetDevice = NULL;
+    hr = pEnumerator->GetDevice(targetDeviceId.c_str(), &pTargetDevice);
+    pEnumerator->Release();
+    if (FAILED(hr) || !pTargetDevice) {
+        ((IUnknown*)pPolicyConfig)->Release();
+        std::string err = "Target audio endpoint not found: " + WideToUtf8(targetDeviceId.c_str());
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    DWORD devState = 0;
+    hr = pTargetDevice->GetState(&devState);
+    if (FAILED(hr) || !(devState & DEVICE_STATE_ACTIVE)) {
+        pTargetDevice->Release();
+        ((IUnknown*)pPolicyConfig)->Release();
+        std::string err = "Target audio endpoint is not active: " + WideToUtf8(targetDeviceId.c_str());
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    std::wstring fullPath = GetFullDevicePath(pTargetDevice, targetDeviceId);
+    pTargetDevice->Release();
+
+    void* hTargetString = NULL;
+    hr = api.WindowsCreateString(fullPath.c_str(), (UINT32)fullPath.length(), &hTargetString);
+    if (FAILED(hr) || !hTargetString) {
+        ((IUnknown*)pPolicyConfig)->Release();
+        napi_throw_error(env, NULL, "Failed to create WinRT HSTRING for target endpoint.");
+        return NULL;
+    }
+
+    hr = SetPersistedDefaultAudioEndpoint(pPolicyConfig, processId, eRender, eConsole, hTargetString);
+    if (SUCCEEDED(hr)) {
+        SetPersistedDefaultAudioEndpoint(pPolicyConfig, processId, eRender, eMultimedia, hTargetString);
+    }
+
+    api.WindowsDeleteString(hTargetString);
+    ((IUnknown*)pPolicyConfig)->Release();
+
+    if (FAILED(hr)) {
+        std::string err = FormatHresultError("SetPersistedDefaultAudioEndpoint", hr);
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    napi_value result;
+    napi_get_boolean(env, true, &result);
+    return result;
+}
+
+static napi_value Method_GetApplicationOutput(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc < 1) {
+        napi_throw_type_error(env, NULL, "getApplicationOutput requires 1 argument: (processIdOrSessionId)");
+        return NULL;
+    }
+
+    DWORD processId = 0;
+    napi_valuetype arg0Type;
+    napi_typeof(env, args[0], &arg0Type);
+    if (arg0Type == napi_number) {
+        uint32_t pidVal = 0;
+        napi_get_value_uint32(env, args[0], &pidVal);
+        processId = pidVal;
+    } else if (arg0Type == napi_string) {
+        std::wstring strArg = GetWideStringFromNapi(env, args[0]);
+        processId = FindProcessIdFromSession(strArg);
+    }
+
+    if (processId == 0) {
+        napi_value nullVal;
+        napi_get_null(env, &nullVal);
+        return nullVal;
+    }
+
+    ScopedCoInitialize scopedCo;
+
+    auto& api = WinRtApi::Instance();
+    if (!api.loaded) {
+        napi_value nullVal;
+        napi_get_null(env, &nullVal);
+        return nullVal;
+    }
+
+    void* pPolicyConfig = NULL;
+    HRESULT hr = GetAudioPolicyConfig(&pPolicyConfig);
+    if (FAILED(hr) || !pPolicyConfig) {
+        napi_value nullVal;
+        napi_get_null(env, &nullVal);
+        return nullVal;
+    }
+
+    void** vtable = *(void***)pPolicyConfig;
+    auto GetPersistedDefaultAudioEndpoint = (GetPersistedDefaultAudioEndpointFunc)vtable[26];
+
+    void* hPersisted = NULL;
+    hr = GetPersistedDefaultAudioEndpoint(pPolicyConfig, processId, eRender, eConsole, &hPersisted);
+    ((IUnknown*)pPolicyConfig)->Release();
+
+    if (SUCCEEDED(hr) && hPersisted) {
+        UINT32 len = 0;
+        PCWSTR rawBuffer = api.WindowsGetStringRawBuffer(hPersisted, &len);
+        std::wstring rawStr = rawBuffer ? rawBuffer : L"";
+        api.WindowsDeleteString(hPersisted);
+
+        std::wstring endpointId = ExtractEndpointIdFromPath(rawStr);
+        if (!endpointId.empty()) {
+            return CreateNapiStringFromWide(env, endpointId.c_str());
+        }
+    }
+
+    napi_value nullVal;
+    napi_get_null(env, &nullVal);
+    return nullVal;
+}
+
+static napi_value Method_ClearApplicationOutput(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc < 1) {
+        napi_throw_type_error(env, NULL, "clearApplicationOutput requires 1 argument: (processIdOrSessionId)");
+        return NULL;
+    }
+
+    DWORD processId = 0;
+    napi_valuetype arg0Type;
+    napi_typeof(env, args[0], &arg0Type);
+    if (arg0Type == napi_number) {
+        uint32_t pidVal = 0;
+        napi_get_value_uint32(env, args[0], &pidVal);
+        processId = pidVal;
+    } else if (arg0Type == napi_string) {
+        std::wstring strArg = GetWideStringFromNapi(env, args[0]);
+        processId = FindProcessIdFromSession(strArg);
+    }
+
+    if (processId == 0) {
+        napi_throw_error(env, NULL, "Target application session not found or has invalid process ID.");
+        return NULL;
+    }
+
+    ScopedCoInitialize scopedCo;
+
+    void* pPolicyConfig = NULL;
+    HRESULT hr = GetAudioPolicyConfig(&pPolicyConfig);
+    if (FAILED(hr) || !pPolicyConfig) {
+        std::string err = FormatHresultError("AudioPolicyConfig activation", hr);
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    void** vtable = *(void***)pPolicyConfig;
+    auto SetPersistedDefaultAudioEndpoint = (SetPersistedDefaultAudioEndpointFunc)vtable[25];
+
+    hr = SetPersistedDefaultAudioEndpoint(pPolicyConfig, processId, eRender, eConsole, nullptr);
+    if (SUCCEEDED(hr)) {
+        SetPersistedDefaultAudioEndpoint(pPolicyConfig, processId, eRender, eMultimedia, nullptr);
+    }
+    ((IUnknown*)pPolicyConfig)->Release();
+
+    if (FAILED(hr)) {
+        std::string err = FormatHresultError("SetPersistedDefaultAudioEndpoint(clear)", hr);
+        napi_throw_error(env, NULL, err.c_str());
+        return NULL;
+    }
+
+    napi_value result;
+    napi_get_boolean(env, true, &result);
     return result;
 }
 
@@ -2723,6 +3253,15 @@ NAPI_MODULE_INIT() {
 
     napi_create_function(env, NULL, 0, Method_GetEndpointMute, NULL, &fn);
     napi_set_named_property(env, exports, "getEndpointMute", fn);
+
+    napi_create_function(env, NULL, 0, Method_SetApplicationOutput, NULL, &fn);
+    napi_set_named_property(env, exports, "setApplicationOutput", fn);
+
+    napi_create_function(env, NULL, 0, Method_GetApplicationOutput, NULL, &fn);
+    napi_set_named_property(env, exports, "getApplicationOutput", fn);
+
+    napi_create_function(env, NULL, 0, Method_ClearApplicationOutput, NULL, &fn);
+    napi_set_named_property(env, exports, "clearApplicationOutput", fn);
 
     napi_create_function(env, NULL, 0, Method_StartMonitoring, NULL, &fn);
     napi_set_named_property(env, exports, "startMonitoring", fn);
