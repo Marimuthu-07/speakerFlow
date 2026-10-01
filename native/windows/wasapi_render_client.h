@@ -24,6 +24,36 @@
 
 namespace speakerflow {
 
+/**
+ * RenderLifecycleState:
+ * - Represents the lifecycle of the WASAPI audio endpoint and render worker thread.
+ * - Distinct from RenderBufferState (which tracks audio ring-buffer state: Preroll / Running / Recovery).
+ * - DeviceLost indicates the underlying WASAPI audio endpoint was invalidated or disconnected
+ *   (e.g., AUDCLNT_E_DEVICE_INVALIDATED), meaning this endpoint instance cannot continue and
+ *   requires external cleanup and future recovery.
+ * - Automatic recovery is intentionally NOT part of Phase 2F.1-A.
+ */
+enum class RenderLifecycleState : uint32_t {
+    Stopped = 0,
+    Starting = 1,
+    Running = 2,
+    DeviceLost = 3,
+    Stopping = 4,
+    Failed = 5
+};
+
+inline const char* RenderLifecycleStateToString(RenderLifecycleState state) {
+    switch (state) {
+        case RenderLifecycleState::Stopped:    return "Stopped";
+        case RenderLifecycleState::Starting:   return "Starting";
+        case RenderLifecycleState::Running:    return "Running";
+        case RenderLifecycleState::DeviceLost: return "DeviceLost";
+        case RenderLifecycleState::Stopping:   return "Stopping";
+        case RenderLifecycleState::Failed:     return "Failed";
+        default: return "Unknown";
+    }
+}
+
 enum class RenderBufferState : uint32_t {
     Preroll = 0,
     Running = 1,
@@ -53,6 +83,9 @@ struct WasapiRenderStats {
     double resampleRatioMultiplier = 1.0;
     bool driftCorrectionEnabled = true;
     std::string lastError;
+    RenderLifecycleState lifecycleState = RenderLifecycleState::Stopped;
+    std::string lifecycleStateName = "Stopped";
+    uint32_t lastDeviceLossError = 0;
 };
 
 class WasapiRenderClient {
@@ -140,6 +173,26 @@ public:
     bool IsDriftCorrectionEnabled() const;
 
     /**
+     * @brief Gets current render endpoint/thread lifecycle state.
+     */
+    RenderLifecycleState GetLifecycleState() const;
+
+    /**
+     * @brief Gets current lifecycle state as human-readable string.
+     */
+    std::string GetLifecycleStateName() const;
+
+    /**
+     * @brief Gets the last HRESULT recorded during device invalidation (or S_OK).
+     */
+    HRESULT GetLastDeviceLossHresult() const;
+
+    /**
+     * @brief Simulates device loss (AUDCLNT_E_DEVICE_INVALIDATED) for deterministic unit testing.
+     */
+    void SimulateDeviceLossForTesting(HRESULT hr = 0x88890004 /* AUDCLNT_E_DEVICE_INVALIDATED */);
+
+    /**
      * @brief Gets a coherent combined snapshot of both DriftTelemetry and DriftControllerStatus
      *        from the render thread in a single atomic reader lease (lock-free, non-blocking reader).
      */
@@ -147,9 +200,13 @@ public:
 
 private:
     void RenderThreadProc();
+    void CleanupResources();
 
     std::atomic<bool> m_isRendering;
     std::atomic<bool> m_isEventDriven;
+    std::atomic<RenderLifecycleState> m_lifecycleState{RenderLifecycleState::Stopped};
+    std::atomic<HRESULT> m_lastDeviceLossHr{S_OK};
+    mutable std::mutex m_controlMutex;
     std::wstring m_targetDeviceId;
     std::string m_deviceFriendlyName;
 

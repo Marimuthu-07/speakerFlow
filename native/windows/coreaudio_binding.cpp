@@ -2457,13 +2457,17 @@ static napi_value Method_EngineGetOutputStats(napi_env env, napi_callback_info i
     napi_set_named_property(env, obj, "deviceId", devIdVal);
     napi_set_named_property(env, obj, "deviceFriendlyName", nameVal);
 
-    napi_value actVal, isRenVal, isEvVal;
+    napi_value actVal, isRenVal, isEvVal, lifeVal, lifeNameVal;
     napi_get_boolean(env, bStats.active, &actVal);
     napi_get_boolean(env, bStats.renderStats.isRendering, &isRenVal);
     napi_get_boolean(env, bStats.renderStats.isEventDriven, &isEvVal);
+    napi_create_uint32(env, static_cast<uint32_t>(bStats.lifecycleState), &lifeVal);
+    napi_create_string_utf8(env, bStats.lifecycleStateName.c_str(), NAPI_AUTO_LENGTH, &lifeNameVal);
     napi_set_named_property(env, obj, "active", actVal);
     napi_set_named_property(env, obj, "isRendering", isRenVal);
     napi_set_named_property(env, obj, "isEventDriven", isEvVal);
+    napi_set_named_property(env, obj, "lifecycleState", lifeVal);
+    napi_set_named_property(env, obj, "lifecycleStateName", lifeNameVal);
 
     napi_value srVal, chVal, bpsVal;
     napi_create_uint32(env, bStats.renderStats.sampleRate, &srVal);

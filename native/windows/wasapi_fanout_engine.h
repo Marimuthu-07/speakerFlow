@@ -34,6 +34,8 @@ struct WasapiBranchStats {
     double driftPpm = 0.0;
     bool estimatorStable = false;
     std::string renderState = "Preroll";
+    RenderLifecycleState lifecycleState = RenderLifecycleState::Stopped;
+    std::string lifecycleStateName = "Stopped";
 
     // Closed-loop drift controller telemetry from render client
     double trueDriftPpm = 0.0;

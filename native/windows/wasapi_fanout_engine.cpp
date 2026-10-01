@@ -244,6 +244,8 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
     if (branch.renderClient) {
         bStats.renderStats = branch.renderClient->GetStats();
         bStats.renderState = bStats.renderStats.bufferStateName;
+        bStats.lifecycleState = bStats.renderStats.lifecycleState;
+        bStats.lifecycleStateName = bStats.renderStats.lifecycleStateName;
 
         DriftTelemetry telem{};
         DriftControllerStatus ctrlStatus{};
@@ -266,6 +268,8 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
     } else {
         bStats.renderStats = WasapiRenderStats{};
         bStats.renderState = "Stopped";
+        bStats.lifecycleState = RenderLifecycleState::Stopped;
+        bStats.lifecycleStateName = "Stopped";
         bStats.occupancyFrames = 0;
         bStats.occupancyMs = 0.0;
         bStats.occupancyErrorFrames = 0;
