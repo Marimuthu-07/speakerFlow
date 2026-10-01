@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <functional>
 
 #include "audio_ring_buffer.h"
 #include "wasapi_capture_client.h" // For SampleFormatType
@@ -30,8 +31,9 @@ namespace speakerflow {
  * - Distinct from RenderBufferState (which tracks audio ring-buffer state: Preroll / Running / Recovery).
  * - DeviceLost indicates the underlying WASAPI audio endpoint was invalidated or disconnected
  *   (e.g., AUDCLNT_E_DEVICE_INVALIDATED), meaning this endpoint instance cannot continue and
- *   requires external cleanup and future recovery.
- * - Automatic recovery is intentionally NOT part of Phase 2F.1-A.
+ *   requires cleanup and recovery.
+ * - RecoveryPending indicates the branch is awaiting endpoint re-acquisition or backoff timer.
+ * - Reinitializing indicates the branch is actively re-acquiring the endpoint and recreating WASAPI pipeline.
  */
 enum class RenderLifecycleState : uint32_t {
     Stopped = 0,
@@ -39,17 +41,21 @@ enum class RenderLifecycleState : uint32_t {
     Running = 2,
     DeviceLost = 3,
     Stopping = 4,
-    Failed = 5
+    Failed = 5,
+    RecoveryPending = 6,
+    Reinitializing = 7
 };
 
 inline const char* RenderLifecycleStateToString(RenderLifecycleState state) {
     switch (state) {
-        case RenderLifecycleState::Stopped:    return "Stopped";
-        case RenderLifecycleState::Starting:   return "Starting";
-        case RenderLifecycleState::Running:    return "Running";
-        case RenderLifecycleState::DeviceLost: return "DeviceLost";
-        case RenderLifecycleState::Stopping:   return "Stopping";
-        case RenderLifecycleState::Failed:     return "Failed";
+        case RenderLifecycleState::Stopped:         return "Stopped";
+        case RenderLifecycleState::Starting:        return "Starting";
+        case RenderLifecycleState::Running:         return "Running";
+        case RenderLifecycleState::DeviceLost:      return "DeviceLost";
+        case RenderLifecycleState::Stopping:        return "Stopping";
+        case RenderLifecycleState::Failed:          return "Failed";
+        case RenderLifecycleState::RecoveryPending: return "RecoveryPending";
+        case RenderLifecycleState::Reinitializing:  return "Reinitializing";
         default: return "Unknown";
     }
 }
@@ -86,6 +92,9 @@ struct WasapiRenderStats {
     RenderLifecycleState lifecycleState = RenderLifecycleState::Stopped;
     std::string lifecycleStateName = "Stopped";
     uint32_t lastDeviceLossError = 0;
+    uint32_t recoveryAttemptCount = 0;
+    uint32_t lastRecoveryHresult = 0;
+    bool recoveryPending = false;
 };
 
 class WasapiRenderClient {
@@ -193,6 +202,54 @@ public:
     void SimulateDeviceLossForTesting(HRESULT hr = 0x88890004 /* AUDCLNT_E_DEVICE_INVALIDATED */);
 
     /**
+     * @brief Transitions from DeviceLost to RecoveryPending if device loss has occurred.
+     * @return true if recovery was scheduled, false if not in DeviceLost or already scheduled.
+     */
+    bool ScheduleRecovery();
+
+    /**
+     * @brief Attempts to reinitialize WASAPI render endpoint and restart rendering.
+     * @param outError Receives error description if reinitialization fails.
+     * @return true if reinitialization succeeded and rendering resumed, false otherwise.
+     */
+    bool ReinitializeRender(std::string& outError);
+
+    /**
+     * @brief Gets the number of recovery attempts made since device loss.
+     */
+    uint32_t GetRecoveryAttemptCount() const;
+
+    /**
+     * @brief Gets the last HRESULT recorded during recovery attempts (or S_OK).
+     */
+    HRESULT GetLastRecoveryHresult() const;
+
+    /**
+     * @brief Checks if recovery is currently scheduled / pending.
+     */
+    bool IsRecoveryPending() const;
+
+    /**
+     * @brief Sets callback to be invoked when the render worker thread encounters device loss.
+     */
+    void SetDeviceLostCallback(std::function<void(WasapiRenderClient*)> callback);
+
+    /**
+     * @brief Configures simulated recovery failure for deterministic testing.
+     */
+    void SetSimulateRecoveryFailureForTesting(bool fail, HRESULT failHr = E_FAIL);
+
+    /**
+     * @brief Configures simulated recovery success for deterministic testing.
+     */
+    void SetSimulateRecoverySuccessForTesting(bool success);
+
+    /**
+     * @brief Puts client directly into Running state for deterministic testing.
+     */
+    void SimulateRunningForTesting();
+
+    /**
      * @brief Gets a coherent combined snapshot of both DriftTelemetry and DriftControllerStatus
      *        from the render thread in a single atomic reader lease (lock-free, non-blocking reader).
      */
@@ -206,6 +263,13 @@ private:
     std::atomic<bool> m_isEventDriven;
     std::atomic<RenderLifecycleState> m_lifecycleState{RenderLifecycleState::Stopped};
     std::atomic<HRESULT> m_lastDeviceLossHr{S_OK};
+    std::atomic<uint32_t> m_recoveryAttemptCount{0};
+    std::atomic<HRESULT> m_lastRecoveryHr{S_OK};
+    std::atomic<bool> m_recoveryPending{false};
+    std::function<void(WasapiRenderClient*)> m_deviceLostCallback;
+    std::atomic<bool> m_simulateRecoveryFailure{false};
+    std::atomic<HRESULT> m_simulatedRecoveryFailHr{E_FAIL};
+    std::atomic<bool> m_simulateRecoverySuccess{false};
     mutable std::mutex m_controlMutex;
     std::wstring m_targetDeviceId;
     std::string m_deviceFriendlyName;

@@ -12,6 +12,9 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <thread>
 
 #include "wasapi_capture_client.h"
 #include "wasapi_render_client.h"
@@ -36,6 +39,10 @@ struct WasapiBranchStats {
     std::string renderState = "Preroll";
     RenderLifecycleState lifecycleState = RenderLifecycleState::Stopped;
     std::string lifecycleStateName = "Stopped";
+    uint32_t lastDeviceLossError = 0;
+    uint32_t recoveryAttemptCount = 0;
+    uint32_t lastRecoveryHresult = 0;
+    bool recoveryPending = false;
 
     // Closed-loop drift controller telemetry from render client
     double trueDriftPpm = 0.0;
@@ -128,6 +135,38 @@ public:
     bool IsBranchDriftCorrectionEnabled(const std::string& branchId) const;
 
     /**
+     * @brief Core Audio notification: device state changed.
+     *        If matching a lost/pending branch, triggers or accelerates recovery reinitialization.
+     */
+    void OnDeviceStateChanged(const std::wstring& deviceId, DWORD newState);
+
+    /**
+     * @brief Core Audio notification: device added.
+     *        If matching a lost/pending branch, triggers immediate reinitialization attempt.
+     */
+    void OnDeviceAdded(const std::wstring& deviceId);
+
+    /**
+     * @brief Core Audio notification: default console render device changed.
+     */
+    void OnDefaultDeviceChanged(const std::wstring& defaultDeviceId);
+
+    /**
+     * @brief Explicitly schedules and triggers immediate recovery attempt for a branch.
+     * @param branchId Identifier of branch to recover.
+     * @return true if branch was found and scheduled, false otherwise.
+     */
+    bool TriggerBranchRecovery(const std::string& branchId);
+
+    /**
+     * @brief Deterministically simulates device loss on a branch for automated unit testing.
+     * @param branchId Identifier of branch.
+     * @param hr Simulated device loss HRESULT (default AUDCLNT_E_DEVICE_INVALIDATED).
+     * @return true if branch was found and invalidated, false otherwise.
+     */
+    bool SimulateBranchDeviceLossForTesting(const std::string& branchId, HRESULT hr = 0x88890004);
+
+    /**
      * @brief Retrieves diagnostics for a specific branch.
      */
     bool GetOutputStats(const std::string& branchId, WasapiBranchStats& outStats) const;
@@ -151,9 +190,18 @@ private:
         std::unique_ptr<AudioRingBuffer> ringBuffer;
         std::unique_ptr<WasapiRenderClient> renderClient;
         std::atomic<bool> active{false};
+        bool driftCorrectionEnabled = true;
+
+        // Bounded backoff recovery coordination
+        std::chrono::steady_clock::time_point nextRetryTime{};
+        std::atomic<uint32_t> recoveryAttempts{0};
     };
 
     void PopulateBranchStats(const BranchDescriptor& branch, WasapiBranchStats& bStats) const;
+    void RecoveryThreadProc();
+    void OnRenderClientDeviceLost(WasapiRenderClient* pClient);
+    bool HasAnyPendingRecovery() const;
+    void RecoverBranchIfDue(size_t slotIndex, const std::chrono::steady_clock::time_point& now);
 
     mutable std::mutex m_engineMutex;
     WasapiCaptureClient m_captureClient;
@@ -161,6 +209,12 @@ private:
     std::string m_lastError;
 
     std::array<std::unique_ptr<BranchDescriptor>, MAX_BRANCHES> m_branches;
+
+    // Single background recovery coordinator thread for all output branches
+    std::thread m_recoveryThread;
+    std::condition_variable m_recoveryCv;
+    std::mutex m_recoveryMutex;
+    std::atomic<bool> m_stopRecoveryThread{false};
 };
 
 } // namespace speakerflow

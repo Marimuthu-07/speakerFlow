@@ -16,6 +16,7 @@ WasapiFanOutEngine::WasapiFanOutEngine() {
     for (size_t i = 0; i < MAX_BRANCHES; ++i) {
         m_branches[i] = nullptr;
     }
+    m_recoveryThread = std::thread(&WasapiFanOutEngine::RecoveryThreadProc, this);
 }
 
 WasapiFanOutEngine::~WasapiFanOutEngine() {
@@ -146,6 +147,9 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
     // Initialize and start render client on the target endpoint
     auto renderClient = std::make_unique<WasapiRenderClient>();
     renderClient->SetDriftCorrectionEnabled(driftCorrectionEnabled);
+    renderClient->SetDeviceLostCallback([this](WasapiRenderClient* c) {
+        OnRenderClientDeviceLost(c);
+    });
     bool renderOk = renderClient->StartRender(endpointId,
                                               ringBuffer.get(),
                                               capStats.sampleRate,
@@ -168,6 +172,9 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
     desc->ringBuffer = std::move(ringBuffer);
     desc->renderClient = std::move(renderClient);
     desc->active.store(true, std::memory_order_release);
+    desc->driftCorrectionEnabled = driftCorrectionEnabled;
+    desc->recoveryAttempts.store(0, std::memory_order_relaxed);
+    desc->nextRetryTime = std::chrono::steady_clock::now();
 
     m_branches[freeSlot] = std::move(desc);
     return true;
@@ -246,6 +253,10 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
         bStats.renderState = bStats.renderStats.bufferStateName;
         bStats.lifecycleState = bStats.renderStats.lifecycleState;
         bStats.lifecycleStateName = bStats.renderStats.lifecycleStateName;
+        bStats.lastDeviceLossError = bStats.renderStats.lastDeviceLossError;
+        bStats.recoveryAttemptCount = bStats.renderStats.recoveryAttemptCount;
+        bStats.lastRecoveryHresult = bStats.renderStats.lastRecoveryHresult;
+        bStats.recoveryPending = bStats.renderStats.recoveryPending;
 
         DriftTelemetry telem{};
         DriftControllerStatus ctrlStatus{};
@@ -270,6 +281,10 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
         bStats.renderState = "Stopped";
         bStats.lifecycleState = RenderLifecycleState::Stopped;
         bStats.lifecycleStateName = "Stopped";
+        bStats.lastDeviceLossError = 0;
+        bStats.recoveryAttemptCount = 0;
+        bStats.lastRecoveryHresult = 0;
+        bStats.recoveryPending = false;
         bStats.occupancyFrames = 0;
         bStats.occupancyMs = 0.0;
         bStats.occupancyErrorFrames = 0;
@@ -320,6 +335,257 @@ WasapiFanOutEngineStatus WasapiFanOutEngine::GetStatus() const {
 
 void WasapiFanOutEngine::Shutdown() {
     StopCapture();
+
+    if (!m_stopRecoveryThread.exchange(true)) {
+        m_recoveryCv.notify_all();
+        if (m_recoveryThread.joinable()) {
+            m_recoveryThread.join();
+        }
+    }
+}
+
+void WasapiFanOutEngine::OnDeviceStateChanged(const std::wstring& deviceId, DWORD newState) {
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->active.load(std::memory_order_relaxed)) {
+                if (m_branches[i]->endpointId == deviceId || (m_branches[i]->endpointId.empty() && deviceId.empty())) {
+                    if (newState == DEVICE_STATE_ACTIVE) {
+                        m_branches[i]->renderClient->ScheduleRecovery();
+                        m_branches[i]->nextRetryTime = std::chrono::steady_clock::now();
+                        notify = true;
+                    } else {
+                        m_branches[i]->renderClient->ScheduleRecovery();
+                        notify = true;
+                    }
+                }
+            }
+        }
+    }
+    if (notify) {
+        m_recoveryCv.notify_all();
+    }
+}
+
+void WasapiFanOutEngine::OnDeviceAdded(const std::wstring& deviceId) {
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->active.load(std::memory_order_relaxed)) {
+                if (m_branches[i]->endpointId == deviceId) {
+                    m_branches[i]->renderClient->ScheduleRecovery();
+                    m_branches[i]->nextRetryTime = std::chrono::steady_clock::now();
+                    notify = true;
+                }
+            }
+        }
+    }
+    if (notify) {
+        m_recoveryCv.notify_all();
+    }
+}
+
+void WasapiFanOutEngine::OnDefaultDeviceChanged(const std::wstring& defaultDeviceId) {
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->active.load(std::memory_order_relaxed)) {
+                if (m_branches[i]->endpointId.empty()) {
+                    m_branches[i]->renderClient->ScheduleRecovery();
+                    m_branches[i]->nextRetryTime = std::chrono::steady_clock::now();
+                    notify = true;
+                }
+            }
+        }
+    }
+    if (notify) {
+        m_recoveryCv.notify_all();
+    }
+}
+
+bool WasapiFanOutEngine::TriggerBranchRecovery(const std::string& branchId) {
+    bool scheduled = false;
+    {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->branchId == branchId &&
+                m_branches[i]->active.load(std::memory_order_relaxed)) {
+                m_branches[i]->renderClient->ScheduleRecovery();
+                m_branches[i]->nextRetryTime = std::chrono::steady_clock::now();
+                scheduled = true;
+                break;
+            }
+        }
+    }
+    if (scheduled) {
+        m_recoveryCv.notify_all();
+    }
+    return scheduled;
+}
+
+bool WasapiFanOutEngine::SimulateBranchDeviceLossForTesting(const std::string& branchId, HRESULT hr) {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->branchId == branchId &&
+            m_branches[i]->active.load(std::memory_order_relaxed)) {
+            m_branches[i]->renderClient->SimulateDeviceLossForTesting(hr);
+            return true;
+        }
+    }
+    return false;
+}
+
+void WasapiFanOutEngine::OnRenderClientDeviceLost(WasapiRenderClient* pClient) {
+    if (!pClient) return;
+    bool scheduled = false;
+    {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->renderClient.get() == pClient &&
+                m_branches[i]->active.load(std::memory_order_relaxed)) {
+                if (m_branches[i]->renderClient->ScheduleRecovery()) {
+                    m_branches[i]->recoveryAttempts.store(0, std::memory_order_relaxed);
+                    m_branches[i]->nextRetryTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+                    scheduled = true;
+                }
+                break;
+            }
+        }
+    }
+    if (scheduled) {
+        m_recoveryCv.notify_all();
+    }
+}
+
+bool WasapiFanOutEngine::HasAnyPendingRecovery() const {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->active.load(std::memory_order_relaxed)) {
+            RenderLifecycleState st = m_branches[i]->renderClient->GetLifecycleState();
+            if (st == RenderLifecycleState::DeviceLost || st == RenderLifecycleState::RecoveryPending) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void WasapiFanOutEngine::RecoveryThreadProc() {
+    HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    while (!m_stopRecoveryThread.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> cvLock(m_recoveryMutex);
+
+        auto now = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point earliestWakeup = now + std::chrono::hours(1);
+        bool hasPending = false;
+
+        {
+            std::lock_guard<std::mutex> lock(m_engineMutex);
+            for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+                if (m_branches[i] && m_branches[i]->active.load(std::memory_order_acquire)) {
+                    RenderLifecycleState st = m_branches[i]->renderClient->GetLifecycleState();
+                    if (st == RenderLifecycleState::DeviceLost) {
+                        m_branches[i]->renderClient->ScheduleRecovery();
+                        st = RenderLifecycleState::RecoveryPending;
+                        m_branches[i]->nextRetryTime = now + std::chrono::milliseconds(50);
+                    }
+                    if (st == RenderLifecycleState::RecoveryPending) {
+                        hasPending = true;
+                        if (m_branches[i]->nextRetryTime <= now) {
+                            earliestWakeup = now;
+                        } else if (m_branches[i]->nextRetryTime < earliestWakeup) {
+                            earliestWakeup = m_branches[i]->nextRetryTime;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (m_stopRecoveryThread.load(std::memory_order_acquire)) {
+            break;
+        }
+
+        if (!hasPending) {
+            m_recoveryCv.wait(cvLock, [this]() {
+                return m_stopRecoveryThread.load(std::memory_order_acquire) || HasAnyPendingRecovery();
+            });
+        } else if (earliestWakeup > now) {
+            m_recoveryCv.wait_until(cvLock, earliestWakeup, [this]() {
+                return m_stopRecoveryThread.load(std::memory_order_acquire);
+            });
+        }
+
+        if (m_stopRecoveryThread.load(std::memory_order_acquire)) {
+            break;
+        }
+
+        // Process branches due for recovery
+        now = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            RecoverBranchIfDue(i, now);
+        }
+    }
+
+    if (SUCCEEDED(hrCom)) {
+        CoUninitialize();
+    }
+}
+
+void WasapiFanOutEngine::RecoverBranchIfDue(size_t slotIndex, const std::chrono::steady_clock::time_point& now) {
+    if (slotIndex >= MAX_BRANCHES) return;
+
+    WasapiRenderClient* pClient = nullptr;
+    std::string branchId;
+    {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        if (!m_branches[slotIndex] || !m_branches[slotIndex]->active.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (m_branches[slotIndex]->renderClient->GetLifecycleState() != RenderLifecycleState::RecoveryPending) {
+            return;
+        }
+        if (m_branches[slotIndex]->nextRetryTime > now) {
+            return;
+        }
+        pClient = m_branches[slotIndex]->renderClient.get();
+        branchId = m_branches[slotIndex]->branchId;
+    }
+
+    if (!pClient) return;
+
+    // Call ReinitializeRender outside m_engineMutex
+    std::string err;
+    bool ok = pClient->ReinitializeRender(err);
+
+    {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        // Verify branch is still active and unmodified
+        if (!m_branches[slotIndex] || !m_branches[slotIndex]->active.load(std::memory_order_acquire) ||
+            m_branches[slotIndex]->branchId != branchId) {
+            // Branch was stopped or removed during reinitialization attempt
+            if (pClient && ok) {
+                pClient->StopRender();
+            }
+            return;
+        }
+
+        if (ok) {
+            m_branches[slotIndex]->recoveryAttempts.store(0, std::memory_order_relaxed);
+        } else {
+            uint32_t attempts = m_branches[slotIndex]->recoveryAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (attempts >= 5) {
+                // Max recovery attempts reached; ReinitializeRender set state to Failed
+            } else {
+                // Backoff: 100ms * 2^(attempts-1): 100ms, 200ms, 400ms, 800ms...
+                uint32_t delayMs = 100 * (1 << std::min<uint32_t>(attempts, 4));
+                m_branches[slotIndex]->nextRetryTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(delayMs);
+            }
+        }
+    }
 }
 
 } // namespace speakerflow

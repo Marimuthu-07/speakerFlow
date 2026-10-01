@@ -34,6 +34,12 @@ WasapiRenderClient::WasapiRenderClient()
       m_isEventDriven(false),
       m_lifecycleState(RenderLifecycleState::Stopped),
       m_lastDeviceLossHr(S_OK),
+      m_recoveryAttemptCount(0),
+      m_lastRecoveryHr(S_OK),
+      m_recoveryPending(false),
+      m_simulateRecoveryFailure(false),
+      m_simulatedRecoveryFailHr(E_FAIL),
+      m_simulateRecoverySuccess(false),
       m_sampleRate(48000),
       m_channels(2),
       m_bitsPerSample(32),
@@ -114,6 +120,9 @@ bool WasapiRenderClient::StartRender(const std::wstring& targetDeviceId,
 
     m_lifecycleState.store(RenderLifecycleState::Starting, std::memory_order_release);
     m_lastDeviceLossHr.store(S_OK, std::memory_order_relaxed);
+    m_recoveryAttemptCount.store(0, std::memory_order_relaxed);
+    m_lastRecoveryHr.store(S_OK, std::memory_order_relaxed);
+    m_recoveryPending.store(false, std::memory_order_release);
 
     {
         std::lock_guard<std::mutex> errLock(m_errorMutex);
@@ -404,6 +413,7 @@ void WasapiRenderClient::StopRender() {
 
     m_lifecycleState.store(RenderLifecycleState::Stopping, std::memory_order_release);
     m_isRendering.store(false, std::memory_order_release);
+    m_recoveryPending.store(false, std::memory_order_release);
 
     if (m_hStopEvent) {
         SetEvent(m_hStopEvent);
@@ -763,6 +773,17 @@ void WasapiRenderClient::RenderThreadProc() {
     if (SUCCEEDED(hrCom)) {
         CoUninitialize();
     }
+
+    if (m_lifecycleState.load(std::memory_order_acquire) == RenderLifecycleState::DeviceLost) {
+        std::function<void(WasapiRenderClient*)> cb;
+        {
+            std::lock_guard<std::mutex> lock(m_controlMutex);
+            cb = m_deviceLostCallback;
+        }
+        if (cb) {
+            cb(this);
+        }
+    }
 }
 
 WasapiRenderStats WasapiRenderClient::GetStats() const {
@@ -806,6 +827,9 @@ WasapiRenderStats WasapiRenderClient::GetStats() const {
     stats.lifecycleState = m_lifecycleState.load(std::memory_order_acquire);
     stats.lifecycleStateName = RenderLifecycleStateToString(stats.lifecycleState);
     stats.lastDeviceLossError = static_cast<uint32_t>(m_lastDeviceLossHr.load(std::memory_order_relaxed));
+    stats.recoveryAttemptCount = m_recoveryAttemptCount.load(std::memory_order_relaxed);
+    stats.lastRecoveryHresult = static_cast<uint32_t>(m_lastRecoveryHr.load(std::memory_order_relaxed));
+    stats.recoveryPending = m_recoveryPending.load(std::memory_order_acquire);
 
     std::lock_guard<std::mutex> lock(m_errorMutex);
     stats.lastError = m_lastError;
@@ -831,6 +855,14 @@ void WasapiRenderClient::SimulateDeviceLossForTesting(HRESULT hr) {
     {
         std::lock_guard<std::mutex> lock(m_errorMutex);
         m_lastError = "WASAPI render device was invalidated or disconnected (simulated).";
+    }
+    std::function<void(WasapiRenderClient*)> cb;
+    {
+        std::lock_guard<std::mutex> lock(m_controlMutex);
+        cb = m_deviceLostCallback;
+    }
+    if (cb) {
+        cb(this);
     }
 }
 
@@ -937,6 +969,460 @@ void WasapiRenderClient::GetDriftSnapshot(DriftTelemetry& outTelemetry,
         }
         m_readerCounts[slot].fetch_sub(1, std::memory_order_seq_cst);
     }
+}
+
+bool WasapiRenderClient::ScheduleRecovery() {
+    std::lock_guard<std::mutex> lock(m_controlMutex);
+    RenderLifecycleState current = m_lifecycleState.load(std::memory_order_acquire);
+    if (current == RenderLifecycleState::DeviceLost) {
+        m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
+        m_recoveryPending.store(true, std::memory_order_release);
+        return true;
+    }
+    return false;
+}
+
+uint32_t WasapiRenderClient::GetRecoveryAttemptCount() const {
+    return m_recoveryAttemptCount.load(std::memory_order_relaxed);
+}
+
+HRESULT WasapiRenderClient::GetLastRecoveryHresult() const {
+    return m_lastRecoveryHr.load(std::memory_order_relaxed);
+}
+
+bool WasapiRenderClient::IsRecoveryPending() const {
+    return m_recoveryPending.load(std::memory_order_acquire);
+}
+
+void WasapiRenderClient::SetDeviceLostCallback(std::function<void(WasapiRenderClient*)> callback) {
+    std::lock_guard<std::mutex> lock(m_controlMutex);
+    m_deviceLostCallback = callback;
+}
+
+void WasapiRenderClient::SetSimulateRecoveryFailureForTesting(bool fail, HRESULT failHr) {
+    m_simulateRecoveryFailure.store(fail, std::memory_order_relaxed);
+    m_simulatedRecoveryFailHr.store(failHr, std::memory_order_relaxed);
+}
+
+void WasapiRenderClient::SetSimulateRecoverySuccessForTesting(bool success) {
+    m_simulateRecoverySuccess.store(success, std::memory_order_relaxed);
+}
+
+void WasapiRenderClient::SimulateRunningForTesting() {
+    m_lifecycleState.store(RenderLifecycleState::Running, std::memory_order_release);
+    m_isRendering.store(true, std::memory_order_release);
+    m_recoveryPending.store(false, std::memory_order_release);
+    m_lastDeviceLossHr.store(S_OK, std::memory_order_relaxed);
+    m_recoveryAttemptCount.store(0, std::memory_order_relaxed);
+}
+
+bool WasapiRenderClient::ReinitializeRender(std::string& outError) {
+    std::lock_guard<std::mutex> lock(m_controlMutex);
+
+    RenderLifecycleState current = m_lifecycleState.load(std::memory_order_acquire);
+    if (current != RenderLifecycleState::RecoveryPending && current != RenderLifecycleState::DeviceLost) {
+        outError = "Cannot reinitialize: branch is not in RecoveryPending or DeviceLost state.";
+        return false;
+    }
+
+    m_lifecycleState.store(RenderLifecycleState::Reinitializing, std::memory_order_release);
+    m_recoveryAttemptCount.fetch_add(1, std::memory_order_relaxed);
+
+    if (m_simulateRecoveryFailure.load(std::memory_order_relaxed)) {
+        HRESULT hrFail = m_simulatedRecoveryFailHr.load(std::memory_order_relaxed);
+        m_lastRecoveryHr.store(hrFail, std::memory_order_relaxed);
+        outError = FormatHresult("Simulated recovery failure", hrFail);
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
+            m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+            m_recoveryPending.store(false, std::memory_order_release);
+        } else {
+            m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
+        }
+        return false;
+    }
+
+    // Join previous worker thread if still joinable
+    if (m_thread.joinable()) {
+        if (m_thread.get_id() != std::this_thread::get_id()) {
+            m_thread.join();
+        }
+    }
+
+    // Retain configuration across cleanup
+    AudioRingBuffer* pRing = m_pRingBuffer;
+    uint32_t capRate = m_captureSampleRate;
+    uint32_t capChannels = m_captureChannels;
+    std::wstring targetId = m_targetDeviceId;
+
+    CleanupResources();
+
+    m_pRingBuffer = pRing;
+    m_captureSampleRate = capRate;
+    m_captureChannels = capChannels;
+    m_targetDeviceId = targetId;
+
+    if (m_simulateRecoverySuccess.load(std::memory_order_relaxed)) {
+        if (m_pRingBuffer) {
+            m_pRingBuffer->Reset();
+        }
+        m_bufferState.store(RenderBufferState::Preroll, std::memory_order_relaxed);
+        m_recoveryAttemptCount.store(0, std::memory_order_relaxed);
+        m_lastRecoveryHr.store(S_OK, std::memory_order_relaxed);
+        m_recoveryPending.store(false, std::memory_order_release);
+        m_lifecycleState.store(RenderLifecycleState::Running, std::memory_order_release);
+        m_isRendering.store(true, std::memory_order_release);
+        return true;
+    }
+
+    if (!m_pRingBuffer) {
+        outError = "Ring buffer pointer is null on reinitialization.";
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+        m_recoveryPending.store(false, std::memory_order_release);
+        return false;
+    }
+
+    // Controlled buffer reset for the recovered branch:
+    // Discard old, stale samples accumulated prior to disconnect so fresh audio begins cleanly
+    m_pRingBuffer->Reset();
+
+    // Re-acquire device endpoint via IMMDeviceEnumerator
+    IMMDeviceEnumerator* pEnumerator = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                  NULL,
+                                  CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator),
+                                  (void**)&pEnumerator);
+    if (FAILED(hr) || !pEnumerator) {
+        m_lastRecoveryHr.store(hr, std::memory_order_relaxed);
+        outError = FormatHresult("CoCreateInstance(MMDeviceEnumerator on recovery)", hr);
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
+            m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+            m_recoveryPending.store(false, std::memory_order_release);
+        } else {
+            m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
+        }
+        return false;
+    }
+
+    if (m_targetDeviceId.empty()) {
+        hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_pDevice);
+    } else {
+        hr = pEnumerator->GetDevice(m_targetDeviceId.c_str(), &m_pDevice);
+    }
+    pEnumerator->Release();
+
+    if (FAILED(hr) || !m_pDevice) {
+        m_lastRecoveryHr.store(hr, std::memory_order_relaxed);
+        outError = FormatHresult("GetAudioEndpoint(Render on recovery)", hr);
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
+            m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+            m_recoveryPending.store(false, std::memory_order_release);
+        } else {
+            m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
+        }
+        return false;
+    }
+
+    // Check device state
+    DWORD devState = 0;
+    if (SUCCEEDED(m_pDevice->GetState(&devState)) && devState != DEVICE_STATE_ACTIVE) {
+        m_lastRecoveryHr.store(static_cast<HRESULT>(0x88890004), std::memory_order_relaxed);
+        outError = "Audio endpoint is not in ACTIVE state (state=" + std::to_string(devState) + ").";
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        CleanupResources();
+        m_pRingBuffer = pRing;
+        m_captureSampleRate = capRate;
+        m_captureChannels = capChannels;
+        m_targetDeviceId = targetId;
+        if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
+            m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+            m_recoveryPending.store(false, std::memory_order_release);
+        } else {
+            m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
+        }
+        return false;
+    }
+
+    // Friendly name
+    m_deviceFriendlyName.clear();
+    IPropertyStore* pProps = nullptr;
+    if (SUCCEEDED(m_pDevice->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
+        PROPVARIANT varName;
+        PropVariantInit(&varName);
+        if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName))) {
+            if (varName.vt == VT_LPWSTR && varName.pwszVal) {
+                m_deviceFriendlyName = WideToUtf8(varName.pwszVal);
+            }
+        }
+        PropVariantClear(&varName);
+        pProps->Release();
+    }
+
+    // Activate IAudioClient
+    hr = m_pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&m_pAudioClient);
+    if (FAILED(hr) || !m_pAudioClient) {
+        m_lastRecoveryHr.store(hr, std::memory_order_relaxed);
+        outError = FormatHresult("Activate(IAudioClient on recovery)", hr);
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        CleanupResources();
+        m_pRingBuffer = pRing;
+        m_captureSampleRate = capRate;
+        m_captureChannels = capChannels;
+        m_targetDeviceId = targetId;
+        if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
+            m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+            m_recoveryPending.store(false, std::memory_order_release);
+        } else {
+            m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
+        }
+        return false;
+    }
+
+    // MixFormat
+    hr = m_pAudioClient->GetMixFormat(&m_pMixFormat);
+    if (FAILED(hr) || !m_pMixFormat) {
+        m_lastRecoveryHr.store(hr, std::memory_order_relaxed);
+        outError = FormatHresult("GetMixFormat on recovery", hr);
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        CleanupResources();
+        m_pRingBuffer = pRing;
+        m_captureSampleRate = capRate;
+        m_captureChannels = capChannels;
+        m_targetDeviceId = targetId;
+        if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
+            m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+            m_recoveryPending.store(false, std::memory_order_release);
+        } else {
+            m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
+        }
+        return false;
+    }
+
+    m_sampleRate = m_pMixFormat->nSamplesPerSec;
+    m_channels = m_pMixFormat->nChannels;
+    m_bitsPerSample = m_pMixFormat->wBitsPerSample;
+
+    // Detect format type
+    m_formatType = SampleFormatType::Unknown;
+    m_formatTagName = "Unknown";
+    if (m_pMixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        m_formatType = SampleFormatType::Float32;
+        m_formatTagName = "IEEE_FLOAT";
+    } else if (m_pMixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        const WAVEFORMATEXTENSIBLE* pExt = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(m_pMixFormat);
+        if (IsEqualGUID(pExt->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
+            m_formatType = SampleFormatType::Float32;
+            m_formatTagName = "EXTENSIBLE_IEEE_FLOAT";
+        } else if (IsEqualGUID(pExt->SubFormat, KSDATAFORMAT_SUBTYPE_PCM)) {
+            if (m_bitsPerSample == 16) {
+                m_formatType = SampleFormatType::Pcm16;
+                m_formatTagName = "EXTENSIBLE_PCM_16";
+            } else if (m_bitsPerSample == 24) {
+                m_formatType = (m_pMixFormat->nBlockAlign == m_channels * 4)
+                                   ? SampleFormatType::Pcm24In32
+                                   : SampleFormatType::Pcm24Packed;
+                m_formatTagName = "EXTENSIBLE_PCM_24";
+            } else if (m_bitsPerSample == 32) {
+                m_formatType = SampleFormatType::Pcm32;
+                m_formatTagName = "EXTENSIBLE_PCM_32";
+            }
+        }
+    } else if (m_pMixFormat->wFormatTag == WAVE_FORMAT_PCM) {
+        if (m_bitsPerSample == 16) {
+            m_formatType = SampleFormatType::Pcm16;
+            m_formatTagName = "PCM_16";
+        } else if (m_bitsPerSample == 24) {
+            m_formatType = (m_pMixFormat->nBlockAlign == m_channels * 4)
+                               ? SampleFormatType::Pcm24In32
+                               : SampleFormatType::Pcm24Packed;
+            m_formatTagName = "PCM_24";
+        } else if (m_bitsPerSample == 32) {
+            m_formatType = SampleFormatType::Pcm32;
+            m_formatTagName = "PCM_32";
+        }
+    }
+
+    if (m_formatType == SampleFormatType::Unknown) {
+        m_lastRecoveryHr.store(E_INVALIDARG, std::memory_order_relaxed);
+        outError = "Unsupported render mix format encountered on recovery.";
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        CleanupResources();
+        m_pRingBuffer = pRing;
+        m_captureSampleRate = capRate;
+        m_captureChannels = capChannels;
+        m_targetDeviceId = targetId;
+        m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+        m_recoveryPending.store(false, std::memory_order_release);
+        return false;
+    }
+
+    m_hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    m_hAudioEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+    REFERENCE_TIME hnsRequestedDuration = 1000000;
+    DWORD streamFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    hr = m_pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                    streamFlags,
+                                    hnsRequestedDuration,
+                                    0,
+                                    m_pMixFormat,
+                                    NULL);
+
+    bool eventDriven = false;
+    if (SUCCEEDED(hr)) {
+        hr = m_pAudioClient->SetEventHandle(m_hAudioEvent);
+        if (SUCCEEDED(hr)) {
+            eventDriven = true;
+        }
+    }
+
+    if (!eventDriven) {
+        if (m_hAudioEvent) {
+            CloseHandle(m_hAudioEvent);
+            m_hAudioEvent = NULL;
+        }
+        m_pAudioClient->Release();
+        m_pAudioClient = nullptr;
+
+        hr = m_pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&m_pAudioClient);
+        if (SUCCEEDED(hr) && m_pAudioClient) {
+            streamFlags = 0;
+            hr = m_pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                            streamFlags,
+                                            hnsRequestedDuration,
+                                            0,
+                                            m_pMixFormat,
+                                            NULL);
+        }
+    }
+
+    if (FAILED(hr)) {
+        m_lastRecoveryHr.store(hr, std::memory_order_relaxed);
+        outError = FormatHresult("Initialize(IAudioClient RENDER on recovery)", hr);
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        CleanupResources();
+        m_pRingBuffer = pRing;
+        m_captureSampleRate = capRate;
+        m_captureChannels = capChannels;
+        m_targetDeviceId = targetId;
+        if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
+            m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+            m_recoveryPending.store(false, std::memory_order_release);
+        } else {
+            m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
+        }
+        return false;
+    }
+
+    m_isEventDriven.store(eventDriven, std::memory_order_relaxed);
+
+    hr = m_pAudioClient->GetService(__uuidof(IAudioRenderClient), (void**)&m_pRenderClient);
+    if (FAILED(hr) || !m_pRenderClient) {
+        m_lastRecoveryHr.store(hr, std::memory_order_relaxed);
+        outError = FormatHresult("GetService(IAudioRenderClient on recovery)", hr);
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        CleanupResources();
+        m_pRingBuffer = pRing;
+        m_captureSampleRate = capRate;
+        m_captureChannels = capChannels;
+        m_targetDeviceId = targetId;
+        if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
+            m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+            m_recoveryPending.store(false, std::memory_order_release);
+        } else {
+            m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
+        }
+        return false;
+    }
+
+    m_bufferFrameCount = 0;
+    m_pAudioClient->GetBufferSize(&m_bufferFrameCount);
+
+    const size_t maxFrames = std::max<size_t>(m_bufferFrameCount * 4, 8192);
+    if (!m_pipeline.Initialize(m_captureSampleRate,
+                               m_captureChannels,
+                               m_sampleRate,
+                               m_channels,
+                               m_formatType,
+                               maxFrames)) {
+        m_lastRecoveryHr.store(E_FAIL, std::memory_order_relaxed);
+        outError = "Failed to initialize AudioFormatPipeline on recovery.";
+        {
+            std::lock_guard<std::mutex> errLock(m_errorMutex);
+            m_lastError = outError;
+        }
+        CleanupResources();
+        m_pRingBuffer = pRing;
+        m_captureSampleRate = capRate;
+        m_captureChannels = capChannels;
+        m_targetDeviceId = targetId;
+        m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
+        m_recoveryPending.store(false, std::memory_order_release);
+        return false;
+    }
+
+    // Pre-roll: silence priming
+    BYTE* pPrimeData = nullptr;
+    hr = m_pRenderClient->GetBuffer(m_bufferFrameCount, &pPrimeData);
+    if (SUCCEEDED(hr) && pPrimeData) {
+        m_pRenderClient->ReleaseBuffer(m_bufferFrameCount, AUDCLNT_BUFFERFLAGS_SILENT);
+    }
+
+    // Reset drift estimator and controller for fresh session
+    const size_t targetOccupancy = static_cast<size_t>(m_captureSampleRate * 0.050);
+    m_driftEstimator.SetSampleRate(m_captureSampleRate);
+    m_driftEstimator.SetTargetOccupancy(targetOccupancy);
+    m_driftEstimator.Reset();
+    m_driftController.Reset();
+    m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
+
+    DriftControllerStatus initStatus = m_driftController.GetStatus();
+    initStatus.driftCorrectionEnabled = m_driftCorrectionEnabled.load(std::memory_order_relaxed);
+    PublishTelemetrySnapshot(m_driftEstimator.GetTelemetry(), initStatus);
+
+    m_recoveryAttemptCount.store(0, std::memory_order_relaxed);
+    m_lastRecoveryHr.store(S_OK, std::memory_order_relaxed);
+    m_recoveryPending.store(false, std::memory_order_release);
+
+    m_isRendering.store(true, std::memory_order_release);
+    m_lifecycleState.store(RenderLifecycleState::Starting, std::memory_order_release);
+    m_thread = std::thread(&WasapiRenderClient::RenderThreadProc, this);
+
+    return true;
 }
 
 } // namespace speakerflow

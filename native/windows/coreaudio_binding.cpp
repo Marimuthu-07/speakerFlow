@@ -441,6 +441,13 @@ public:
             DispatchEvent(payload);
 
             OnEndpointStateChanged(pwstrDeviceId, dwNewState);
+
+            {
+                std::lock_guard<std::mutex> lock(g_fanoutMutex);
+                if (g_fanoutEngine) {
+                    g_fanoutEngine->OnDeviceStateChanged(pwstrDeviceId, dwNewState);
+                }
+            }
         }
         return S_OK;
     }
@@ -471,6 +478,13 @@ public:
             DispatchEvent(payload);
 
             OnEndpointAdded(pwstrDeviceId);
+
+            {
+                std::lock_guard<std::mutex> lock(g_fanoutMutex);
+                if (g_fanoutEngine) {
+                    g_fanoutEngine->OnDeviceAdded(pwstrDeviceId);
+                }
+            }
         }
         return S_OK;
     }
@@ -498,6 +512,13 @@ public:
 
             OnEndpointRemoved(pwstrDeviceId);
         }
+
+        {
+            std::lock_guard<std::mutex> lock(g_fanoutMutex);
+            if (g_fanoutEngine) {
+                g_fanoutEngine->OnDeviceStateChanged(pwstrDeviceId, DEVICE_STATE_NOTPRESENT);
+            }
+        }
         return S_OK;
     }
 
@@ -507,6 +528,13 @@ public:
             payload.type = "default-device-changed";
             payload.deviceId = pwstrDefaultDeviceId ? WideToUtf8(pwstrDefaultDeviceId) : "";
             DispatchEvent(payload);
+
+            {
+                std::lock_guard<std::mutex> lock(g_fanoutMutex);
+                if (g_fanoutEngine) {
+                    g_fanoutEngine->OnDefaultDeviceChanged(pwstrDefaultDeviceId ? pwstrDefaultDeviceId : L"");
+                }
+            }
         }
         return S_OK;
     }
@@ -2469,6 +2497,17 @@ static napi_value Method_EngineGetOutputStats(napi_env env, napi_callback_info i
     napi_set_named_property(env, obj, "lifecycleState", lifeVal);
     napi_set_named_property(env, obj, "lifecycleStateName", lifeNameVal);
 
+    napi_value lossErrVal, recAttVal, recHrVal, recPendVal;
+    napi_create_uint32(env, bStats.lastDeviceLossError, &lossErrVal);
+    napi_create_uint32(env, bStats.recoveryAttemptCount, &recAttVal);
+    napi_create_uint32(env, bStats.lastRecoveryHresult, &recHrVal);
+    napi_get_boolean(env, bStats.recoveryPending, &recPendVal);
+    napi_set_named_property(env, obj, "lastDeviceLossHresult", lossErrVal);
+    napi_set_named_property(env, obj, "lastDeviceLossError", lossErrVal);
+    napi_set_named_property(env, obj, "recoveryAttemptCount", recAttVal);
+    napi_set_named_property(env, obj, "lastRecoveryHresult", recHrVal);
+    napi_set_named_property(env, obj, "recoveryPending", recPendVal);
+
     napi_value srVal, chVal, bpsVal;
     napi_create_uint32(env, bStats.renderStats.sampleRate, &srVal);
     napi_create_uint32(env, bStats.renderStats.channels, &chVal);
@@ -2576,6 +2615,21 @@ static napi_value Method_EngineGetStatus(napi_env env, napi_callback_info info) 
         napi_set_named_property(env, bObj, "deviceId", devIdVal);
         napi_set_named_property(env, bObj, "deviceFriendlyName", nameVal);
         napi_set_named_property(env, bObj, "active", actVal);
+
+        napi_value bLifeVal, bLifeNameVal, bLossErrVal, bRecAttVal, bRecHrVal, bRecPendVal;
+        napi_create_uint32(env, static_cast<uint32_t>(b.lifecycleState), &bLifeVal);
+        napi_create_string_utf8(env, b.lifecycleStateName.c_str(), NAPI_AUTO_LENGTH, &bLifeNameVal);
+        napi_create_uint32(env, b.lastDeviceLossError, &bLossErrVal);
+        napi_create_uint32(env, b.recoveryAttemptCount, &bRecAttVal);
+        napi_create_uint32(env, b.lastRecoveryHresult, &bRecHrVal);
+        napi_get_boolean(env, b.recoveryPending, &bRecPendVal);
+        napi_set_named_property(env, bObj, "lifecycleState", bLifeVal);
+        napi_set_named_property(env, bObj, "lifecycleStateName", bLifeNameVal);
+        napi_set_named_property(env, bObj, "lastDeviceLossHresult", bLossErrVal);
+        napi_set_named_property(env, bObj, "lastDeviceLossError", bLossErrVal);
+        napi_set_named_property(env, bObj, "recoveryAttemptCount", bRecAttVal);
+        napi_set_named_property(env, bObj, "lastRecoveryHresult", bRecHrVal);
+        napi_set_named_property(env, bObj, "recoveryPending", bRecPendVal);
 
         napi_value framesVal, underVal, overVal;
         napi_create_int64(env, b.renderStats.framesRendered, &framesVal);
