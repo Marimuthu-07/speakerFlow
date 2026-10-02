@@ -247,6 +247,20 @@ Phase 8 introduces a higher-level motion orchestration layer that makes a single
 - **Safe Dynamic Topology**: $N=0$ and $N=1$ topologies are safely handled across every mode without throwing or freezing. Hot-unplug, disconnect, and reconnect dynamically adjust the motion sequence while strictly preserving user volume, mute state, and spatial coordinates.
 - **Zero Invariant Violations**: Leaves `all_speakers`, WirePlumber, persistent PipeWire configurations, and system default sinks completely untouched.
 
+## Windows Multi-Speaker Engine & Acoustic Delay (Phase 2H)
+
+SpeakerFlow includes native multi-speaker audio fan-out and per-branch acoustic delay compensation on Windows using Core Audio (WASAPI).
+
+### Per-Branch Acoustic Delay (Phase 2H-B)
+
+When playing audio across heterogeneous audio outputs (such as Bluetooth headphones alongside built-in laptop speakers), physical and transmission latencies can cause acoustic misalignment or echo. SpeakerFlow provides manual acoustic delay controls to align sound output across multiple speakers.
+
+- **Software Compensation**: Acoustic delay is implemented as a bounded software ring buffer on each render branch. It adds configurable delay to earlier-sounding outputs so that sound reaches the listener synchronously.
+- **Range & Precision**: 0 to 500 ms (1 ms slider adjustment).
+- **Default Value**: 0 ms for all newly discovered devices.
+- **Device-Specific Persistence**: Delay settings are persisted per physical hardware device (keyed by stable Windows MMDevice endpoint ID). Saved delays are automatically restored when starting an engine session, reconnecting devices, or relaunching the application.
+- **Manual Configuration Only**: Phase 2H-B provides manual delay adjustment sliders in the Output Devices view. Automatic acoustic measurement, microphone calibration, and chirp-based latency detection are not yet implemented.
+
 ## Linux Support
 
 SpeakerFlow targets Linux desktop systems running PipeWire with WirePlumber.

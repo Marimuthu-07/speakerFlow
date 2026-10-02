@@ -1,6 +1,7 @@
 const { randomUUID } = require('node:crypto');
 const { createAudioPipelineAdapter } = require('./createAudioBackend.cjs');
 const { WaveEngineController } = require('./waveEngineController.cjs');
+const { DeviceDelayStore } = require('./deviceDelayStore.cjs');
 
 function isVirtualSink(sink) {
   if (!sink) return false;
@@ -12,9 +13,10 @@ function isVirtualSink(sink) {
 }
 
 class SpeakerEngineService {
-  constructor(audioBackend, pipelineAdapter) {
+  constructor(audioBackend, pipelineAdapter, delayStore = null) {
     this.audioBackend = audioBackend;
     this.pipelineAdapter = pipelineAdapter || createAudioPipelineAdapter(audioBackend);
+    this.delayStore = delayStore || new DeviceDelayStore();
     this.session = null;
     this.lastMessage = '';
     this.waveController = new WaveEngineController(audioBackend);
@@ -25,15 +27,27 @@ class SpeakerEngineService {
     this._reconcilePending = false;
   }
 
+  getDeviceDelay(deviceId) {
+    return this.delayStore.getDelay(deviceId);
+  }
+
+  supportsAcousticDelay() {
+    return process.platform === 'win32' || Boolean(this.pipelineAdapter?.setBranchDelay);
+  }
+
   async getStatus() {
     await this.reconcileSession();
     const allOutputs = await this.audioBackend.listOutputDevicesWithStatus();
-    const outputs = allOutputs.filter((device) => !isVirtualSink(device));
+    const outputs = allOutputs.filter((device) => !isVirtualSink(device)).map((device) => ({
+      ...device,
+      configuredDelayMs: this.delayStore.getDelay(device.id)
+    }));
 
     const waveStatus = this.waveController.getStatus();
 
     return {
       outputs,
+      supportsAcousticDelay: this.supportsAcousticDelay(),
       session: this.session
         ? {
             active: true,
@@ -57,7 +71,7 @@ class SpeakerEngineService {
               state: b.state,
               error: b.error || null,
               delayMs: b.delayMs ?? 0,
-              configuredDelayMs: b.delayMs ?? 0,
+              configuredDelayMs: b.delayMs ?? this.delayStore.getDelay(b.sinkId),
               effectiveDelayFrames: b.delayFrames ?? (b.handle?.delayFrames ?? 0),
               intentionalDisconnect: b.intentionalDisconnect || false
             })),
@@ -178,6 +192,7 @@ class SpeakerEngineService {
       for (let i = 0; i < validPhysicalSinks.length; i++) {
         const physicalSink = validPhysicalSinks[i];
         const branchSinkId = `speakerflow.session.${sessionId}.branch.${i}`;
+        const initialDelay = this.delayStore.getDelay(physicalSink.id);
         const branchObj = {
           sinkId: physicalSink.id,
           sinkName: physicalSink.name,
@@ -185,7 +200,7 @@ class SpeakerEngineService {
           handle: null,
           state: 'starting',
           error: null,
-          delayMs: 0,
+          delayMs: initialDelay,
           delayFrames: 0,
           intentionalDisconnect: false,
           retryCount: 0,
@@ -197,7 +212,7 @@ class SpeakerEngineService {
           const branchHandle = await pipeline.createBranch({
             branchSinkId,
             physicalSinkId: physicalSink.id,
-            delayMs: branchObj.delayMs,
+            delayMs: initialDelay,
             onError: (error) => {
               branchObj.state = 'failed';
               branchObj.error = error.message;
@@ -438,14 +453,8 @@ class SpeakerEngineService {
   }
 
   async setSpeakerDelay(sinkId, delayMs) {
-    const session = this.session;
-    if (!session || session.stopping) {
-      throw new Error('No active Speaker Engine session.');
-    }
-
-    const branch = session.branches.find((b) => b.sinkId === sinkId || b.branchSinkId === sinkId);
-    if (!branch) {
-      throw new Error(`Output branch "${sinkId}" was not found in active session.`);
+    if (!sinkId || typeof sinkId !== 'string') {
+      throw new Error('A valid speaker sink ID is required.');
     }
 
     const val = Number(delayMs);
@@ -453,13 +462,23 @@ class SpeakerEngineService {
       throw new Error('Speaker delay must be a finite number between 0 and 500 milliseconds.');
     }
 
-    branch.delayMs = val;
-    if (session.pipeline && typeof session.pipeline.setBranchDelay === 'function') {
-      const res = await session.pipeline.setBranchDelay(branch.branchSinkId, val);
-      if (res && res.delayFrames !== undefined) {
-        branch.delayFrames = res.delayFrames;
+    const session = this.session;
+    const branch = session?.branches?.find((b) => b.sinkId === sinkId || b.branchSinkId === sinkId);
+
+    let effectiveFrames = 0;
+    if (session && !session.stopping && branch) {
+      if (session.pipeline && typeof session.pipeline.setBranchDelay === 'function') {
+        const res = await session.pipeline.setBranchDelay(branch.branchSinkId, val);
+        if (res && res.delayFrames !== undefined) {
+          branch.delayFrames = res.delayFrames;
+          effectiveFrames = res.delayFrames;
+        }
       }
+      branch.delayMs = val;
     }
+
+    const physicalSinkId = branch ? branch.sinkId : sinkId;
+    this.delayStore.setDelay(physicalSinkId, val);
 
     if (typeof this.onSessionChanged === 'function') {
       this.onSessionChanged();
@@ -467,10 +486,10 @@ class SpeakerEngineService {
 
     return {
       success: true,
-      sinkId: branch.sinkId,
-      branchSinkId: branch.branchSinkId,
-      configuredDelayMs: branch.delayMs,
-      effectiveDelayFrames: branch.delayFrames ?? 0
+      sinkId: physicalSinkId,
+      branchSinkId: branch?.branchSinkId || null,
+      configuredDelayMs: val,
+      effectiveDelayFrames: effectiveFrames
     };
   }
 
@@ -541,10 +560,11 @@ class SpeakerEngineService {
       }
 
       if (session.pipeline) {
+        const initialDelay = branch.delayMs ?? this.delayStore.getDelay(branch.sinkId);
         const branchHandle = await session.pipeline.createBranch({
           branchSinkId: branch.branchSinkId,
           physicalSinkId: branch.sinkId,
-          delayMs: branch.delayMs ?? 0,
+          delayMs: initialDelay,
           onError: (error) => {
             branch.state = 'failed';
             branch.error = error.message;
@@ -568,6 +588,7 @@ class SpeakerEngineService {
         });
 
         branch.handle = branchHandle;
+        branch.delayMs = branchHandle?.delayMs ?? initialDelay;
         branch.delayFrames = branchHandle?.delayFrames ?? (branch.delayFrames ?? 0);
         branch.state = 'active';
         branch.error = null;

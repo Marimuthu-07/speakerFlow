@@ -60,6 +60,11 @@ function App() {
   const svgCanvasRef = useRef(null);
   const [draggingTarget, setDraggingTarget] = useState(null); // 'source' | sinkId | null
 
+  // Phase 2H-B: Per-device manual acoustic delay state (0-500 ms)
+  const [deviceDelays, setDeviceDelays] = useState({});
+  const confirmedDelaysRef = useRef({});
+  const pendingDelayTimersRef = useRef(new Map());
+
   const refreshDevices = useCallback(async () => {
     setLoadingDevices(true);
     setDeviceError('');
@@ -147,6 +152,26 @@ function App() {
         }
         return filtered;
       });
+
+      // Synchronize confirmed device delays from engine status
+      setDeviceDelays((current) => {
+        const next = { ...current };
+        for (const out of nextStatus?.outputs || []) {
+          if (!pendingDelayTimersRef.current.has(out.id)) {
+            const val = out.configuredDelayMs ?? 0;
+            next[out.id] = val;
+            confirmedDelaysRef.current[out.id] = val;
+          }
+        }
+        for (const b of nextStatus?.session?.branches || []) {
+          if (!pendingDelayTimersRef.current.has(b.sinkId)) {
+            const val = b.configuredDelayMs ?? b.delayMs ?? 0;
+            next[b.sinkId] = val;
+            confirmedDelaysRef.current[b.sinkId] = val;
+          }
+        }
+        return next;
+      });
     } catch (refreshError) {
       setEngineError(refreshError.message || 'Could not inspect the Multi-Speaker Engine.');
     }
@@ -208,6 +233,10 @@ function App() {
     });
 
     return () => {
+      for (const timer of pendingDelayTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      pendingDelayTimersRef.current.clear();
       if (typeof unsubBattery === 'function') unsubBattery();
       if (typeof unsubMaster === 'function') unsubMaster();
       if (typeof unsubDevices === 'function') unsubDevices();
@@ -368,6 +397,52 @@ function App() {
       setEngineError(err.message || 'Could not reconnect output branch.');
     }
   }
+
+  // --- Phase 2H-B Acoustic Delay Controls ---
+  const handleAcousticDelayChange = (sinkId, newDelayMs) => {
+    const rawVal = Number(newDelayMs);
+    const clamped = Math.max(0, Math.min(500, Number.isFinite(rawVal) ? Math.round(rawVal) : 0));
+    setDeviceDelays((prev) => ({ ...prev, [sinkId]: clamped }));
+
+    const existingTimer = pendingDelayTimersRef.current.get(sinkId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    const timer = setTimeout(async () => {
+      pendingDelayTimersRef.current.delete(sinkId);
+      try {
+        const res = await window.speakerFlow.setSpeakerDelay(sinkId, clamped);
+        const confirmed = res?.configuredDelayMs ?? clamped;
+        confirmedDelaysRef.current[sinkId] = confirmed;
+        setDeviceDelays((prev) => ({ ...prev, [sinkId]: confirmed }));
+      } catch (err) {
+        const rollbackVal = confirmedDelaysRef.current[sinkId] ?? 0;
+        setDeviceDelays((prev) => ({ ...prev, [sinkId]: rollbackVal }));
+        setEngineError(err.message || 'Could not update acoustic delay.');
+      }
+    }, 40);
+    pendingDelayTimersRef.current.set(sinkId, timer);
+  };
+
+  const handleAcousticDelayCommit = async (sinkId) => {
+    const timer = pendingDelayTimersRef.current.get(sinkId);
+    if (timer) {
+      clearTimeout(timer);
+      pendingDelayTimersRef.current.delete(sinkId);
+      const val = deviceDelays[sinkId] ?? confirmedDelaysRef.current[sinkId] ?? 0;
+      try {
+        const res = await window.speakerFlow.setSpeakerDelay(sinkId, val);
+        const confirmed = res?.configuredDelayMs ?? val;
+        confirmedDelaysRef.current[sinkId] = confirmed;
+        setDeviceDelays((prev) => ({ ...prev, [sinkId]: confirmed }));
+      } catch (err) {
+        const rollbackVal = confirmedDelaysRef.current[sinkId] ?? 0;
+        setDeviceDelays((prev) => ({ ...prev, [sinkId]: rollbackVal }));
+        setEngineError(err.message || 'Could not update acoustic delay.');
+      }
+    }
+  };
 
   // Legacy Stream Routing
   async function routeSelectedStream() {
@@ -1122,6 +1197,40 @@ function App() {
                             {sink.mute ? '0% (Muted)' : `${sink.volumePercent ?? 100}%`}
                           </span>
                         </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Phase 2H-B: Per-Device Acoustic Delay Controls */}
+                  {engineStatus?.supportsAcousticDelay !== false && (
+                    <div className="delay-control-block">
+                      <div className="delay-control-tag-row">
+                        <span className="delay-tag">ACOUSTIC DELAY</span>
+                        <span className={`delay-value-badge ${engineActive && !isBranchActive ? 'disabled' : ''}`}>
+                          {deviceDelays[sink.id] ?? 0} ms
+                        </span>
+                      </div>
+                      <p className="delay-help-text">
+                        Software compensation delay (0–500 ms) for physical speaker alignment.
+                      </p>
+
+                      <div className="delay-slider-row">
+                        <span className="slider-edge-label">0 ms</span>
+                        <input
+                          type="range"
+                          className="delay-slider"
+                          min="0"
+                          max="500"
+                          step="1"
+                          value={deviceDelays[sink.id] ?? 0}
+                          onChange={(e) => handleAcousticDelayChange(sink.id, e.target.value)}
+                          onPointerUp={() => handleAcousticDelayCommit(sink.id)}
+                          onKeyUp={() => handleAcousticDelayCommit(sink.id)}
+                          disabled={engineActive && !isBranchActive}
+                          title={`Acoustic compensation delay for ${sink.name}`}
+                          aria-label={`Acoustic delay for ${sink.name}`}
+                        />
+                        <span className="slider-edge-label">500 ms</span>
                       </div>
                     </div>
                   )}
@@ -2270,6 +2379,7 @@ function App() {
                         <div className="branch-info">
                           <span className="branch-name">{branch.sinkName}</span>
                           <span className="branch-target">→ {branch.branchSinkId} → {branch.sinkId}</span>
+                          <span className="branch-delay-pill">Acoustic Delay: {branch.configuredDelayMs ?? branch.delayMs ?? 0} ms</span>
                           {branch.error && <span className="branch-error">{branch.error}</span>}
                         </div>
                         <span className={`status ${branch.state}`}>{branch.state}</span>

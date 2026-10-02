@@ -1405,6 +1405,86 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
   box-shadow: 0 0 10px rgba(37, 99, 235, 0.35);
 }
 
+/* Phase 2H-B Acoustic Delay Controls */
+.delay-control-block {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #1a2436;
+}
+.delay-control-tag-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.delay-tag {
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #38bdf8;
+}
+.delay-value-badge {
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  font-weight: 700;
+  background: #0f1d33;
+  color: #7dd3fc;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid #1e3a5f;
+  min-width: 58px;
+  text-align: right;
+  white-space: nowrap;
+}
+.delay-value-badge.disabled {
+  color: #64748b;
+  background: #111827;
+  border-color: #1e293b;
+}
+.delay-help-text {
+  margin: 0;
+  font-size: 0.73rem;
+  color: #8fa4cb;
+  font-style: italic;
+}
+.delay-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #101624;
+  border: 1px solid #212d44;
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+.delay-slider {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: #202b3f;
+  accent-color: #38bdf8;
+  cursor: pointer;
+  outline: none;
+}
+.delay-slider:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  background: #192233;
+}
+.branch-delay-pill {
+  font-size: 0.72rem;
+  color: #7dd3fc;
+  font-family: ui-monospace, monospace;
+  background: rgba(56, 189, 248, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 4px;
+  padding: 1px 6px;
+  display: inline-block;
+  margin-top: 2px;
+}
+
 @media (max-width: 600px) {
   .app-shell { width: min(100% - 24px, 880px); padding-top: 32px; }
   .hero, .action-bar { align-items: flex-start; flex-direction: column; }
