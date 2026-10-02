@@ -52,6 +52,10 @@ struct WasapiBranchStats {
     double targetMultiplier = 1.0;
     bool isClamped = false;
     bool driftCorrectionEnabled = true;
+
+    // Software acoustic delay configuration (Phase 2H-A)
+    double configuredDelayMs = 0.0;
+    uint32_t effectiveDelayFrames = 0;
 };
 
 struct WasapiFanOutEngineStatus {
@@ -105,7 +109,8 @@ public:
     bool AddOutput(const std::string& branchId,
                    const std::wstring& endpointId,
                    std::string& outError,
-                   bool driftCorrectionEnabled = true);
+                   bool driftCorrectionEnabled = true,
+                   double delayMs = 0.0);
 
     /**
      * @brief Removes and stops an active render output branch.
@@ -133,6 +138,20 @@ public:
      * @return true if enabled (or false if disabled or branch not found).
      */
     bool IsBranchDriftCorrectionEnabled(const std::string& branchId) const;
+
+    /**
+     * @brief Configures software acoustic delay in milliseconds for a specific branch (Phase 2H-A).
+     * @param branchId Identifier of branch.
+     * @param delayMs Delay in milliseconds (0.0 <= delayMs <= 500.0).
+     * @param outError Receives error description if configuration fails.
+     * @return true if branch was found and updated, false otherwise.
+     */
+    bool SetBranchDelay(const std::string& branchId, double delayMs, std::string& outError);
+
+    /**
+     * @brief Gets current software delay configuration for a specific branch.
+     */
+    bool GetBranchDelay(const std::string& branchId, double& outDelayMs, size_t& outDelayFrames) const;
 
     /**
      * @brief Core Audio notification: device state changed.
@@ -191,6 +210,7 @@ private:
         std::unique_ptr<WasapiRenderClient> renderClient;
         std::atomic<bool> active{false};
         bool driftCorrectionEnabled = true;
+        double delayMs = 0.0;
 
         // Bounded backoff recovery coordination
         std::chrono::steady_clock::time_point nextRetryTime{};

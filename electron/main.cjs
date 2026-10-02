@@ -235,6 +235,7 @@ ipcMain.handle('audio:set-master-volume', async (_event, volume) => speakerEngin
 ipcMain.handle('audio:set-master-mute', async (_event, muted) => speakerEngineService.setMasterMute(muted));
 ipcMain.handle('audio:set-speaker-volume', async (_event, sinkId, volume) => speakerEngineService.setSpeakerVolume(sinkId, volume));
 ipcMain.handle('audio:set-speaker-mute', async (_event, sinkId, muted) => speakerEngineService.setSpeakerMute(sinkId, muted));
+ipcMain.handle('audio:set-speaker-delay', async (_event, sinkId, delayMs) => speakerEngineService.setSpeakerDelay(sinkId, delayMs));
 ipcMain.handle('audio:get-wave-status', async () => speakerEngineService.getWaveStatus());
 ipcMain.handle('audio:set-wave-config', async (_event, config) => speakerEngineService.setWaveConfig(config));
 ipcMain.handle('audio:set-motion-config', async (_event, config) => speakerEngineService.setMotionConfig(config));

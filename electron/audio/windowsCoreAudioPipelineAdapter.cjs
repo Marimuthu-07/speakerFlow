@@ -11,7 +11,7 @@ class WindowsCoreAudioPipelineSession extends AudioPipelineSession {
     this.destroyed = false;
   }
 
-  async createBranch({ branchSinkId, physicalSinkId, onError, onDisconnect }) {
+  async createBranch({ branchSinkId, physicalSinkId, delayMs = 0, onError, onDisconnect }) {
     if (this.destroyed) {
       throw new Error('Cannot create branch on a destroyed pipeline session.');
     }
@@ -25,18 +25,33 @@ class WindowsCoreAudioPipelineSession extends AudioPipelineSession {
       } catch {}
     }
 
+    let validatedDelayMs = 0;
+    if (delayMs !== undefined && delayMs !== null) {
+      const val = Number(delayMs);
+      if (Number.isNaN(val) || !Number.isFinite(val) || val < 0 || val > 500) {
+        throw new Error('Delay must be a finite number between 0 and 500 milliseconds.');
+      }
+      validatedDelayMs = val;
+    }
+
     try {
       const res = this.native.engineAddOutput({
         branchId: branchSinkId,
         deviceId: physicalSinkId,
-        driftCorrectionEnabled: true
+        driftCorrectionEnabled: true,
+        delayMs: validatedDelayMs
       });
 
       if (!res || !res.success) {
         throw new Error(`Failed to create WASAPI render branch for ${branchSinkId}`);
       }
 
-      const handle = { branchSinkId, physicalSinkId };
+      const handle = {
+        branchSinkId,
+        physicalSinkId,
+        delayMs: res.configuredDelayMs ?? validatedDelayMs,
+        delayFrames: res.effectiveDelayFrames ?? 0
+      };
       this.branches.set(branchSinkId, handle);
       return handle;
     } catch (err) {
@@ -45,6 +60,33 @@ class WindowsCoreAudioPipelineSession extends AudioPipelineSession {
       }
       throw err;
     }
+  }
+
+  async setBranchDelay(branchSinkId, delayMs) {
+    if (this.destroyed) {
+      throw new Error('Cannot configure branch delay on a destroyed pipeline session.');
+    }
+    const val = Number(delayMs);
+    if (Number.isNaN(val) || !Number.isFinite(val) || val < 0 || val > 500) {
+      throw new Error('Delay must be a finite number between 0 and 500 milliseconds.');
+    }
+    const handle = this.branches.get(branchSinkId);
+    if (!handle) {
+      throw new Error(`Branch with ID ${branchSinkId} not found in pipeline session.`);
+    }
+    if (typeof this.native.engineSetBranchDelay === 'function') {
+      this.native.engineSetBranchDelay(branchSinkId, val);
+    } else if (typeof this.native.engineSetOutputDelay === 'function') {
+      this.native.engineSetOutputDelay(branchSinkId, val);
+    }
+    handle.delayMs = val;
+    if (typeof this.native.engineGetBranchDelay === 'function') {
+      try {
+        const stats = this.native.engineGetBranchDelay(branchSinkId);
+        handle.delayFrames = stats.effectiveDelayFrames;
+      } catch {}
+    }
+    return { success: true, branchSinkId, delayMs: val, delayFrames: handle.delayFrames ?? 0 };
   }
 
   async destroyBranch(branchHandle) {

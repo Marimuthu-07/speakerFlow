@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('speakerFlow', {
   setMasterMute: (muted) => ipcRenderer.invoke('audio:set-master-mute', muted),
   setSpeakerVolume: (sinkId, volume) => ipcRenderer.invoke('audio:set-speaker-volume', sinkId, volume),
   setSpeakerMute: (sinkId, muted) => ipcRenderer.invoke('audio:set-speaker-mute', sinkId, muted),
+  setSpeakerDelay: (sinkId, delayMs) => ipcRenderer.invoke('audio:set-speaker-delay', sinkId, delayMs),
   getWaveStatus: () => ipcRenderer.invoke('audio:get-wave-status'),
   setWaveConfig: (config) => ipcRenderer.invoke('audio:set-wave-config', config),
   setMotionConfig: (config) => ipcRenderer.invoke('audio:set-motion-config', config),

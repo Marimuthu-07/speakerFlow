@@ -72,9 +72,16 @@ WasapiCaptureStats WasapiFanOutEngine::GetCaptureStats() const {
 bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
                                    const std::wstring& endpointId,
                                    std::string& outError,
-                                   bool driftCorrectionEnabled) {
+                                   bool driftCorrectionEnabled,
+                                   double delayMs) {
     std::lock_guard<std::mutex> lock(m_engineMutex);
     m_lastError.clear();
+
+    if (std::isnan(delayMs) || std::isinf(delayMs) || delayMs < 0.0 || delayMs > 500.0) {
+        outError = "Output delay must be a finite number between 0.0 and 500.0 milliseconds.";
+        m_lastError = outError;
+        return false;
+    }
 
     if (!m_captureClient.IsCapturing()) {
         outError = "Cannot add output: WASAPI loopback capture is not active.";
@@ -147,6 +154,13 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
     // Initialize and start render client on the target endpoint
     auto renderClient = std::make_unique<WasapiRenderClient>();
     renderClient->SetDriftCorrectionEnabled(driftCorrectionEnabled);
+    std::string delayErr;
+    if (!renderClient->SetDelayMs(delayMs, delayErr)) {
+        outError = delayErr;
+        m_lastError = outError;
+        return false;
+    }
+
     renderClient->SetDeviceLostCallback([this](WasapiRenderClient* c) {
         OnRenderClientDeviceLost(c);
     });
@@ -173,6 +187,7 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
     desc->renderClient = std::move(renderClient);
     desc->active.store(true, std::memory_order_release);
     desc->driftCorrectionEnabled = driftCorrectionEnabled;
+    desc->delayMs = delayMs;
     desc->recoveryAttempts.store(0, std::memory_order_relaxed);
     desc->nextRetryTime = std::chrono::steady_clock::now();
 
@@ -242,6 +257,50 @@ bool WasapiFanOutEngine::IsBranchDriftCorrectionEnabled(const std::string& branc
     return false;
 }
 
+bool WasapiFanOutEngine::SetBranchDelay(const std::string& branchId, double delayMs, std::string& outError) {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    m_lastError.clear();
+
+    if (std::isnan(delayMs) || std::isinf(delayMs) || delayMs < 0.0 || delayMs > 500.0) {
+        outError = "Output delay must be a finite number between 0.0 and 500.0 milliseconds.";
+        m_lastError = outError;
+        return false;
+    }
+
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->branchId == branchId) {
+            if (m_branches[i]->renderClient) {
+                if (!m_branches[i]->renderClient->SetDelayMs(delayMs, outError)) {
+                    m_lastError = outError;
+                    return false;
+                }
+                m_branches[i]->delayMs = delayMs;
+                return true;
+            }
+        }
+    }
+
+    outError = "Branch with identifier '" + branchId + "' was not found.";
+    m_lastError = outError;
+    return false;
+}
+
+bool WasapiFanOutEngine::GetBranchDelay(const std::string& branchId, double& outDelayMs, size_t& outDelayFrames) const {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->branchId == branchId) {
+            if (m_branches[i]->renderClient) {
+                outDelayMs = m_branches[i]->renderClient->GetConfiguredDelayMs();
+                outDelayFrames = m_branches[i]->renderClient->GetEffectiveDelayFrames();
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, WasapiBranchStats& bStats) const {
     bStats.branchId = branch.branchId;
     bStats.endpointId = WideToUtf8(branch.endpointId.c_str());
@@ -276,6 +335,8 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
         bStats.targetMultiplier = ctrlStatus.targetMultiplier;
         bStats.isClamped = ctrlStatus.isClamped;
         bStats.driftCorrectionEnabled = ctrlStatus.driftCorrectionEnabled;
+        bStats.configuredDelayMs = bStats.renderStats.configuredDelayMs;
+        bStats.effectiveDelayFrames = bStats.renderStats.effectiveDelayFrames;
     } else {
         bStats.renderStats = WasapiRenderStats{};
         bStats.renderState = "Stopped";
@@ -298,6 +359,8 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
         bStats.targetMultiplier = 1.0;
         bStats.isClamped = false;
         bStats.driftCorrectionEnabled = true;
+        bStats.configuredDelayMs = branch.delayMs;
+        bStats.effectiveDelayFrames = 0;
     }
 }
 

@@ -22,6 +22,7 @@
 #include "audio_format_pipeline.h"
 #include "audio_drift_estimator.h"
 #include "audio_drift_controller.h"
+#include "audio_delay_buffer.h"
 
 namespace speakerflow {
 
@@ -95,6 +96,8 @@ struct WasapiRenderStats {
     uint32_t recoveryAttemptCount = 0;
     uint32_t lastRecoveryHresult = 0;
     bool recoveryPending = false;
+    double configuredDelayMs = 0.0;
+    uint32_t effectiveDelayFrames = 0;
 };
 
 class WasapiRenderClient {
@@ -255,6 +258,24 @@ public:
      */
     void GetDriftSnapshot(DriftTelemetry& outTelemetry, DriftControllerStatus& outStatus) const;
 
+    /**
+     * @brief Sets software delay for this render branch in milliseconds (0.0 <= delayMs <= 500.0).
+     * @param delayMs Delay in milliseconds.
+     * @param outError Error message if validation fails.
+     * @return true if successfully set, false otherwise.
+     */
+    bool SetDelayMs(double delayMs, std::string& outError);
+
+    /**
+     * @brief Gets currently configured software delay in milliseconds.
+     */
+    double GetConfiguredDelayMs() const;
+
+    /**
+     * @brief Gets currently effective delay in frames.
+     */
+    size_t GetEffectiveDelayFrames() const;
+
 private:
     void RenderThreadProc();
     void CleanupResources();
@@ -309,6 +330,8 @@ private:
 
     AudioDriftEstimator m_driftEstimator;
     AudioDriftController m_driftController;
+    AudioDelayBuffer m_delayBuffer;
+    std::atomic<double> m_configuredDelayMs{0.0};
 
     // Multi-slot lock-free snapshot publication with reader lifetime protection.
     // Guaranteed zero data races: writer never overwrites a slot while readerCount > 0.

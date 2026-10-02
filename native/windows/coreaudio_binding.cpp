@@ -2783,19 +2783,20 @@ static napi_value Method_EngineGetCaptureStats(napi_env env, napi_callback_info 
 }
 
 static napi_value Method_EngineAddOutput(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2] = { nullptr, nullptr };
+    size_t argc = 4;
+    napi_value args[4] = { nullptr, nullptr, nullptr, nullptr };
     napi_get_cb_info(env, info, &argc, args, NULL, NULL);
 
     std::string branchId;
     std::wstring endpointId;
     bool driftCorrectionEnabled = true;
+    double delayMs = 0.0;
 
     if (argc >= 1 && args[0] != nullptr) {
         napi_valuetype t0;
         napi_typeof(env, args[0], &t0);
         if (t0 == napi_object) {
-            napi_value bIdVal, devIdVal, dcVal;
+            napi_value bIdVal, devIdVal, dcVal, delayVal;
             if (napi_get_named_property(env, args[0], "branchId", &bIdVal) == napi_ok) {
                 size_t len = 0;
                 napi_get_value_string_utf8(env, bIdVal, NULL, 0, &len);
@@ -2814,6 +2815,16 @@ static napi_value Method_EngineAddOutput(napi_env env, napi_callback_info info) 
                     napi_get_value_bool(env, dcVal, &driftCorrectionEnabled);
                 }
             }
+            if (napi_get_named_property(env, args[0], "delayMs", &delayVal) == napi_ok) {
+                napi_valuetype delayType;
+                napi_typeof(env, delayVal, &delayType);
+                if (delayType == napi_number) {
+                    napi_get_value_double(env, delayVal, &delayMs);
+                } else if (delayType != napi_undefined && delayType != napi_null) {
+                    napi_throw_error(env, NULL, "delayMs must be a number");
+                    return NULL;
+                }
+            }
         } else if (t0 == napi_string) {
             size_t len = 0;
             napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
@@ -2824,11 +2835,33 @@ static napi_value Method_EngineAddOutput(napi_env env, napi_callback_info info) 
             if (argc >= 2 && args[1] != nullptr) {
                 endpointId = GetWideStringFromNapi(env, args[1]);
             }
+            if (argc >= 3 && args[2] != nullptr) {
+                napi_valuetype dcType;
+                napi_typeof(env, args[2], &dcType);
+                if (dcType == napi_boolean) {
+                    napi_get_value_bool(env, args[2], &driftCorrectionEnabled);
+                }
+            }
+            if (argc >= 4 && args[3] != nullptr) {
+                napi_valuetype delayType;
+                napi_typeof(env, args[3], &delayType);
+                if (delayType == napi_number) {
+                    napi_get_value_double(env, args[3], &delayMs);
+                } else if (delayType != napi_undefined && delayType != napi_null) {
+                    napi_throw_error(env, NULL, "delayMs must be a number");
+                    return NULL;
+                }
+            }
         }
     }
 
     if (branchId.empty()) {
         napi_throw_error(env, NULL, "branchId is required for engineAddOutput");
+        return NULL;
+    }
+
+    if (std::isnan(delayMs) || std::isinf(delayMs) || delayMs < 0.0 || delayMs > 500.0) {
+        napi_throw_error(env, NULL, "delayMs must be a finite number between 0.0 and 500.0 milliseconds.");
         return NULL;
     }
 
@@ -2839,7 +2872,7 @@ static napi_value Method_EngineAddOutput(napi_env env, napi_callback_info info) 
     }
 
     std::string error;
-    bool success = g_fanoutEngine->AddOutput(branchId, endpointId, error, driftCorrectionEnabled);
+    bool success = g_fanoutEngine->AddOutput(branchId, endpointId, error, driftCorrectionEnabled, delayMs);
     if (!success) {
         napi_throw_error(env, NULL, error.c_str());
         return NULL;
@@ -2881,7 +2914,143 @@ static napi_value Method_EngineAddOutput(napi_env env, napi_callback_info info) 
     napi_create_double(env, bStats.renderStats.bufferDurationMs, &bufDurVal);
     napi_set_named_property(env, resObj, "bufferDurationMs", bufDurVal);
 
+    napi_value confDelayVal, effFramesVal;
+    napi_create_double(env, bStats.configuredDelayMs, &confDelayVal);
+    napi_create_uint32(env, bStats.effectiveDelayFrames, &effFramesVal);
+    napi_set_named_property(env, resObj, "configuredDelayMs", confDelayVal);
+    napi_set_named_property(env, resObj, "effectiveDelayFrames", effFramesVal);
+
     return resObj;
+}
+
+static napi_value Method_EngineSetBranchDelay(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = { nullptr, nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    std::string branchId;
+    double delayMs = 0.0;
+
+    if (argc >= 1 && args[0] != nullptr) {
+        napi_valuetype t0;
+        napi_typeof(env, args[0], &t0);
+        if (t0 == napi_object) {
+            napi_value bIdVal, delayVal;
+            if (napi_get_named_property(env, args[0], "branchId", &bIdVal) == napi_ok) {
+                size_t len = 0;
+                napi_get_value_string_utf8(env, bIdVal, NULL, 0, &len);
+                if (len > 0) {
+                    branchId.resize(len);
+                    napi_get_value_string_utf8(env, bIdVal, &branchId[0], len + 1, &len);
+                }
+            }
+            if (napi_get_named_property(env, args[0], "delayMs", &delayVal) == napi_ok) {
+                napi_valuetype delayType;
+                napi_typeof(env, delayVal, &delayType);
+                if (delayType == napi_number) {
+                    napi_get_value_double(env, delayVal, &delayMs);
+                } else {
+                    napi_throw_error(env, NULL, "delayMs must be a number");
+                    return NULL;
+                }
+            }
+        } else if (t0 == napi_string) {
+            size_t len = 0;
+            napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
+            if (len > 0) {
+                branchId.resize(len);
+                napi_get_value_string_utf8(env, args[0], &branchId[0], len + 1, &len);
+            }
+            if (argc >= 2 && args[1] != nullptr) {
+                napi_valuetype t1;
+                napi_typeof(env, args[1], &t1);
+                if (t1 == napi_number) {
+                    napi_get_value_double(env, args[1], &delayMs);
+                } else {
+                    napi_throw_error(env, NULL, "delayMs must be a number");
+                    return NULL;
+                }
+            } else {
+                napi_throw_error(env, NULL, "delayMs argument is required");
+                return NULL;
+            }
+        }
+    }
+
+    if (branchId.empty()) {
+        napi_throw_error(env, NULL, "branchId is required for engineSetBranchDelay");
+        return NULL;
+    }
+
+    if (std::isnan(delayMs) || std::isinf(delayMs) || delayMs < 0.0 || delayMs > 500.0) {
+        napi_throw_error(env, NULL, "delayMs must be a finite number between 0.0 and 500.0 milliseconds.");
+        return NULL;
+    }
+
+    std::string error;
+    bool success = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            success = g_fanoutEngine->SetBranchDelay(branchId, delayMs, error);
+        } else {
+            error = "Fan-out engine is not initialized.";
+        }
+    }
+
+    if (!success) {
+        napi_throw_error(env, NULL, error.c_str());
+        return NULL;
+    }
+
+    napi_value result;
+    napi_get_boolean(env, true, &result);
+    return result;
+}
+
+static napi_value Method_EngineGetBranchDelay(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    std::string branchId;
+    if (argc > 0 && args[0] != nullptr) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
+        if (len > 0) {
+            branchId.resize(len);
+            napi_get_value_string_utf8(env, args[0], &branchId[0], len + 1, &len);
+        }
+    }
+
+    if (branchId.empty()) {
+        napi_throw_error(env, NULL, "branchId is required for engineGetBranchDelay");
+        return NULL;
+    }
+
+    double delayMs = 0.0;
+    size_t delayFrames = 0;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            found = g_fanoutEngine->GetBranchDelay(branchId, delayMs, delayFrames);
+        }
+    }
+
+    if (!found) {
+        napi_throw_error(env, NULL, ("Branch not found: " + branchId).c_str());
+        return NULL;
+    }
+
+    napi_value obj;
+    napi_create_object(env, &obj);
+    napi_value msVal, framesVal;
+    napi_create_double(env, delayMs, &msVal);
+    napi_create_uint32(env, static_cast<uint32_t>(delayFrames), &framesVal);
+    napi_set_named_property(env, obj, "configuredDelayMs", msVal);
+    napi_set_named_property(env, obj, "effectiveDelayFrames", framesVal);
+    return obj;
 }
 
 static napi_value Method_EngineRemoveOutput(napi_env env, napi_callback_info info) {
@@ -3108,6 +3277,12 @@ static napi_value Method_EngineGetOutputStats(napi_env env, napi_callback_info i
     napi_set_named_property(env, obj, "isClamped", clampedVal);
     napi_set_named_property(env, obj, "driftCorrectionEnabled", driftCorrVal);
 
+    napi_value confDelayVal, effFramesVal;
+    napi_create_double(env, bStats.configuredDelayMs, &confDelayVal);
+    napi_create_uint32(env, bStats.effectiveDelayFrames, &effFramesVal);
+    napi_set_named_property(env, obj, "configuredDelayMs", confDelayVal);
+    napi_set_named_property(env, obj, "effectiveDelayFrames", effFramesVal);
+
     return obj;
 }
 
@@ -3202,6 +3377,12 @@ static napi_value Method_EngineGetStatus(napi_env env, napi_callback_info info) 
         napi_set_named_property(env, bObj, "targetMultiplier", bTargetRatioVal);
         napi_set_named_property(env, bObj, "isClamped", bClampedVal);
         napi_set_named_property(env, bObj, "driftCorrectionEnabled", bDriftCorrVal);
+
+        napi_value bConfDelayVal, bEffFramesVal;
+        napi_create_double(env, b.configuredDelayMs, &bConfDelayVal);
+        napi_create_uint32(env, b.effectiveDelayFrames, &bEffFramesVal);
+        napi_set_named_property(env, bObj, "configuredDelayMs", bConfDelayVal);
+        napi_set_named_property(env, bObj, "effectiveDelayFrames", bEffFramesVal);
 
         napi_set_element(env, branchArr, (uint32_t)i, bObj);
     }
@@ -3326,6 +3507,14 @@ NAPI_MODULE_INIT() {
 
     napi_create_function(env, NULL, 0, Method_EngineGetStatus, NULL, &fn);
     napi_set_named_property(env, exports, "engineGetStatus", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineSetBranchDelay, NULL, &fn);
+    napi_set_named_property(env, exports, "engineSetBranchDelay", fn);
+    napi_set_named_property(env, exports, "engineSetOutputDelay", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineGetBranchDelay, NULL, &fn);
+    napi_set_named_property(env, exports, "engineGetBranchDelay", fn);
+    napi_set_named_property(env, exports, "engineGetOutputDelay", fn);
 
     napi_create_function(env, NULL, 0, Method_EngineShutdown, NULL, &fn);
     napi_set_named_property(env, exports, "engineShutdown", fn);

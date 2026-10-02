@@ -371,6 +371,11 @@ bool WasapiRenderClient::StartRender(const std::wstring& targetDeviceId,
         return false;
     }
 
+    // Initialize software delay buffer for acoustic alignment (Phase 2H-A)
+    m_delayBuffer.Initialize(m_sampleRate, m_pMixFormat->nBlockAlign, 500.0);
+    std::string delayInitErr;
+    m_delayBuffer.SetDelayMs(m_configuredDelayMs.load(std::memory_order_relaxed), delayInitErr);
+
     // Pre-roll: prime the WASAPI render buffer with initial silence
     BYTE* pPrimeData = nullptr;
     hr = m_pRenderClient->GetBuffer(m_bufferFrameCount, &pPrimeData);
@@ -400,6 +405,7 @@ bool WasapiRenderClient::StartRender(const std::wstring& targetDeviceId,
 void WasapiRenderClient::StopRender() {
     std::lock_guard<std::mutex> lock(m_controlMutex);
 
+    m_delayBuffer.Reset();
     m_bufferState.store(RenderBufferState::Preroll, std::memory_order_relaxed);
 
     RenderLifecycleState current = m_lifecycleState.load(std::memory_order_acquire);
@@ -477,6 +483,8 @@ void WasapiRenderClient::RenderThreadProc() {
     // Zero heap allocations inside the audio real-time path.
     const size_t maxFrames = std::max<size_t>(m_bufferFrameCount * 4, 8192);
     std::vector<float> captureStaging(maxFrames * m_captureChannels, 0.0f);
+    const size_t blockAlign = (m_pMixFormat ? m_pMixFormat->nBlockAlign : (m_channels * 4));
+    std::vector<uint8_t> renderStaging(maxFrames * blockAlign, 0);
 
     RenderBufferState bufferState = RenderBufferState::Preroll;
     m_bufferState.store(RenderBufferState::Preroll, std::memory_order_relaxed);
@@ -755,11 +763,20 @@ void WasapiRenderClient::RenderThreadProc() {
 
         // Process through AudioFormatPipeline: Resample -> Channel Map -> Format Convert
         size_t framesProduced = 0;
-        m_pipeline.Process(captureStaging.data(),
-                           framesRead,
-                           pRenderData,
-                           framesNeeded,
-                           framesProduced);
+        if (m_configuredDelayMs.load(std::memory_order_acquire) > 0.0) {
+            m_pipeline.Process(captureStaging.data(),
+                               framesRead,
+                               renderStaging.data(),
+                               framesNeeded,
+                               framesProduced);
+            m_delayBuffer.Process(renderStaging.data(), pRenderData, framesNeeded);
+        } else {
+            m_pipeline.Process(captureStaging.data(),
+                               framesRead,
+                               pRenderData,
+                               framesNeeded,
+                               framesProduced);
+        }
 
         m_pRenderClient->ReleaseBuffer(framesNeeded, 0);
         m_framesRendered.fetch_add(framesNeeded, std::memory_order_relaxed);
@@ -830,6 +847,8 @@ WasapiRenderStats WasapiRenderClient::GetStats() const {
     stats.recoveryAttemptCount = m_recoveryAttemptCount.load(std::memory_order_relaxed);
     stats.lastRecoveryHresult = static_cast<uint32_t>(m_lastRecoveryHr.load(std::memory_order_relaxed));
     stats.recoveryPending = m_recoveryPending.load(std::memory_order_acquire);
+    stats.configuredDelayMs = GetConfiguredDelayMs();
+    stats.effectiveDelayFrames = static_cast<uint32_t>(GetEffectiveDelayFrames());
 
     std::lock_guard<std::mutex> lock(m_errorMutex);
     stats.lastError = m_lastError;
@@ -894,6 +913,35 @@ RenderBufferState WasapiRenderClient::GetBufferState() const {
 
 bool WasapiRenderClient::IsBufferRunning() const {
     return m_bufferState.load(std::memory_order_relaxed) == RenderBufferState::Running;
+}
+
+bool WasapiRenderClient::SetDelayMs(double delayMs, std::string& outError) {
+    if (std::isnan(delayMs) || std::isinf(delayMs)) {
+        outError = "Delay value cannot be NaN or Infinite.";
+        return false;
+    }
+    if (delayMs < 0.0) {
+        outError = "Delay value cannot be negative.";
+        return false;
+    }
+    if (delayMs > 500.0) {
+        outError = "Delay value exceeds maximum limit of 500 ms.";
+        return false;
+    }
+
+    m_configuredDelayMs.store(delayMs, std::memory_order_release);
+    if (m_delayBuffer.IsInitialized()) {
+        return m_delayBuffer.SetDelayMs(delayMs, outError);
+    }
+    return true;
+}
+
+double WasapiRenderClient::GetConfiguredDelayMs() const {
+    return m_configuredDelayMs.load(std::memory_order_relaxed);
+}
+
+size_t WasapiRenderClient::GetEffectiveDelayFrames() const {
+    return m_delayBuffer.GetEffectiveDelayFrames();
 }
 
 void WasapiRenderClient::PublishTelemetrySnapshot(const DriftTelemetry& telemetry,
@@ -1394,6 +1442,12 @@ bool WasapiRenderClient::ReinitializeRender(std::string& outError) {
         m_recoveryPending.store(false, std::memory_order_release);
         return false;
     }
+
+    // Re-initialize software delay buffer on recovery with new sample rate and block align
+    m_delayBuffer.Initialize(m_sampleRate, m_pMixFormat->nBlockAlign, 500.0);
+    std::string delayRecoveryErr;
+    m_delayBuffer.SetDelayMs(m_configuredDelayMs.load(std::memory_order_relaxed), delayRecoveryErr);
+    m_delayBuffer.Reset();
 
     // Pre-roll: silence priming
     BYTE* pPrimeData = nullptr;

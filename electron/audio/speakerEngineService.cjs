@@ -56,6 +56,9 @@ class SpeakerEngineService {
               branchSinkId: b.branchSinkId,
               state: b.state,
               error: b.error || null,
+              delayMs: b.delayMs ?? 0,
+              configuredDelayMs: b.delayMs ?? 0,
+              effectiveDelayFrames: b.delayFrames ?? (b.handle?.delayFrames ?? 0),
               intentionalDisconnect: b.intentionalDisconnect || false
             })),
             activeBranchCount: this.session.branches.filter((b) => b.state === 'active').length,
@@ -182,6 +185,8 @@ class SpeakerEngineService {
           handle: null,
           state: 'starting',
           error: null,
+          delayMs: 0,
+          delayFrames: 0,
           intentionalDisconnect: false,
           retryCount: 0,
           reconnecting: false
@@ -192,6 +197,7 @@ class SpeakerEngineService {
           const branchHandle = await pipeline.createBranch({
             branchSinkId,
             physicalSinkId: physicalSink.id,
+            delayMs: branchObj.delayMs,
             onError: (error) => {
               branchObj.state = 'failed';
               branchObj.error = error.message;
@@ -214,6 +220,8 @@ class SpeakerEngineService {
             }
           });
           branchObj.handle = branchHandle;
+          branchObj.delayMs = branchHandle?.delayMs ?? branchObj.delayMs;
+          branchObj.delayFrames = branchHandle?.delayFrames ?? 0;
           branchObj.state = 'active';
           successfulBranches++;
         } catch (branchError) {
@@ -429,6 +437,43 @@ class SpeakerEngineService {
     await this._performBranchReconnect(sinkId, false);
   }
 
+  async setSpeakerDelay(sinkId, delayMs) {
+    const session = this.session;
+    if (!session || session.stopping) {
+      throw new Error('No active Speaker Engine session.');
+    }
+
+    const branch = session.branches.find((b) => b.sinkId === sinkId || b.branchSinkId === sinkId);
+    if (!branch) {
+      throw new Error(`Output branch "${sinkId}" was not found in active session.`);
+    }
+
+    const val = Number(delayMs);
+    if (Number.isNaN(val) || !Number.isFinite(val) || val < 0 || val > 500) {
+      throw new Error('Speaker delay must be a finite number between 0 and 500 milliseconds.');
+    }
+
+    branch.delayMs = val;
+    if (session.pipeline && typeof session.pipeline.setBranchDelay === 'function') {
+      const res = await session.pipeline.setBranchDelay(branch.branchSinkId, val);
+      if (res && res.delayFrames !== undefined) {
+        branch.delayFrames = res.delayFrames;
+      }
+    }
+
+    if (typeof this.onSessionChanged === 'function') {
+      this.onSessionChanged();
+    }
+
+    return {
+      success: true,
+      sinkId: branch.sinkId,
+      branchSinkId: branch.branchSinkId,
+      configuredDelayMs: branch.delayMs,
+      effectiveDelayFrames: branch.delayFrames ?? 0
+    };
+  }
+
   scheduleAutoReconnect(sinkId, delayMs = 1500) {
     const session = this.session;
     if (!session || session.stopping) return;
@@ -499,6 +544,7 @@ class SpeakerEngineService {
         const branchHandle = await session.pipeline.createBranch({
           branchSinkId: branch.branchSinkId,
           physicalSinkId: branch.sinkId,
+          delayMs: branch.delayMs ?? 0,
           onError: (error) => {
             branch.state = 'failed';
             branch.error = error.message;
@@ -522,6 +568,7 @@ class SpeakerEngineService {
         });
 
         branch.handle = branchHandle;
+        branch.delayFrames = branchHandle?.delayFrames ?? (branch.delayFrames ?? 0);
         branch.state = 'active';
         branch.error = null;
         branch.retryCount = 0;
