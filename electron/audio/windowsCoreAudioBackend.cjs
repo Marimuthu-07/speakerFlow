@@ -152,17 +152,20 @@ class WindowsCoreAudioBackend extends AudioBackend {
     }
 
     const rawDevices = await this._native.listOutputDevices();
-    return (rawDevices || []).map((device) => ({
-      id: device.id,
-      index: 0,
-      name: device.name || device.id,
-      technicalName: device.id,
-      state: 'active',
-      isDefault: Boolean(device.isDefault),
-      isVirtual: false,
-      volumePercent: typeof device.volumePercent === 'number' ? device.volumePercent : 100,
-      mute: Boolean(device.mute)
-    }));
+    return (rawDevices || []).map((device) => {
+      const name = device.name || device.id;
+      return {
+        id: device.id,
+        index: 0,
+        name,
+        technicalName: device.id,
+        state: 'active',
+        isDefault: Boolean(device.isDefault),
+        isVirtual: false,
+        volumePercent: typeof device.volumePercent === 'number' ? device.volumePercent : 100,
+        mute: Boolean(device.mute)
+      };
+    });
   }
 
   async listSinks() {
