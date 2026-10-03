@@ -188,6 +188,15 @@ class SpeakerEngineService {
       const effectiveIngressSinkId = pipeline.ingressSinkId || ingressSinkId;
       session.ingressSinkId = effectiveIngressSinkId;
 
+      if (process.platform === 'win32') {
+        if (typeof pipeline.setMasterVolume === 'function') {
+          pipeline.setMasterVolume((this.waveController.masterVolume ?? 100) / 100);
+        }
+        if (typeof pipeline.setMasterMute === 'function') {
+          pipeline.setMasterMute(Boolean(this.waveController.masterMuted));
+        }
+      }
+
       let successfulBranches = 0;
       for (let i = 0; i < validPhysicalSinks.length; i++) {
         const physicalSink = validPhysicalSinks[i];
@@ -238,6 +247,18 @@ class SpeakerEngineService {
           branchObj.delayMs = branchHandle?.delayMs ?? branchObj.delayMs;
           branchObj.delayFrames = branchHandle?.delayFrames ?? 0;
           branchObj.state = 'active';
+
+          if (process.platform === 'win32') {
+            const spkVol = this.waveController.userSpeakerVolumes.get(physicalSink.id) ?? 100;
+            const spkMute = this.waveController.userSpeakerMuted.get(physicalSink.id) ?? false;
+            if (typeof pipeline.setBranchVolume === 'function') {
+              pipeline.setBranchVolume(branchSinkId, spkVol / 100);
+            }
+            if (typeof pipeline.setBranchMute === 'function') {
+              pipeline.setBranchMute(branchSinkId, spkMute);
+            }
+          }
+
           successfulBranches++;
         } catch (branchError) {
           branchObj.state = 'failed';
@@ -356,8 +377,14 @@ class SpeakerEngineService {
   async setMasterVolume(volume) {
     const clamped = Math.max(0, Math.min(100, Math.round(volume)));
     await this.waveController.setMasterVolume(clamped);
-    if (this.session && this.session.ingressSinkId) {
-      await this.audioBackend.setSinkVolume(this.session.ingressSinkId, clamped).catch(() => {});
+    if (process.platform === 'win32') {
+      if (this.session?.pipeline && typeof this.session.pipeline.setMasterVolume === 'function') {
+        this.session.pipeline.setMasterVolume(clamped / 100);
+      }
+    } else {
+      if (this.session && this.session.ingressSinkId) {
+        await this.audioBackend.setSinkVolume(this.session.ingressSinkId, clamped).catch(() => {});
+      }
     }
     return this.waveController.getStatus();
   }
@@ -365,19 +392,37 @@ class SpeakerEngineService {
   async setMasterMute(muted) {
     const isMuted = Boolean(muted);
     await this.waveController.setMasterMute(isMuted);
-    if (this.session && this.session.ingressSinkId) {
-      await this.audioBackend.setSinkMute(this.session.ingressSinkId, isMuted).catch(() => {});
+    if (process.platform === 'win32') {
+      if (this.session?.pipeline && typeof this.session.pipeline.setMasterMute === 'function') {
+        this.session.pipeline.setMasterMute(Boolean(muted));
+      }
+    } else {
+      if (this.session && this.session.ingressSinkId) {
+        await this.audioBackend.setSinkMute(this.session.ingressSinkId, isMuted).catch(() => {});
+      }
     }
     return this.waveController.getStatus();
   }
 
   async setSpeakerVolume(sinkId, volume) {
     await this.waveController.setSpeakerVolume(sinkId, volume);
+    if (process.platform === 'win32' && this.session?.pipeline && typeof this.session.pipeline.setBranchVolume === 'function') {
+      const branch = this.session.branches.find((b) => b.sinkId === sinkId || b.branchSinkId === sinkId);
+      if (branch) {
+        this.session.pipeline.setBranchVolume(branch.branchSinkId, Math.max(0, Math.min(100, volume)) / 100);
+      }
+    }
     return this.waveController.getStatus();
   }
 
   async setSpeakerMute(sinkId, muted) {
     await this.waveController.setSpeakerMute(sinkId, muted);
+    if (process.platform === 'win32' && this.session?.pipeline && typeof this.session.pipeline.setBranchMute === 'function') {
+      const branch = this.session.branches.find((b) => b.sinkId === sinkId || b.branchSinkId === sinkId);
+      if (branch) {
+        this.session.pipeline.setBranchMute(branch.branchSinkId, Boolean(muted));
+      }
+    }
     return this.waveController.getStatus();
   }
 
@@ -649,9 +694,9 @@ class SpeakerEngineService {
       if (s.id) validPhysicalMap.set(s.id, s);
     }
 
-    // 1. Observe active session ingress sink volume and mute (OS / pavucontrol / Media key master control)
+    // 1. Observe active session ingress sink volume and mute (OS / pavucontrol / Media key master control on Linux)
     const ingressSink = sinks.find((s) => s.id === session.ingressSinkId || s.name === session.ingressSinkId);
-    if (ingressSink) {
+    if (ingressSink && process.platform !== 'win32') {
       const sinkVol = parseSinkVolumePercent(ingressSink.volumePercent !== undefined ? ingressSink.volumePercent : ingressSink.volume);
       const sinkMuted = Boolean(ingressSink.mute);
       const currentWave = this.waveController.getStatus();
@@ -836,6 +881,18 @@ class SpeakerEngineService {
           });
           branchObj.handle = branchHandle;
           branchObj.state = 'active';
+
+          if (process.platform === 'win32') {
+            const spkVol = this.waveController.userSpeakerVolumes.get(physicalSink.id) ?? 100;
+            const spkMute = this.waveController.userSpeakerMuted.get(physicalSink.id) ?? false;
+            if (typeof session.pipeline.setBranchVolume === 'function') {
+              session.pipeline.setBranchVolume(branchSinkId, spkVol / 100);
+            }
+            if (typeof session.pipeline.setBranchMute === 'function') {
+              session.pipeline.setBranchMute(branchSinkId, spkMute);
+            }
+          }
+
           this.lastMessage = `New output "${branchObj.sinkName}" connected and added to engine session.`;
           branchesChanged = true;
         } catch (branchErr) {

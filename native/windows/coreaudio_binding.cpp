@@ -3283,6 +3283,18 @@ static napi_value Method_EngineGetOutputStats(napi_env env, napi_callback_info i
     napi_set_named_property(env, obj, "configuredDelayMs", confDelayVal);
     napi_set_named_property(env, obj, "effectiveDelayFrames", effFramesVal);
 
+    napi_value mVolVal, mMuteVal, bVolVal, bMuteVal, effGainVal;
+    napi_create_double(env, bStats.masterVolume, &mVolVal);
+    napi_get_boolean(env, bStats.masterMuted, &mMuteVal);
+    napi_create_double(env, bStats.branchVolume, &bVolVal);
+    napi_get_boolean(env, bStats.branchMuted, &bMuteVal);
+    napi_create_double(env, bStats.effectiveGain, &effGainVal);
+    napi_set_named_property(env, obj, "masterVolume", mVolVal);
+    napi_set_named_property(env, obj, "masterMuted", mMuteVal);
+    napi_set_named_property(env, obj, "branchVolume", bVolVal);
+    napi_set_named_property(env, obj, "branchMuted", bMuteVal);
+    napi_set_named_property(env, obj, "effectiveGain", effGainVal);
+
     return obj;
 }
 
@@ -3384,11 +3396,272 @@ static napi_value Method_EngineGetStatus(napi_env env, napi_callback_info info) 
         napi_set_named_property(env, bObj, "configuredDelayMs", bConfDelayVal);
         napi_set_named_property(env, bObj, "effectiveDelayFrames", bEffFramesVal);
 
+        napi_value bMVolVal, bMMuteVal, bBVolVal, bBMuteVal, bEffGainVal;
+        napi_create_double(env, b.masterVolume, &bMVolVal);
+        napi_get_boolean(env, b.masterMuted, &bMMuteVal);
+        napi_create_double(env, b.branchVolume, &bBVolVal);
+        napi_get_boolean(env, b.branchMuted, &bBMuteVal);
+        napi_create_double(env, b.effectiveGain, &bEffGainVal);
+        napi_set_named_property(env, bObj, "masterVolume", bMVolVal);
+        napi_set_named_property(env, bObj, "masterMuted", bMMuteVal);
+        napi_set_named_property(env, bObj, "branchVolume", bBVolVal);
+        napi_set_named_property(env, bObj, "branchMuted", bBMuteVal);
+        napi_set_named_property(env, bObj, "effectiveGain", bEffGainVal);
+
         napi_set_element(env, branchArr, (uint32_t)i, bObj);
     }
     napi_set_named_property(env, obj, "branches", branchArr);
 
+    float rootMasterVol = 1.0f;
+    bool rootMasterMuted = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            rootMasterVol = g_fanoutEngine->GetMasterVolume();
+            rootMasterMuted = g_fanoutEngine->IsMasterMuted();
+        }
+    }
+    napi_value rMVolVal, rMMuteVal;
+    napi_create_double(env, rootMasterVol, &rMVolVal);
+    napi_get_boolean(env, rootMasterMuted, &rMMuteVal);
+    napi_set_named_property(env, obj, "masterVolume", rMVolVal);
+    napi_set_named_property(env, obj, "masterMuted", rMMuteVal);
+
     return obj;
+}
+
+static napi_value Method_EngineSetMasterVolume(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    if (argc < 1 || args[0] == nullptr) {
+        napi_throw_type_error(env, NULL, "volume number is required for engineSetMasterVolume");
+        return NULL;
+    }
+
+    double volume = 1.0;
+    if (napi_get_value_double(env, args[0], &volume) != napi_ok) {
+        napi_throw_type_error(env, NULL, "Invalid volume: must be a number");
+        return NULL;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (!g_fanoutEngine) {
+            g_fanoutEngine = std::make_unique<speakerflow::WasapiFanOutEngine>();
+        }
+        g_fanoutEngine->SetMasterVolume(static_cast<float>(volume));
+    }
+
+    napi_value resVal;
+    napi_get_boolean(env, true, &resVal);
+    return resVal;
+}
+
+static napi_value Method_EngineGetMasterVolume(napi_env env, napi_callback_info info) {
+    float volume = 1.0f;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            volume = g_fanoutEngine->GetMasterVolume();
+        }
+    }
+    napi_value resVal;
+    napi_create_double(env, volume, &resVal);
+    return resVal;
+}
+
+static napi_value Method_EngineSetMasterMute(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    if (argc < 1 || args[0] == nullptr) {
+        napi_throw_type_error(env, NULL, "mute boolean is required for engineSetMasterMute");
+        return NULL;
+    }
+
+    bool mute = false;
+    if (napi_get_value_bool(env, args[0], &mute) != napi_ok) {
+        napi_throw_type_error(env, NULL, "Invalid mute: must be a boolean");
+        return NULL;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (!g_fanoutEngine) {
+            g_fanoutEngine = std::make_unique<speakerflow::WasapiFanOutEngine>();
+        }
+        g_fanoutEngine->SetMasterMute(mute);
+    }
+
+    napi_value resVal;
+    napi_get_boolean(env, true, &resVal);
+    return resVal;
+}
+
+static napi_value Method_EngineGetMasterMute(napi_env env, napi_callback_info info) {
+    bool mute = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            mute = g_fanoutEngine->IsMasterMuted();
+        }
+    }
+    napi_value resVal;
+    napi_get_boolean(env, mute, &resVal);
+    return resVal;
+}
+
+static napi_value Method_EngineSetBranchVolume(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = { nullptr, nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    if (argc < 2 || args[0] == nullptr || args[1] == nullptr) {
+        napi_throw_type_error(env, NULL, "branchId (string) and volume (number) are required for engineSetBranchVolume");
+        return NULL;
+    }
+
+    std::string branchId;
+    size_t len = 0;
+    napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
+    if (len > 0) {
+        branchId.resize(len);
+        napi_get_value_string_utf8(env, args[0], &branchId[0], len + 1, &len);
+    }
+
+    double volume = 1.0;
+    if (napi_get_value_double(env, args[1], &volume) != napi_ok) {
+        napi_throw_type_error(env, NULL, "Invalid volume: must be a number");
+        return NULL;
+    }
+
+    bool success = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            success = g_fanoutEngine->SetBranchVolume(branchId, static_cast<float>(volume));
+        }
+    }
+
+    napi_value resVal;
+    napi_get_boolean(env, success, &resVal);
+    return resVal;
+}
+
+static napi_value Method_EngineGetBranchVolume(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    if (argc < 1 || args[0] == nullptr) {
+        napi_throw_type_error(env, NULL, "branchId (string) is required for engineGetBranchVolume");
+        return NULL;
+    }
+
+    std::string branchId;
+    size_t len = 0;
+    napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
+    if (len > 0) {
+        branchId.resize(len);
+        napi_get_value_string_utf8(env, args[0], &branchId[0], len + 1, &len);
+    }
+
+    float volume = 1.0f;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            found = g_fanoutEngine->GetBranchVolume(branchId, volume);
+        }
+    }
+
+    if (!found) {
+        napi_value nullVal;
+        napi_get_null(env, &nullVal);
+        return nullVal;
+    }
+
+    napi_value resVal;
+    napi_create_double(env, volume, &resVal);
+    return resVal;
+}
+
+static napi_value Method_EngineSetBranchMute(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = { nullptr, nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    if (argc < 2 || args[0] == nullptr || args[1] == nullptr) {
+        napi_throw_type_error(env, NULL, "branchId (string) and mute (boolean) are required for engineSetBranchMute");
+        return NULL;
+    }
+
+    std::string branchId;
+    size_t len = 0;
+    napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
+    if (len > 0) {
+        branchId.resize(len);
+        napi_get_value_string_utf8(env, args[0], &branchId[0], len + 1, &len);
+    }
+
+    bool mute = false;
+    if (napi_get_value_bool(env, args[1], &mute) != napi_ok) {
+        napi_throw_type_error(env, NULL, "Invalid mute: must be a boolean");
+        return NULL;
+    }
+
+    bool success = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            success = g_fanoutEngine->SetBranchMute(branchId, mute);
+        }
+    }
+
+    napi_value resVal;
+    napi_get_boolean(env, success, &resVal);
+    return resVal;
+}
+
+static napi_value Method_EngineGetBranchMute(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    if (argc < 1 || args[0] == nullptr) {
+        napi_throw_type_error(env, NULL, "branchId (string) is required for engineGetBranchMute");
+        return NULL;
+    }
+
+    std::string branchId;
+    size_t len = 0;
+    napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
+    if (len > 0) {
+        branchId.resize(len);
+        napi_get_value_string_utf8(env, args[0], &branchId[0], len + 1, &len);
+    }
+
+    bool mute = false;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            found = g_fanoutEngine->IsBranchMuted(branchId, mute);
+        }
+    }
+
+    if (!found) {
+        napi_value nullVal;
+        napi_get_null(env, &nullVal);
+        return nullVal;
+    }
+
+    napi_value resVal;
+    napi_get_boolean(env, mute, &resVal);
+    return resVal;
 }
 
 static napi_value Method_EngineShutdown(napi_env env, napi_callback_info info) {
@@ -3515,6 +3788,30 @@ NAPI_MODULE_INIT() {
     napi_create_function(env, NULL, 0, Method_EngineGetBranchDelay, NULL, &fn);
     napi_set_named_property(env, exports, "engineGetBranchDelay", fn);
     napi_set_named_property(env, exports, "engineGetOutputDelay", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineSetMasterVolume, NULL, &fn);
+    napi_set_named_property(env, exports, "engineSetMasterVolume", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineGetMasterVolume, NULL, &fn);
+    napi_set_named_property(env, exports, "engineGetMasterVolume", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineSetMasterMute, NULL, &fn);
+    napi_set_named_property(env, exports, "engineSetMasterMute", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineGetMasterMute, NULL, &fn);
+    napi_set_named_property(env, exports, "engineGetMasterMute", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineSetBranchVolume, NULL, &fn);
+    napi_set_named_property(env, exports, "engineSetBranchVolume", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineGetBranchVolume, NULL, &fn);
+    napi_set_named_property(env, exports, "engineGetBranchVolume", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineSetBranchMute, NULL, &fn);
+    napi_set_named_property(env, exports, "engineSetBranchMute", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineGetBranchMute, NULL, &fn);
+    napi_set_named_property(env, exports, "engineGetBranchMute", fn);
 
     napi_create_function(env, NULL, 0, Method_EngineShutdown, NULL, &fn);
     napi_set_named_property(env, exports, "engineShutdown", fn);

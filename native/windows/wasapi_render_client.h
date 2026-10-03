@@ -98,6 +98,11 @@ struct WasapiRenderStats {
     bool recoveryPending = false;
     double configuredDelayMs = 0.0;
     uint32_t effectiveDelayFrames = 0;
+    float masterVolume = 1.0f;
+    bool masterMuted = false;
+    float branchVolume = 1.0f;
+    bool branchMuted = false;
+    float effectiveGain = 1.0f;
 };
 
 class WasapiRenderClient {
@@ -276,6 +281,51 @@ public:
      */
     size_t GetEffectiveDelayFrames() const;
 
+    /**
+     * @brief Sets master volume scalar (0.0f <= volume <= 1.0f).
+     */
+    void SetMasterVolume(float volume);
+
+    /**
+     * @brief Gets current master volume scalar.
+     */
+    float GetMasterVolume() const;
+
+    /**
+     * @brief Sets master mute state.
+     */
+    void SetMasterMute(bool mute);
+
+    /**
+     * @brief Checks if master is muted.
+     */
+    bool IsMasterMuted() const;
+
+    /**
+     * @brief Sets branch volume scalar (0.0f <= volume <= 1.0f).
+     */
+    void SetBranchVolume(float volume);
+
+    /**
+     * @brief Gets current branch volume scalar.
+     */
+    float GetBranchVolume() const;
+
+    /**
+     * @brief Sets branch mute state.
+     */
+    void SetBranchMute(bool mute);
+
+    /**
+     * @brief Checks if branch is muted.
+     */
+    bool IsBranchMuted() const;
+
+    /**
+     * @brief Gets combined effective software gain (0.0f if muted, else masterVolume * branchVolume).
+     */
+    float GetEffectiveGain() const;
+
 private:
     void RenderThreadProc();
     void CleanupResources();
@@ -291,6 +341,13 @@ private:
     std::atomic<bool> m_simulateRecoveryFailure{false};
     std::atomic<HRESULT> m_simulatedRecoveryFailHr{E_FAIL};
     std::atomic<bool> m_simulateRecoverySuccess{false};
+
+    // Software master and branch gain scalars (Phase 2F.1-D)
+    std::atomic<float> m_masterVolume{1.0f};
+    std::atomic<bool> m_masterMuted{false};
+    std::atomic<float> m_branchVolume{1.0f};
+    std::atomic<bool> m_branchMuted{false};
+
     mutable std::mutex m_controlMutex;
     std::wstring m_targetDeviceId;
     std::string m_deviceFriendlyName;

@@ -56,6 +56,13 @@ struct WasapiBranchStats {
     // Software acoustic delay configuration (Phase 2H-A)
     double configuredDelayMs = 0.0;
     uint32_t effectiveDelayFrames = 0;
+
+    // Software volume and mute status (Phase 2F.1-D)
+    float masterVolume = 1.0f;
+    bool masterMuted = false;
+    float branchVolume = 1.0f;
+    bool branchMuted = false;
+    float effectiveGain = 1.0f;
 };
 
 struct WasapiFanOutEngineStatus {
@@ -154,6 +161,46 @@ public:
     bool GetBranchDelay(const std::string& branchId, double& outDelayMs, size_t& outDelayFrames) const;
 
     /**
+     * @brief Sets master volume scalar (0.0 <= volume <= 1.0) applied across all active output branches.
+     */
+    void SetMasterVolume(float volume);
+
+    /**
+     * @brief Gets current master volume scalar.
+     */
+    float GetMasterVolume() const;
+
+    /**
+     * @brief Sets master mute state across all active output branches.
+     */
+    void SetMasterMute(bool mute);
+
+    /**
+     * @brief Checks if master is muted.
+     */
+    bool IsMasterMuted() const;
+
+    /**
+     * @brief Sets branch volume scalar (0.0 <= volume <= 1.0) for a specific branch.
+     */
+    bool SetBranchVolume(const std::string& branchId, float volume);
+
+    /**
+     * @brief Gets branch volume scalar.
+     */
+    bool GetBranchVolume(const std::string& branchId, float& outVolume) const;
+
+    /**
+     * @brief Sets branch mute state for a specific branch.
+     */
+    bool SetBranchMute(const std::string& branchId, bool mute);
+
+    /**
+     * @brief Checks if branch is muted.
+     */
+    bool IsBranchMuted(const std::string& branchId, bool& outMuted) const;
+
+    /**
      * @brief Core Audio notification: device state changed.
      *        If matching a lost/pending branch, triggers or accelerates recovery reinitialization.
      */
@@ -212,6 +259,10 @@ private:
         bool driftCorrectionEnabled = true;
         double delayMs = 0.0;
 
+        // Software branch gain and mute (Phase 2F.1-D)
+        std::atomic<float> branchVolume{1.0f};
+        std::atomic<bool> branchMuted{false};
+
         // Bounded backoff recovery coordination
         std::chrono::steady_clock::time_point nextRetryTime{};
         std::atomic<uint32_t> recoveryAttempts{0};
@@ -227,6 +278,10 @@ private:
     WasapiCaptureClient m_captureClient;
     std::wstring m_captureDeviceId;
     std::string m_lastError;
+
+    // Software master volume and mute (Phase 2F.1-D)
+    std::atomic<float> m_masterVolume{1.0f};
+    std::atomic<bool> m_masterMuted{false};
 
     std::array<std::unique_ptr<BranchDescriptor>, MAX_BRANCHES> m_branches;
 

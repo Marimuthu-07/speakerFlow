@@ -65,6 +65,11 @@ function App() {
   const confirmedDelaysRef = useRef({});
   const pendingDelayTimersRef = useRef(new Map());
 
+  // UI smoothness & re-render stabilization (Phase 2F.1-D)
+  const isManualStreamSelectionRef = useRef(isManualStreamSelection);
+  isManualStreamSelectionRef.current = isManualStreamSelection;
+  const lastWaveJsonRef = useRef('');
+
   const refreshDevices = useCallback(async () => {
     setLoadingDevices(true);
     setDeviceError('');
@@ -102,7 +107,7 @@ function App() {
         }
 
         // If manual stream disappeared, clear manual mode
-        if (isManualStreamSelection && !currentStream) {
+        if (isManualStreamSelectionRef.current && !currentStream) {
           setIsManualStreamSelection(false);
         }
 
@@ -130,7 +135,7 @@ function App() {
     } finally {
       setLoadingStreams(false);
     }
-  }, [isManualStreamSelection]);
+  }, []);
 
   const refreshEngineStatus = useCallback(async () => {
     try {
@@ -140,7 +145,7 @@ function App() {
         setWaveStatus(nextStatus.session.wave);
       }
       if (nextStatus?.session?.active && nextStatus.session.streamId) {
-        if (!isManualStreamSelection) {
+        if (!isManualStreamSelectionRef.current) {
           setSelectedStreamId(nextStatus.session.streamId);
         }
       }
@@ -175,13 +180,17 @@ function App() {
     } catch (refreshError) {
       setEngineError(refreshError.message || 'Could not inspect the Multi-Speaker Engine.');
     }
-  }, [isManualStreamSelection]);
+  }, []);
 
   const refreshWaveStatus = useCallback(async () => {
     try {
       const status = await window.speakerFlow.getWaveStatus();
       if (status) {
-        setWaveStatus(status);
+        const json = JSON.stringify(status);
+        if (json !== lastWaveJsonRef.current) {
+          lastWaveJsonRef.current = json;
+          setWaveStatus(status);
+        }
       }
     } catch {}
   }, []);

@@ -445,6 +445,75 @@ void WasapiRenderClient::StopRender() {
     m_lifecycleState.store(RenderLifecycleState::Stopped, std::memory_order_release);
 }
 
+static void ApplyFormatAwareGain(BYTE* pBuffer, size_t totalSamples, SampleFormatType fmt, float gain) {
+    if (!pBuffer || totalSamples == 0 || std::abs(gain - 1.0f) < 0.0001f) {
+        return;
+    }
+    if (gain <= 0.0f) {
+        return;
+    }
+
+    switch (fmt) {
+        case SampleFormatType::Float32: {
+            float* p = reinterpret_cast<float*>(pBuffer);
+            for (size_t i = 0; i < totalSamples; ++i) {
+                p[i] *= gain;
+            }
+            break;
+        }
+        case SampleFormatType::Pcm16: {
+            int16_t* p = reinterpret_cast<int16_t*>(pBuffer);
+            for (size_t i = 0; i < totalSamples; ++i) {
+                float s = static_cast<float>(p[i]) * gain;
+                if (s > 32767.0f) s = 32767.0f;
+                else if (s < -32768.0f) s = -32768.0f;
+                p[i] = static_cast<int16_t>(std::lrintf(s));
+            }
+            break;
+        }
+        case SampleFormatType::Pcm32: {
+            int32_t* p = reinterpret_cast<int32_t*>(pBuffer);
+            for (size_t i = 0; i < totalSamples; ++i) {
+                double s = static_cast<double>(p[i]) * static_cast<double>(gain);
+                if (s > 2147483647.0) s = 2147483647.0;
+                else if (s < -2147483648.0) s = -2147483648.0;
+                p[i] = static_cast<int32_t>(std::lrint(s));
+            }
+            break;
+        }
+        case SampleFormatType::Pcm24In32: {
+            int32_t* p = reinterpret_cast<int32_t*>(pBuffer);
+            for (size_t i = 0; i < totalSamples; ++i) {
+                int32_t raw24 = p[i] >> 8;
+                double s = static_cast<double>(raw24) * static_cast<double>(gain);
+                if (s > 8388607.0) s = 8388607.0;
+                else if (s < -8388608.0) s = -8388608.0;
+                p[i] = static_cast<int32_t>(std::lrint(s)) << 8;
+            }
+            break;
+        }
+        case SampleFormatType::Pcm24Packed: {
+            uint8_t* pByte = pBuffer;
+            for (size_t i = 0; i < totalSamples; ++i) {
+                int32_t raw24 = static_cast<int32_t>(pByte[0]) |
+                                (static_cast<int32_t>(pByte[1]) << 8) |
+                                (static_cast<int32_t>(static_cast<int8_t>(pByte[2])) << 16);
+                double s = static_cast<double>(raw24) * static_cast<double>(gain);
+                if (s > 8388607.0) s = 8388607.0;
+                else if (s < -8388608.0) s = -8388608.0;
+                int32_t val = static_cast<int32_t>(std::lrint(s));
+                pByte[0] = static_cast<uint8_t>(val & 0xFF);
+                pByte[1] = static_cast<uint8_t>((val >> 8) & 0xFF);
+                pByte[2] = static_cast<uint8_t>((val >> 16) & 0xFF);
+                pByte += 3;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 void WasapiRenderClient::RenderThreadProc() {
     HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
@@ -778,6 +847,23 @@ void WasapiRenderClient::RenderThreadProc() {
                                framesProduced);
         }
 
+        // Apply format-aware software gain (Master * Branch)
+        const bool masterMuted = m_masterMuted.load(std::memory_order_relaxed);
+        const bool branchMuted = m_branchMuted.load(std::memory_order_relaxed);
+        const float masterVol = m_masterVolume.load(std::memory_order_relaxed);
+        const float branchVol = m_branchVolume.load(std::memory_order_relaxed);
+        const float effectiveGain = (masterMuted || branchMuted) ? 0.0f : (masterVol * branchVol);
+
+        if (effectiveGain <= 0.0f) {
+            m_pRenderClient->ReleaseBuffer(framesNeeded, AUDCLNT_BUFFERFLAGS_SILENT);
+            m_silentFramesRendered.fetch_add(framesNeeded, std::memory_order_relaxed);
+            continue;
+        }
+
+        if (std::abs(effectiveGain - 1.0f) > 0.0001f) {
+            ApplyFormatAwareGain(pRenderData, framesNeeded * m_channels, m_formatType, effectiveGain);
+        }
+
         m_pRenderClient->ReleaseBuffer(framesNeeded, 0);
         m_framesRendered.fetch_add(framesNeeded, std::memory_order_relaxed);
     }
@@ -849,6 +935,11 @@ WasapiRenderStats WasapiRenderClient::GetStats() const {
     stats.recoveryPending = m_recoveryPending.load(std::memory_order_acquire);
     stats.configuredDelayMs = GetConfiguredDelayMs();
     stats.effectiveDelayFrames = static_cast<uint32_t>(GetEffectiveDelayFrames());
+    stats.masterVolume = m_masterVolume.load(std::memory_order_relaxed);
+    stats.masterMuted = m_masterMuted.load(std::memory_order_relaxed);
+    stats.branchVolume = m_branchVolume.load(std::memory_order_relaxed);
+    stats.branchMuted = m_branchMuted.load(std::memory_order_relaxed);
+    stats.effectiveGain = (stats.masterMuted || stats.branchMuted) ? 0.0f : (stats.masterVolume * stats.branchVolume);
 
     std::lock_guard<std::mutex> lock(m_errorMutex);
     stats.lastError = m_lastError;
@@ -1477,6 +1568,47 @@ bool WasapiRenderClient::ReinitializeRender(std::string& outError) {
     m_thread = std::thread(&WasapiRenderClient::RenderThreadProc, this);
 
     return true;
+}
+
+void WasapiRenderClient::SetMasterVolume(float volume) {
+    float clamped = std::max(0.0f, std::min(1.0f, volume));
+    m_masterVolume.store(clamped, std::memory_order_release);
+}
+
+float WasapiRenderClient::GetMasterVolume() const {
+    return m_masterVolume.load(std::memory_order_acquire);
+}
+
+void WasapiRenderClient::SetMasterMute(bool mute) {
+    m_masterMuted.store(mute, std::memory_order_release);
+}
+
+bool WasapiRenderClient::IsMasterMuted() const {
+    return m_masterMuted.load(std::memory_order_acquire);
+}
+
+void WasapiRenderClient::SetBranchVolume(float volume) {
+    float clamped = std::max(0.0f, std::min(1.0f, volume));
+    m_branchVolume.store(clamped, std::memory_order_release);
+}
+
+float WasapiRenderClient::GetBranchVolume() const {
+    return m_branchVolume.load(std::memory_order_acquire);
+}
+
+void WasapiRenderClient::SetBranchMute(bool mute) {
+    m_branchMuted.store(mute, std::memory_order_release);
+}
+
+bool WasapiRenderClient::IsBranchMuted() const {
+    return m_branchMuted.load(std::memory_order_acquire);
+}
+
+float WasapiRenderClient::GetEffectiveGain() const {
+    if (m_masterMuted.load(std::memory_order_acquire) || m_branchMuted.load(std::memory_order_acquire)) {
+        return 0.0f;
+    }
+    return m_masterVolume.load(std::memory_order_acquire) * m_branchVolume.load(std::memory_order_acquire);
 }
 
 } // namespace speakerflow

@@ -99,6 +99,86 @@ class WindowsCoreAudioPipelineSession extends AudioPipelineSession {
     } catch {}
   }
 
+  setMasterVolume(volume) {
+    if (this.destroyed || !this.native || typeof this.native.engineSetMasterVolume !== 'function') {
+      return;
+    }
+    try {
+      this.native.engineSetMasterVolume(Number(volume));
+    } catch {}
+  }
+
+  getMasterVolume() {
+    if (this.destroyed || !this.native || typeof this.native.engineGetMasterVolume !== 'function') {
+      return 1.0;
+    }
+    try {
+      return Number(this.native.engineGetMasterVolume());
+    } catch {
+      return 1.0;
+    }
+  }
+
+  setMasterMute(muted) {
+    if (this.destroyed || !this.native || typeof this.native.engineSetMasterMute !== 'function') {
+      return;
+    }
+    try {
+      this.native.engineSetMasterMute(Boolean(muted));
+    } catch {}
+  }
+
+  isMasterMuted() {
+    if (this.destroyed || !this.native || typeof this.native.engineGetMasterMute !== 'function') {
+      return false;
+    }
+    try {
+      return Boolean(this.native.engineGetMasterMute());
+    } catch {
+      return false;
+    }
+  }
+
+  setBranchVolume(branchSinkId, volume) {
+    if (this.destroyed || !this.native || typeof this.native.engineSetBranchVolume !== 'function') {
+      return;
+    }
+    try {
+      this.native.engineSetBranchVolume(branchSinkId, Number(volume));
+    } catch {}
+  }
+
+  getBranchVolume(branchSinkId) {
+    if (this.destroyed || !this.native || typeof this.native.engineGetBranchVolume !== 'function') {
+      return 1.0;
+    }
+    try {
+      return Number(this.native.engineGetBranchVolume(branchSinkId));
+    } catch {
+      return 1.0;
+    }
+  }
+
+  setBranchMute(branchSinkId, muted) {
+    if (this.destroyed || !this.native || typeof this.native.engineSetBranchMute !== 'function') {
+      return;
+    }
+    try {
+      this.native.engineSetBranchMute(branchSinkId, Boolean(muted));
+    } catch {}
+  }
+
+  isBranchMuted(branchSinkId) {
+    if (this.destroyed || !this.native || typeof this.native.engineGetBranchMute !== 'function') {
+      return false;
+    }
+    try {
+      return Boolean(this.native.engineGetBranchMute(branchSinkId));
+    } catch {
+      return false;
+    }
+  }
+
   async destroy() {
     if (this.destroyed) return;
     this.destroyed = true;

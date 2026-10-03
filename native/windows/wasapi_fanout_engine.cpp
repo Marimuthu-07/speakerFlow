@@ -183,6 +183,15 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
     desc->endpointId = endpointId;
     desc->deviceFriendlyName = renderClient->GetStats().deviceFriendlyName;
     desc->slotIndex = freeSlot;
+    desc->branchVolume.store(1.0f, std::memory_order_relaxed);
+    desc->branchMuted.store(false, std::memory_order_relaxed);
+
+    // Apply current master gain and initial branch gain to new render client
+    renderClient->SetMasterVolume(m_masterVolume.load(std::memory_order_relaxed));
+    renderClient->SetMasterMute(m_masterMuted.load(std::memory_order_relaxed));
+    renderClient->SetBranchVolume(1.0f);
+    renderClient->SetBranchMute(false);
+
     desc->ringBuffer = std::move(ringBuffer);
     desc->renderClient = std::move(renderClient);
     desc->active.store(true, std::memory_order_release);
@@ -301,6 +310,86 @@ bool WasapiFanOutEngine::GetBranchDelay(const std::string& branchId, double& out
     return false;
 }
 
+void WasapiFanOutEngine::SetMasterVolume(float volume) {
+    float clamped = std::max(0.0f, std::min(1.0f, volume));
+    m_masterVolume.store(clamped, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->active.load(std::memory_order_relaxed) && m_branches[i]->renderClient) {
+            m_branches[i]->renderClient->SetMasterVolume(clamped);
+        }
+    }
+}
+
+float WasapiFanOutEngine::GetMasterVolume() const {
+    return m_masterVolume.load(std::memory_order_acquire);
+}
+
+void WasapiFanOutEngine::SetMasterMute(bool mute) {
+    m_masterMuted.store(mute, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->active.load(std::memory_order_relaxed) && m_branches[i]->renderClient) {
+            m_branches[i]->renderClient->SetMasterMute(mute);
+        }
+    }
+}
+
+bool WasapiFanOutEngine::IsMasterMuted() const {
+    return m_masterMuted.load(std::memory_order_acquire);
+}
+
+bool WasapiFanOutEngine::SetBranchVolume(const std::string& branchId, float volume) {
+    float clamped = std::max(0.0f, std::min(1.0f, volume));
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->branchId == branchId) {
+            m_branches[i]->branchVolume.store(clamped, std::memory_order_release);
+            if (m_branches[i]->renderClient) {
+                m_branches[i]->renderClient->SetBranchVolume(clamped);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WasapiFanOutEngine::GetBranchVolume(const std::string& branchId, float& outVolume) const {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->branchId == branchId) {
+            outVolume = m_branches[i]->branchVolume.load(std::memory_order_acquire);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WasapiFanOutEngine::SetBranchMute(const std::string& branchId, bool mute) {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->branchId == branchId) {
+            m_branches[i]->branchMuted.store(mute, std::memory_order_release);
+            if (m_branches[i]->renderClient) {
+                m_branches[i]->renderClient->SetBranchMute(mute);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WasapiFanOutEngine::IsBranchMuted(const std::string& branchId, bool& outMuted) const {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i] && m_branches[i]->branchId == branchId) {
+            outMuted = m_branches[i]->branchMuted.load(std::memory_order_acquire);
+            return true;
+        }
+    }
+    return false;
+}
+
 void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, WasapiBranchStats& bStats) const {
     bStats.branchId = branch.branchId;
     bStats.endpointId = WideToUtf8(branch.endpointId.c_str());
@@ -337,6 +426,12 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
         bStats.driftCorrectionEnabled = ctrlStatus.driftCorrectionEnabled;
         bStats.configuredDelayMs = bStats.renderStats.configuredDelayMs;
         bStats.effectiveDelayFrames = bStats.renderStats.effectiveDelayFrames;
+
+        bStats.masterVolume = bStats.renderStats.masterVolume;
+        bStats.masterMuted = bStats.renderStats.masterMuted;
+        bStats.branchVolume = bStats.renderStats.branchVolume;
+        bStats.branchMuted = bStats.renderStats.branchMuted;
+        bStats.effectiveGain = bStats.renderStats.effectiveGain;
     } else {
         bStats.renderStats = WasapiRenderStats{};
         bStats.renderState = "Stopped";
@@ -361,6 +456,12 @@ void WasapiFanOutEngine::PopulateBranchStats(const BranchDescriptor& branch, Was
         bStats.driftCorrectionEnabled = true;
         bStats.configuredDelayMs = branch.delayMs;
         bStats.effectiveDelayFrames = 0;
+
+        bStats.masterVolume = m_masterVolume.load(std::memory_order_relaxed);
+        bStats.masterMuted = m_masterMuted.load(std::memory_order_relaxed);
+        bStats.branchVolume = branch.branchVolume.load(std::memory_order_relaxed);
+        bStats.branchMuted = branch.branchMuted.load(std::memory_order_relaxed);
+        bStats.effectiveGain = (bStats.masterMuted || bStats.branchMuted) ? 0.0f : (bStats.masterVolume * bStats.branchVolume);
     }
 }
 
