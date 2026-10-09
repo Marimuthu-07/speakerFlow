@@ -179,6 +179,28 @@ class WindowsCoreAudioPipelineSession extends AudioPipelineSession {
     }
   }
 
+  getEngineStatus() {
+    if (this.destroyed || !this.native || typeof this.native.engineGetStatus !== 'function') {
+      return null;
+    }
+    try {
+      return this.native.engineGetStatus();
+    } catch {
+      return null;
+    }
+  }
+
+  triggerBranchRecovery(branchSinkId, forceImmediate = false) {
+    if (this.destroyed || !this.native || typeof this.native.engineTriggerBranchRecovery !== 'function') {
+      return false;
+    }
+    try {
+      return Boolean(this.native.engineTriggerBranchRecovery(branchSinkId, Boolean(forceImmediate)));
+    } catch {
+      return false;
+    }
+  }
+
   async destroy() {
     if (this.destroyed) return;
     this.destroyed = true;

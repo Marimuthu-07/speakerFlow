@@ -73,7 +73,15 @@ class SpeakerEngineService {
               delayMs: b.delayMs ?? 0,
               configuredDelayMs: b.delayMs ?? this.delayStore.getDelay(b.sinkId),
               effectiveDelayFrames: b.delayFrames ?? (b.handle?.delayFrames ?? 0),
-              intentionalDisconnect: b.intentionalDisconnect || false
+              intentionalDisconnect: b.intentionalDisconnect || false,
+              waitingForDevice: Boolean(b.waitingForDevice || b.state === 'waiting_device'),
+              lifecycleState: b.lifecycleStateName || (b.state === 'active' ? 'Running' : b.state === 'waiting_device' ? 'WaitingForDevice' : b.state),
+              lifecycleStateName: b.lifecycleStateName || (b.state === 'active' ? 'Running' : b.state === 'waiting_device' ? 'WaitingForDevice' : b.state),
+              renderState: b.renderState || (b.state === 'active' ? 'Running' : 'Preroll'),
+              framesRendered: b.framesRendered ?? 0,
+              silentFramesRendered: b.silentFramesRendered ?? 0,
+              deviceState: b.deviceState ?? 0,
+              lastRecoveryTimestamp: b.lastRecoveryTimestamp ?? 0
             })),
             activeBranchCount: this.session.branches.filter((b) => b.state === 'active').length,
             totalBranchCount: this.session.branches.length,
@@ -583,6 +591,23 @@ class SpeakerEngineService {
     branch.reconnecting = true;
 
     try {
+      if (process.platform === 'win32' && session.pipeline && typeof session.pipeline.triggerBranchRecovery === 'function') {
+        const engineStatus = typeof session.pipeline.getEngineStatus === 'function' ? session.pipeline.getEngineStatus() : null;
+        const nativeBranch = engineStatus?.branches?.find(
+          (b) => b.branchId === branch.branchSinkId || b.deviceId === branch.sinkId
+        );
+        if (nativeBranch || (!engineStatus && session.pipeline)) {
+          // Native engine already manages this branch slot: wake recovery coordinator.
+          // Manual user action ("Connect to Engine") uses forceImmediate = true (!isAuto).
+          // Automatic scheduled reconnect uses forceImmediate = false.
+          session.pipeline.triggerBranchRecovery(branch.branchSinkId, !isAuto);
+          branch.state = 'reconnecting';
+          branch.waitingForDevice = true;
+          this.reconcileSessionState();
+          return;
+        }
+      }
+
       const allSinks = await this.audioBackend.listSinks();
       const physicalSink = allSinks.find((s) => s.id === sinkId || s.name === sinkId);
 
@@ -591,8 +616,9 @@ class SpeakerEngineService {
         if (!isAuto) {
           throw new Error('The physical output is not currently available.');
         }
-        branch.state = 'disconnected';
-        branch.error = 'Physical sink is not available.';
+        branch.state = 'waiting_device';
+        branch.waitingForDevice = true;
+        branch.error = null;
         branch.retryCount = (branch.retryCount || 0) + 1;
         const nextDelay = Math.min(5000, Math.round(1500 * Math.pow(1.5, Math.min(branch.retryCount, 3))));
         this.scheduleAutoReconnect(sinkId, nextDelay);
@@ -785,12 +811,104 @@ class SpeakerEngineService {
 
     let branchesChanged = false;
 
+    // 2.5 Sync native engine branch lifecycle on Windows
+    if (process.platform === 'win32' && session.pipeline && typeof session.pipeline.getEngineStatus === 'function') {
+      const engineStatus = session.pipeline.getEngineStatus();
+      if (engineStatus && Array.isArray(engineStatus.branches)) {
+        const nativeMap = new Map();
+        for (const nb of engineStatus.branches) {
+          if (nb.branchId) nativeMap.set(nb.branchId, nb);
+          if (nb.deviceId) nativeMap.set(nb.deviceId, nb);
+        }
+
+        for (const branch of session.branches) {
+          const nb = nativeMap.get(branch.branchSinkId) || nativeMap.get(branch.sinkId);
+          if (nb) {
+            branch.lifecycleStateName = nb.lifecycleStateName;
+            branch.renderState = nb.renderState;
+            branch.framesRendered = nb.framesRendered;
+            branch.silentFramesRendered = nb.silentFramesRendered;
+            branch.deviceState = nb.deviceState;
+            branch.lastRecoveryTimestamp = nb.lastRecoveryTimestamp;
+
+            // FIX 3: Check OS physical device presence first!
+            // Priority:
+            // 1. Physical endpoint presence
+            // 2. Recovery/waiting state
+            // 3. Native render lifecycle
+            // 4. Active state
+            const isPhysicallyPresent = validPhysicalMap.has(branch.sinkId);
+            if (!isPhysicallyPresent && !branch.intentionalDisconnect) {
+              branch.waitingForDevice = true;
+              if (branch.state !== 'waiting_device' && branch.state !== 'reconnecting') {
+                branch.state = 'waiting_device';
+                branch.error = null;
+                branchesChanged = true;
+              }
+              continue;
+            }
+
+            if (nb.lifecycleStateName === 'Running') {
+              if (branch.state !== 'active') {
+                branch.state = 'active';
+                branch.error = null;
+                branch.waitingForDevice = false;
+                branch.retryCount = 0;
+                branchesChanged = true;
+              }
+            } else if (nb.lifecycleStateName === 'WaitingForDevice' || nb.waitingForDevice) {
+              if (branch.state !== 'waiting_device') {
+                branch.state = 'waiting_device';
+                branch.error = null;
+                branch.waitingForDevice = true;
+                branchesChanged = true;
+              }
+            } else if (
+              nb.lifecycleStateName === 'RecoveryPending' ||
+              nb.lifecycleStateName === 'Reinitializing' ||
+              nb.lifecycleStateName === 'Starting'
+            ) {
+              if (branch.state !== 'reconnecting') {
+                branch.state = 'reconnecting';
+                branch.waitingForDevice = true;
+                branchesChanged = true;
+              }
+            } else if (nb.lifecycleStateName === 'DeviceLost') {
+              if (branch.state !== 'waiting_device') {
+                branch.state = 'waiting_device';
+                branch.waitingForDevice = true;
+                branchesChanged = true;
+              }
+            } else if (nb.lifecycleStateName === 'Failed') {
+              if (branch.state !== 'failed') {
+                branch.state = 'failed';
+                branch.error = nb.lastError || 'Endpoint initialization failed.';
+                branchesChanged = true;
+              }
+            }
+          }
+        }
+      }
+    }
+
     // 3. Clean up branches for physical sinks that no longer exist in the system
     for (let i = session.branches.length - 1; i >= 0; i--) {
       const branch = session.branches[i];
       const isPresent = validPhysicalMap.has(branch.sinkId);
 
       if (!isPresent) {
+        if (process.platform === 'win32' && !branch.intentionalDisconnect) {
+          // On Windows, the native engine maintains persistent recovery for disconnected outputs.
+          // Do NOT remove or destroy the branch during temporary device disappearance!
+          branch.waitingForDevice = true;
+          if (branch.state !== 'waiting_device' && branch.state !== 'reconnecting') {
+            branch.state = 'waiting_device';
+            branch.error = null;
+            branchesChanged = true;
+          }
+          continue;
+        }
+
         if (branch.state === 'active') {
           branch.state = 'disconnected';
           branch.error = 'Physical sink disconnected.';
@@ -806,8 +924,23 @@ class SpeakerEngineService {
           session.branches.splice(i, 1);
           branchesChanged = true;
         }
+      } else if (branch.waitingForDevice && !branch.intentionalDisconnect) {
+        // Physical endpoint returned! Wake up native recovery coordinator
+        // Automatic reconciliation passes forceImmediate = false to preserve Bluetooth settling deadline
+        if (process.platform === 'win32' && session.pipeline && typeof session.pipeline.triggerBranchRecovery === 'function') {
+          session.pipeline.triggerBranchRecovery(branch.branchSinkId, false);
+        }
+        if (!session.pipeline || typeof session.pipeline.getEngineStatus !== 'function') {
+          branch.state = 'active';
+          branch.waitingForDevice = false;
+          branchesChanged = true;
+        }
       } else if (branch.state === 'disconnected' && !branch.intentionalDisconnect && !branch.reconnecting) {
-        this.scheduleAutoReconnect(branch.sinkId, 100);
+        if (process.platform === 'win32' && session.pipeline && typeof session.pipeline.triggerBranchRecovery === 'function') {
+          session.pipeline.triggerBranchRecovery(branch.branchSinkId, false);
+        } else {
+          this.scheduleAutoReconnect(branch.sinkId, 100);
+        }
       }
     }
 

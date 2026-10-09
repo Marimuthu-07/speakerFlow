@@ -76,6 +76,7 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
 .status.degraded { color: #ffdca8; background: #4a3615; border: 1px solid #755520; }
 .status.disconnected { color: #f5c2c7; background: #482329; border: 1px solid #6b333c; }
 .status.failed, .status.error, .status.unavailable { color: #ffb4ab; background: #4a191e; border: 1px solid #70262e; }
+.status.waiting, .status.waiting_device { color: #7dd3fc; background: #0c334d; border: 1px solid #0284c7; }
 
 .empty, .error { margin: 18px 24px; }
 .error {

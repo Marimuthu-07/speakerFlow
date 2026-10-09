@@ -43,6 +43,9 @@ struct WasapiBranchStats {
     uint32_t recoveryAttemptCount = 0;
     uint32_t lastRecoveryHresult = 0;
     bool recoveryPending = false;
+    DWORD deviceState = 0;
+    bool waitingForDevice = false;
+    uint64_t lastRecoveryTimestampMs = 0;
 
     // Closed-loop drift controller telemetry from render client
     double trueDriftPpm = 0.0;
@@ -218,11 +221,13 @@ public:
     void OnDefaultDeviceChanged(const std::wstring& defaultDeviceId);
 
     /**
-     * @brief Explicitly schedules and triggers immediate recovery attempt for a branch.
+     * @brief Explicitly schedules and triggers recovery attempt for a branch.
      * @param branchId Identifier of branch to recover.
+     * @param forceImmediate If true (manual user action), resets settling delay and recovers immediately.
+     *                       If false (automatic reconciliation), preserves existing future settling deadline.
      * @return true if branch was found and scheduled, false otherwise.
      */
-    bool TriggerBranchRecovery(const std::string& branchId);
+    bool TriggerBranchRecovery(const std::string& branchId, bool forceImmediate = false);
 
     /**
      * @brief Deterministically simulates device loss on a branch for automated unit testing.
@@ -247,14 +252,109 @@ public:
      */
     void Shutdown();
 
+    // Deterministic testing methods for Phase 2F.1-G
+    bool AddBranchForTesting(const std::string& branchId, const std::wstring& endpointId) {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        size_t freeSlot = MAX_BRANCHES;
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (!m_branches[i]) {
+                freeSlot = i;
+                break;
+            }
+        }
+        if (freeSlot >= MAX_BRANCHES) return false;
+
+        auto desc = std::make_unique<BranchDescriptor>();
+        desc->branchId = branchId;
+        desc->endpointId = endpointId;
+        desc->slotIndex = freeSlot;
+        desc->ringBuffer = std::make_shared<AudioRingBuffer>(65536, 2);
+        desc->renderClient = std::make_shared<WasapiRenderClient>();
+        desc->active.store(true, std::memory_order_release);
+        desc->recoveryAttempts.store(0, std::memory_order_relaxed);
+        desc->lastKnownDeviceState = DEVICE_STATE_ACTIVE;
+
+        m_captureClient.SetBranchBuffer(freeSlot, desc->ringBuffer.get());
+        m_branches[freeSlot] = std::move(desc);
+        return true;
+    }
+
+    std::chrono::steady_clock::time_point GetBranchNextRetryTimeForTesting(const std::string& branchId) const {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->branchId == branchId && m_branches[i]->active.load(std::memory_order_relaxed)) {
+                return m_branches[i]->nextRetryTime;
+            }
+        }
+        return {};
+    }
+
+    AudioRingBuffer* GetBranchRingBufferForTesting(const std::string& branchId) const {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->branchId == branchId && m_branches[i]->active.load(std::memory_order_relaxed)) {
+                return m_branches[i]->ringBuffer.get();
+            }
+        }
+        return nullptr;
+    }
+
+    WasapiRenderClient* GetBranchRenderClientForTesting(const std::string& branchId) const {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->branchId == branchId && m_branches[i]->active.load(std::memory_order_relaxed)) {
+                return m_branches[i]->renderClient.get();
+            }
+        }
+        return nullptr;
+    }
+
+    DWORD GetBranchLastKnownDeviceStateForTesting(const std::string& branchId) const {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->branchId == branchId && m_branches[i]->active.load(std::memory_order_relaxed)) {
+                return m_branches[i]->lastKnownDeviceState;
+            }
+        }
+        return 0;
+    }
+
+    std::chrono::steady_clock::time_point GetBranchLastStateChangeTimeForTesting(const std::string& branchId) const {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->branchId == branchId && m_branches[i]->active.load(std::memory_order_relaxed)) {
+                return m_branches[i]->lastStateChangeTime;
+            }
+        }
+        return {};
+    }
+
+    void RecoverBranchForTesting(size_t slotIndex, const std::chrono::steady_clock::time_point& now) {
+        RecoverBranchIfDue(slotIndex, now);
+    }
+
+    AudioRingBuffer* GetCaptureBranchBufferForTesting(size_t slotIndex) const {
+        return m_captureClient.GetBranchBuffer(slotIndex);
+    }
+
+    uint32_t GetBranchRecoveryAttemptsForTesting(const std::string& branchId) const {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->branchId == branchId && m_branches[i]->active.load(std::memory_order_relaxed)) {
+                return m_branches[i]->recoveryAttempts.load(std::memory_order_relaxed);
+            }
+        }
+        return 0;
+    }
+
 private:
     struct BranchDescriptor {
         std::string branchId;
         std::wstring endpointId;
         std::string deviceFriendlyName;
         size_t slotIndex = 0;
-        std::unique_ptr<AudioRingBuffer> ringBuffer;
-        std::unique_ptr<WasapiRenderClient> renderClient;
+        std::shared_ptr<AudioRingBuffer> ringBuffer;
+        std::shared_ptr<WasapiRenderClient> renderClient;
         std::atomic<bool> active{false};
         bool driftCorrectionEnabled = true;
         double delayMs = 0.0;
@@ -263,8 +363,10 @@ private:
         std::atomic<float> branchVolume{1.0f};
         std::atomic<bool> branchMuted{false};
 
-        // Bounded backoff recovery coordination
+        // Bounded backoff and adaptive Bluetooth settling recovery coordination
         std::chrono::steady_clock::time_point nextRetryTime{};
+        std::chrono::steady_clock::time_point lastStateChangeTime{};
+        DWORD lastKnownDeviceState{DEVICE_STATE_ACTIVE};
         std::atomic<uint32_t> recoveryAttempts{0};
     };
 

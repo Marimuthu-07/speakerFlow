@@ -49,6 +49,7 @@ WasapiCaptureClient::WasapiCaptureClient()
       m_pMixFormat(nullptr) {
     for (size_t i = 0; i < MAX_FANOUT_SLOTS; ++i) {
         m_branchBuffers[i].store(nullptr, std::memory_order_relaxed);
+        m_slotInWrite[i].store(false, std::memory_order_relaxed);
     }
 }
 
@@ -316,6 +317,15 @@ void WasapiCaptureClient::StopCapture() {
     ClearBranchBuffers();
 }
 
+void WasapiCaptureClient::DetachBranchBufferSync(size_t slot) {
+    if (slot >= MAX_FANOUT_SLOTS) return;
+    m_branchBuffers[slot].store(nullptr, std::memory_order_release);
+    // Yield until any in-flight write to this slot on the capture thread completes
+    while (m_slotInWrite[slot].load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
 void WasapiCaptureClient::CaptureThreadProc() {
     HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
@@ -388,11 +398,16 @@ void WasapiCaptureClient::CaptureThreadProc() {
                     m_ringBuffer->Write(stagingBuffer.data(), numFramesRead);
                 }
 
-                // Lock-free fan-out to registered branch buffers
+                // Lock-free fan-out to registered branch buffers with active write protection
                 for (size_t slot = 0; slot < MAX_FANOUT_SLOTS; ++slot) {
-                    AudioRingBuffer* pBranchBuf = m_branchBuffers[slot].load(std::memory_order_relaxed);
+                    AudioRingBuffer* pBranchBuf = m_branchBuffers[slot].load(std::memory_order_acquire);
                     if (pBranchBuf) {
-                        pBranchBuf->Write(stagingBuffer.data(), numFramesRead);
+                        m_slotInWrite[slot].store(true, std::memory_order_release);
+                        // Re-verify slot buffer has not been cleared concurrently
+                        if (m_branchBuffers[slot].load(std::memory_order_acquire) == pBranchBuf) {
+                            pBranchBuf->Write(stagingBuffer.data(), numFramesRead);
+                        }
+                        m_slotInWrite[slot].store(false, std::memory_order_release);
                     }
                 }
 

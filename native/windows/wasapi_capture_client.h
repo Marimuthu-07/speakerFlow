@@ -87,6 +87,7 @@ public:
      * @brief Returns pointer to the captured PCM ring buffer.
      */
     AudioRingBuffer* GetRingBuffer() const { return m_ringBuffer.get(); }
+    uint32_t GetChannels() const { return m_channels; }
 
     static constexpr size_t MAX_FANOUT_SLOTS = 8;
 
@@ -102,10 +103,22 @@ public:
         return true;
     }
 
+    /**
+     * @brief Synchronously detaches a branch buffer and waits for any in-flight write to complete.
+     *        The caller spin-yields until an active write finishes; the real-time capture thread
+     *        remains completely non-blocking, wait-free, and lock-free.
+     * @param slot Slot index [0 .. MAX_FANOUT_SLOTS - 1].
+     */
+    void DetachBranchBufferSync(size_t slot);
+
     void ClearBranchBuffers() {
         for (size_t i = 0; i < MAX_FANOUT_SLOTS; ++i) {
-            m_branchBuffers[i].store(nullptr, std::memory_order_release);
+            DetachBranchBufferSync(i);
         }
+    }
+
+    AudioRingBuffer* GetBranchBuffer(size_t slot) const {
+        return (slot < MAX_FANOUT_SLOTS) ? m_branchBuffers[slot].load(std::memory_order_acquire) : nullptr;
     }
 
 private:
@@ -139,6 +152,7 @@ private:
 
     std::unique_ptr<AudioRingBuffer> m_ringBuffer;
     std::array<std::atomic<AudioRingBuffer*>, MAX_FANOUT_SLOTS> m_branchBuffers;
+    std::array<std::atomic<bool>, MAX_FANOUT_SLOTS> m_slotInWrite;
 
     HANDLE m_hStopEvent;
     HANDLE m_hAudioEvent;

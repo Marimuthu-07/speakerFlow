@@ -691,12 +691,12 @@ public:
             DispatchEvent(payload);
 
             OnEndpointStateChanged(pwstrDeviceId, dwNewState);
+        }
 
-            {
-                std::lock_guard<std::mutex> lock(g_fanoutMutex);
-                if (g_fanoutEngine) {
-                    g_fanoutEngine->OnDeviceStateChanged(pwstrDeviceId, dwNewState);
-                }
+        {
+            std::lock_guard<std::mutex> lock(g_fanoutMutex);
+            if (g_fanoutEngine) {
+                g_fanoutEngine->OnDeviceStateChanged(pwstrDeviceId, dwNewState);
             }
         }
         return S_OK;
@@ -728,12 +728,12 @@ public:
             DispatchEvent(payload);
 
             OnEndpointAdded(pwstrDeviceId);
+        }
 
-            {
-                std::lock_guard<std::mutex> lock(g_fanoutMutex);
-                if (g_fanoutEngine) {
-                    g_fanoutEngine->OnDeviceAdded(pwstrDeviceId);
-                }
+        {
+            std::lock_guard<std::mutex> lock(g_fanoutMutex);
+            if (g_fanoutEngine) {
+                g_fanoutEngine->OnDeviceAdded(pwstrDeviceId);
             }
         }
         return S_OK;
@@ -3207,6 +3207,14 @@ static napi_value Method_EngineGetOutputStats(napi_env env, napi_callback_info i
     napi_set_named_property(env, obj, "lastRecoveryHresult", recHrVal);
     napi_set_named_property(env, obj, "recoveryPending", recPendVal);
 
+    napi_value devStateVal, waitingVal, lastRecTimeVal;
+    napi_create_uint32(env, bStats.deviceState, &devStateVal);
+    napi_get_boolean(env, bStats.waitingForDevice, &waitingVal);
+    napi_create_int64(env, bStats.lastRecoveryTimestampMs, &lastRecTimeVal);
+    napi_set_named_property(env, obj, "deviceState", devStateVal);
+    napi_set_named_property(env, obj, "waitingForDevice", waitingVal);
+    napi_set_named_property(env, obj, "lastRecoveryTimestamp", lastRecTimeVal);
+
     napi_value srVal, chVal, bpsVal;
     napi_create_uint32(env, bStats.renderStats.sampleRate, &srVal);
     napi_create_uint32(env, bStats.renderStats.channels, &chVal);
@@ -3348,6 +3356,14 @@ static napi_value Method_EngineGetStatus(napi_env env, napi_callback_info info) 
         napi_set_named_property(env, bObj, "lastRecoveryHresult", bRecHrVal);
         napi_set_named_property(env, bObj, "recoveryPending", bRecPendVal);
 
+        napi_value devStateVal, waitingVal, lastRecTimeVal;
+        napi_create_uint32(env, b.deviceState, &devStateVal);
+        napi_get_boolean(env, b.waitingForDevice, &waitingVal);
+        napi_create_int64(env, b.lastRecoveryTimestampMs, &lastRecTimeVal);
+        napi_set_named_property(env, bObj, "deviceState", devStateVal);
+        napi_set_named_property(env, bObj, "waitingForDevice", waitingVal);
+        napi_set_named_property(env, bObj, "lastRecoveryTimestamp", lastRecTimeVal);
+
         napi_value framesVal, underVal, overVal;
         napi_create_int64(env, b.renderStats.framesRendered, &framesVal);
         napi_create_int64(env, b.renderStats.bufferUnderruns, &underVal);
@@ -3355,6 +3371,10 @@ static napi_value Method_EngineGetStatus(napi_env env, napi_callback_info info) 
         napi_set_named_property(env, bObj, "framesRendered", framesVal);
         napi_set_named_property(env, bObj, "bufferUnderruns", underVal);
         napi_set_named_property(env, bObj, "bufferOverruns", overVal);
+
+        napi_value silentFramesVal;
+        napi_create_int64(env, b.renderStats.silentFramesRendered, &silentFramesVal);
+        napi_set_named_property(env, bObj, "silentFramesRendered", silentFramesVal);
 
         napi_value occFramesVal, occMsVal, driftVal, occErrVal, stableVal, slopeVal, stateVal, bRatioVal;
         napi_create_int64(env, static_cast<int64_t>(b.occupancyFrames), &occFramesVal);
@@ -3664,6 +3684,44 @@ static napi_value Method_EngineGetBranchMute(napi_env env, napi_callback_info in
     return resVal;
 }
 
+static napi_value Method_EngineTriggerBranchRecovery(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = { nullptr, nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    std::string branchId;
+    if (argc > 0 && args[0] != nullptr) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, args[0], NULL, 0, &len);
+        if (len > 0) {
+            branchId.resize(len);
+            napi_get_value_string_utf8(env, args[0], &branchId[0], len + 1, &len);
+        }
+    }
+
+    if (branchId.empty()) {
+        napi_throw_error(env, NULL, "branchId is required for engineTriggerBranchRecovery");
+        return NULL;
+    }
+
+    bool forceImmediate = false;
+    if (argc > 1 && args[1] != nullptr) {
+        napi_get_value_bool(env, args[1], &forceImmediate);
+    }
+
+    bool scheduled = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fanoutMutex);
+        if (g_fanoutEngine) {
+            scheduled = g_fanoutEngine->TriggerBranchRecovery(branchId, forceImmediate);
+        }
+    }
+
+    napi_value resVal;
+    napi_get_boolean(env, scheduled, &resVal);
+    return resVal;
+}
+
 static napi_value Method_EngineShutdown(napi_env env, napi_callback_info info) {
     std::lock_guard<std::mutex> lock(g_fanoutMutex);
     if (g_fanoutEngine) {
@@ -3788,6 +3846,9 @@ NAPI_MODULE_INIT() {
     napi_create_function(env, NULL, 0, Method_EngineGetBranchDelay, NULL, &fn);
     napi_set_named_property(env, exports, "engineGetBranchDelay", fn);
     napi_set_named_property(env, exports, "engineGetOutputDelay", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineTriggerBranchRecovery, NULL, &fn);
+    napi_set_named_property(env, exports, "engineTriggerBranchRecovery", fn);
 
     napi_create_function(env, NULL, 0, Method_EngineSetMasterVolume, NULL, &fn);
     napi_set_named_property(env, exports, "engineSetMasterVolume", fn);

@@ -150,9 +150,27 @@ function App() {
         }
       }
       setSelectedEngineSinkIds((current) => {
-        const availableIds = new Set(nextStatus.outputs.map((o) => o.id));
-        const filtered = new Set([...current].filter((id) => availableIds.has(id)));
-        if (filtered.size === 0 && nextStatus.outputs.length > 0) {
+        const availableIds = new Set((nextStatus?.outputs || []).map((o) => o.id));
+        const persistentBranchSinkIds = new Set(
+          (nextStatus?.session?.branches || [])
+            .filter((b) => {
+              const st = b.state;
+              return (
+                st === 'active' ||
+                st === 'waiting_device' ||
+                st === 'reconnecting' ||
+                st === 'recovery_pending' ||
+                Boolean(b.waitingForDevice)
+              );
+            })
+            .map((b) => b.sinkId)
+            .filter(Boolean)
+        );
+
+        const filtered = new Set(
+          [...current].filter((id) => availableIds.has(id) || persistentBranchSinkIds.has(id))
+        );
+        if (filtered.size === 0 && (nextStatus?.outputs || []).length > 0) {
           return new Set(nextStatus.outputs.map((o) => o.id));
         }
         return filtered;
@@ -1061,7 +1079,8 @@ function App() {
             {physicalSinks.map((sink) => {
               const branch = branchMap.get(sink.id);
               const isBranchActive = branch && branch.state === 'active';
-              const isBranchDisconnected = branch && branch.state === 'disconnected';
+              const isBranchWaiting = branch && (branch.state === 'waiting_device' || branch.waitingForDevice);
+              const isBranchDisconnected = branch && branch.state === 'disconnected' && !isBranchWaiting;
 
               const userVol = waveStatus.userSpeakerVolumes?.[sink.id] ?? 100;
               const spkMuted = waveStatus.userSpeakerMuted?.[sink.id] ?? false;
@@ -1086,7 +1105,7 @@ function App() {
 
               return (
                 <div
-                  className={`pavu-card ${isBranchActive ? 'card-speakerflow' : isBranchDisconnected ? 'card-disconnected' : ''}`}
+                  className={`pavu-card ${isBranchActive ? 'card-speakerflow' : isBranchWaiting ? 'card-waiting' : isBranchDisconnected ? 'card-disconnected' : ''}`}
                   key={sink.id}
                 >
                   {/* Speaker Header */}
@@ -1105,11 +1124,12 @@ function App() {
                               <span className="battery-pct">{devBattery.percentage}%</span>
                             </span>
                           )}
-                          <span className={`status-pill ${sink.state}`}>
-                            {sink.state}
+                          <span className={`status-pill ${isBranchWaiting ? 'waiting' : sink.state}`}>
+                            {isBranchWaiting ? 'Waiting for device...' : sink.state}
                           </span>
                           {sink.isDefault && <span className="badge">Default</span>}
                           {isBranchActive && <span className="badge badge-engine">Branch Active</span>}
+                          {isBranchWaiting && <span className="badge badge-waiting">Waiting for device...</span>}
                           {isBranchDisconnected && <span className="badge badge-warning">Branch Disconnected</span>}
                         </div>
                         <div className="pavu-device-id">{sink.technicalName}</div>
@@ -1126,6 +1146,14 @@ function App() {
                             title="Disconnect this branch from the SpeakerFlow engine without interrupting other branches"
                           >
                             Disconnect
+                          </button>
+                        ) : isBranchWaiting ? (
+                          <button
+                            className="button secondary btn-reconnect-now"
+                            onClick={() => handleReconnectBranch(sink.id)}
+                            title="Device will automatically reconnect when back in range, or click to retry now"
+                          >
+                            Retry Now
                           </button>
                         ) : (
                           <button
@@ -2380,20 +2408,24 @@ function App() {
                 <div className="branches-section">
                   <h4>Active Branches ({engineSession.activeBranchCount || 0} active)</h4>
                   <div className="branch-list">
-                    {(engineSession.branches || []).map((branch) => (
-                      <div className={`branch-item branch-${branch.state}`} key={branch.branchSinkId}>
-                        <span className="branch-indicator">
-                          {branch.state === 'active' ? '✓' : branch.state === 'disconnected' ? '⚠' : '✗'}
-                        </span>
-                        <div className="branch-info">
-                          <span className="branch-name">{branch.sinkName}</span>
-                          <span className="branch-target">→ {branch.branchSinkId} → {branch.sinkId}</span>
-                          <span className="branch-delay-pill">Acoustic Delay: {branch.configuredDelayMs ?? branch.delayMs ?? 0} ms</span>
-                          {branch.error && <span className="branch-error">{branch.error}</span>}
+                    {(engineSession.branches || []).map((branch) => {
+                      const isWaiting = Boolean(branch.waitingForDevice || branch.state === 'waiting_device' || branch.state === 'reconnecting');
+                      const displayStatus = isWaiting ? 'Waiting for device...' : branch.state;
+                      const indicator = branch.state === 'active' ? '✓' : isWaiting ? '⏳' : branch.state === 'disconnected' ? '⚠' : '✗';
+                      return (
+                        <div className={`branch-item branch-${branch.state} ${isWaiting ? 'branch-waiting' : ''}`} key={branch.branchSinkId}>
+                          <span className="branch-indicator">{indicator}</span>
+                          <div className="branch-info">
+                            <span className="branch-name">{branch.sinkName}</span>
+                            <span className="branch-target">→ {branch.branchSinkId} → {branch.sinkId}</span>
+                            <span className="branch-delay-pill">Acoustic Delay: {branch.configuredDelayMs ?? branch.delayMs ?? 0} ms</span>
+                            {branch.error && !isWaiting && <span className="branch-error">{branch.error}</span>}
+                            {isWaiting && <span className="branch-waiting-hint">Waiting for endpoint to return…</span>}
+                          </div>
+                          <span className={`status ${isWaiting ? 'waiting' : branch.state}`}>{displayStatus}</span>
                         </div>
-                        <span className={`status ${branch.state}`}>{branch.state}</span>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               </div>

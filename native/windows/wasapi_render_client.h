@@ -44,7 +44,8 @@ enum class RenderLifecycleState : uint32_t {
     Stopping = 4,
     Failed = 5,
     RecoveryPending = 6,
-    Reinitializing = 7
+    Reinitializing = 7,
+    WaitingForDevice = 8
 };
 
 inline const char* RenderLifecycleStateToString(RenderLifecycleState state) {
@@ -57,6 +58,7 @@ inline const char* RenderLifecycleStateToString(RenderLifecycleState state) {
         case RenderLifecycleState::Failed:          return "Failed";
         case RenderLifecycleState::RecoveryPending: return "RecoveryPending";
         case RenderLifecycleState::Reinitializing:  return "Reinitializing";
+        case RenderLifecycleState::WaitingForDevice: return "WaitingForDevice";
         default: return "Unknown";
     }
 }
@@ -98,6 +100,9 @@ struct WasapiRenderStats {
     bool recoveryPending = false;
     double configuredDelayMs = 0.0;
     uint32_t effectiveDelayFrames = 0;
+    DWORD deviceState = 0;
+    bool waitingForDevice = false;
+    uint64_t lastRecoveryTimestampMs = 0;
     float masterVolume = 1.0f;
     bool masterMuted = false;
     float branchVolume = 1.0f;
@@ -210,17 +215,19 @@ public:
     void SimulateDeviceLossForTesting(HRESULT hr = 0x88890004 /* AUDCLNT_E_DEVICE_INVALIDATED */);
 
     /**
-     * @brief Transitions from DeviceLost to RecoveryPending if device loss has occurred.
-     * @return true if recovery was scheduled, false if not in DeviceLost or already scheduled.
+     * @brief Transitions from DeviceLost, WaitingForDevice, or (if explicit) Running to RecoveryPending.
+     * @param allowFromRunning If true, allows explicit recovery transition from Running state (Phase 2F.1-G).
+     * @return true if recovery was scheduled, false if not in eligible state or already scheduled.
      */
-    bool ScheduleRecovery();
+    bool ScheduleRecovery(bool allowFromRunning = false);
 
     /**
      * @brief Attempts to reinitialize WASAPI render endpoint and restart rendering.
      * @param outError Receives error description if reinitialization fails.
+     * @param pNewRingBuffer Optional clean/new AudioRingBuffer instance to replace the old one.
      * @return true if reinitialization succeeded and rendering resumed, false otherwise.
      */
-    bool ReinitializeRender(std::string& outError);
+    bool ReinitializeRender(std::string& outError, AudioRingBuffer* pNewRingBuffer = nullptr);
 
     /**
      * @brief Gets the number of recovery attempts made since device loss.
@@ -258,10 +265,35 @@ public:
     void SimulateRunningForTesting();
 
     /**
+     * @brief Gets current ring buffer pointer for deterministic lifetime verification.
+     */
+    AudioRingBuffer* GetRingBufferForTesting() const { return m_pRingBuffer; }
+
+    /**
      * @brief Gets a coherent combined snapshot of both DriftTelemetry and DriftControllerStatus
      *        from the render thread in a single atomic reader lease (lock-free, non-blocking reader).
      */
     void GetDriftSnapshot(DriftTelemetry& outTelemetry, DriftControllerStatus& outStatus) const;
+
+    /**
+     * @brief Gets the last recorded Windows device state (e.g. DEVICE_STATE_ACTIVE).
+     */
+    DWORD GetEndpointDeviceState() const;
+
+    /**
+     * @brief Checks if branch is currently waiting for device to become active.
+     */
+    bool IsWaitingForDevice() const;
+
+    /**
+     * @brief Transitions branch into WaitingForDevice state.
+     */
+    void SetWaitingForDeviceState(bool allowFromRunning = false);
+
+    /**
+     * @brief Gets timestamp (ms since epoch) of last successful recovery.
+     */
+    uint64_t GetLastRecoveryTimestampMs() const;
 
     /**
      * @brief Sets software delay for this render branch in milliseconds (0.0 <= delayMs <= 500.0).
@@ -337,6 +369,8 @@ private:
     std::atomic<uint32_t> m_recoveryAttemptCount{0};
     std::atomic<HRESULT> m_lastRecoveryHr{S_OK};
     std::atomic<bool> m_recoveryPending{false};
+    std::atomic<DWORD> m_endpointDeviceState{0};
+    std::atomic<uint64_t> m_lastRecoveryTimestampMs{0};
     std::function<void(WasapiRenderClient*)> m_deviceLostCallback;
     std::atomic<bool> m_simulateRecoveryFailure{false};
     std::atomic<HRESULT> m_simulatedRecoveryFailHr{E_FAIL};
