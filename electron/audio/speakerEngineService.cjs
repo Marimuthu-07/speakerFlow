@@ -23,7 +23,7 @@ function isTelephonyOrSecondaryEndpoint(sink) {
   // 1. Form-factor check if provided by backend metadata
   if (sink.formFactor && typeof sink.formFactor === 'string') {
     const ff = sink.formFactor.toLowerCase();
-    if (ff.includes('headset') || ff.includes('handset') || ff.includes('telephony')) {
+    if (ff.includes('handset') || ff.includes('telephony')) {
       return true;
     }
   }
@@ -44,7 +44,8 @@ function isTelephonyOrSecondaryEndpoint(sink) {
     text.includes('hfp') ||
     text.includes('telephony') ||
     text.includes('communications') ||
-    text.includes('bthfpenum')
+    text.includes('bthfpenum') ||
+    text.includes('bthhfenum')
   ) {
     return true;
   }
@@ -396,6 +397,14 @@ class SpeakerEngineService {
 
     if (this.session === session) {
       this.session = null;
+    }
+
+    if (typeof this.onSessionChanged === 'function') {
+      try {
+        this.onSessionChanged();
+      } catch (err) {
+        console.warn('[SpeakerEngineService] onSessionChanged error on stopSession:', err);
+      }
     }
 
     if (restoreError) {

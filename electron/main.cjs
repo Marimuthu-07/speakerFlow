@@ -75,13 +75,13 @@ speakerEngineService.onMasterVolumeChanged = (data) => {
 };
 
 speakerEngineService.onSessionChanged = () => {
+  if (!speakerEngineService.session) {
+    unregisterEngineMasterShortcuts();
+  }
   audioCoalescingCoordinator.trigger({ engineStatus: true });
 };
 
 audioBackend.on('devices-changed', () => {
-  if (speakerEngineService.session) {
-    speakerEngineService.reassertTargetIngress(true).catch(() => {});
-  }
   audioCoalescingCoordinator.trigger({
     devices: true,
     engineStatus: true,
@@ -91,9 +91,6 @@ audioBackend.on('devices-changed', () => {
 });
 
 audioBackend.on('default-sink-changed', () => {
-  if (speakerEngineService.session) {
-    speakerEngineService.reassertTargetIngress(true).catch(() => {});
-  }
   audioCoalescingCoordinator.trigger({
     devices: true,
     engineStatus: true,

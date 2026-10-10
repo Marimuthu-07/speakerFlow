@@ -176,7 +176,7 @@ function App() {
           const primaryOutputs = availableOutputs.filter((o) => {
             const isComm = Boolean(o.isCommunications);
             const name = (o.name || o.id || '').toLowerCase();
-            const isHfp = name.includes('hands-free') || name.includes('handsfree') || name.includes('hfp');
+            const isHfp = name.includes('hands-free') || name.includes('handsfree') || name.includes('hfp') || name.includes('bthhfenum') || name.includes('bthfpenum');
             return !isComm && !isHfp;
           });
           const targets = primaryOutputs.length > 0 ? primaryOutputs : availableOutputs;

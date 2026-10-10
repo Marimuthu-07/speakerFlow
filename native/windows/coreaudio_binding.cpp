@@ -1094,38 +1094,8 @@ static void RegisterEndpointMonitoring(IMMDevice* pDevice, const std::wstring& d
         }
     }
 
-    IPropertyStore* pProps = NULL;
-    if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
-        PROPVARIANT varFF;
-        PropVariantInit(&varFF);
-        static const PROPERTYKEY propKeyFormFactor = { { 0x1da5d803, 0xd492, 0x4edd, { 0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e } }, 0 };
-        bool isComm = false;
-        if (SUCCEEDED(pProps->GetValue(propKeyFormFactor, &varFF))) {
-            if (varFF.vt == VT_UI4 && (varFF.ulVal == 5 || varFF.ulVal == 6)) {
-                isComm = true;
-            }
-        }
-        PropVariantClear(&varFF);
-
-        PROPVARIANT varName;
-        PropVariantInit(&varName);
-        if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName))) {
-            if (varName.vt == VT_LPWSTR && varName.pwszVal) {
-                std::wstring nameLower = varName.pwszVal;
-                for (auto& c : nameLower) c = static_cast<wchar_t>(towlower(c));
-                if (nameLower.find(L"hands-free") != std::wstring::npos ||
-                    nameLower.find(L"handsfree") != std::wstring::npos ||
-                    nameLower.find(L"hfp") != std::wstring::npos) {
-                    isComm = true;
-                }
-            }
-        }
-        PropVariantClear(&varName);
-        pProps->Release();
-
-        if (isComm) {
-            return;
-        }
+    if (IsTelephonyOrHandsFreeEndpoint(pDevice)) {
+        return;
     }
 
     IAudioSessionManager2* pMgr = NULL;
@@ -1651,16 +1621,7 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
         }
 
         bool isDefault = (!defaultDeviceId.empty() && defaultDeviceId == deviceId);
-        bool isCommunications = (!defaultCommDeviceId.empty() && defaultCommDeviceId == deviceId) ||
-                                (formFactorVal == 5 || formFactorVal == 6);
-
-        std::wstring lowerName = friendlyName;
-        for (auto& c : lowerName) c = static_cast<wchar_t>(towlower(c));
-        if (lowerName.find(L"hands-free") != std::wstring::npos ||
-            lowerName.find(L"handsfree") != std::wstring::npos ||
-            lowerName.find(L"hfp") != std::wstring::npos) {
-            isCommunications = true;
-        }
+        bool isCommunications = IsTelephonyOrHandsFreeEndpoint(pDevice, friendlyName);
 
         int volPercent = 100;
         bool isMuted = false;
