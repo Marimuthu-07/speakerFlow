@@ -202,6 +202,8 @@ class SpeakerEngineService {
       branchSequence: validPhysicalSinks.length,
       selectedSinkIds: new Set(validPhysicalSinks.map((s) => s.id)),
       initialAvailableSinkIds: new Set(allPhysicalSinksAtStartup.map((s) => s.name)),
+      originalAppMuted: Boolean(stream.mute),
+      appMutedByMaster: false,
       stopping: false
     };
     this.session = session;
@@ -337,6 +339,13 @@ class SpeakerEngineService {
 
       session.state = 'running';
 
+      if (process.platform === 'win32' && pipeline.isNativeProcessLoopback) {
+        if (this.waveController.masterMuted && !session.originalAppMuted) {
+          await this._setTargetAppMute(session, true).catch(() => {});
+          session.appMutedByMaster = true;
+        }
+      }
+
       this.reconcileSessionState();
       await this.waveController.updateBranches(session.branches);
 
@@ -359,6 +368,11 @@ class SpeakerEngineService {
 
     session.stopping = true;
     let restoreError = null;
+
+    if (process.platform === 'win32' && session.appMutedByMaster) {
+      await this._setTargetAppMute(session, false).catch(() => {});
+      session.appMutedByMaster = false;
+    }
 
     await this.waveController.destroy().catch(() => {});
 
@@ -457,12 +471,55 @@ class SpeakerEngineService {
     return this.waveController.getStatus();
   }
 
+  async _setTargetAppMute(target, muted) {
+    if (!target || process.platform !== 'win32' || !this.audioBackend || typeof this.audioBackend.setStreamMute !== 'function') {
+      return false;
+    }
+    const candidates = [];
+    if (target.streamId) candidates.push(String(target.streamId));
+    if (target.streamProcessId) candidates.push(String(target.streamProcessId));
+
+    const uniqueCandidates = [...new Set(candidates.filter(Boolean))];
+    let anySuccess = false;
+    for (const targetId of uniqueCandidates) {
+      try {
+        await this.audioBackend.setStreamMute(targetId, Boolean(muted));
+        anySuccess = true;
+        break;
+      } catch (_) {
+        // Fallback to next candidate if first fails
+      }
+    }
+    return anySuccess;
+  }
+
   async setMasterMute(muted) {
     const isMuted = Boolean(muted);
     await this.waveController.setMasterMute(isMuted);
     if (process.platform === 'win32') {
       if (this.session?.pipeline && typeof this.session.pipeline.setMasterMute === 'function') {
         this.session.pipeline.setMasterMute(isMuted);
+      }
+      if (this.session && (this.session.isNativeProcessLoopback || this.session.pipeline?.isNativeProcessLoopback)) {
+        if (isMuted) {
+          let wasAlreadyMuted = Boolean(this.session.originalAppMuted);
+          try {
+            const liveStream = await this.findApplicationStream(this.session.streamId);
+            if (liveStream) {
+              wasAlreadyMuted = Boolean(liveStream.mute);
+            }
+          } catch (_) {}
+          this.session.originalAppMuted = wasAlreadyMuted;
+          if (!wasAlreadyMuted) {
+            await this._setTargetAppMute(this.session, true).catch(() => {});
+            this.session.appMutedByMaster = true;
+          }
+        } else {
+          if (this.session.appMutedByMaster) {
+            await this._setTargetAppMute(this.session, false).catch(() => {});
+            this.session.appMutedByMaster = false;
+          }
+        }
       }
     } else {
       if (this.session && this.session.ingressSinkId) {
@@ -536,7 +593,17 @@ class SpeakerEngineService {
 
       if (session.pipeline && typeof session.pipeline.switchProcess === 'function') {
         try {
+          const previousSessionTarget = {
+            streamId: session.streamId,
+            streamProcessId: session.streamProcessId
+          };
+          const wasOldAppMutedByMaster = Boolean(session.appMutedByMaster);
+
           await session.pipeline.switchProcess(targetPid);
+
+          if (wasOldAppMutedByMaster) {
+            await this._setTargetAppMute(previousSessionTarget, false).catch(() => {});
+          }
 
           // Synchronize session branch objects with pipeline branches after reconstruction
           if (session.pipeline.branches) {
@@ -564,6 +631,13 @@ class SpeakerEngineService {
             ? `${stream.applicationName} — ${stream.streamName}`
             : stream.applicationName;
           session.streamActive = stream.isActive;
+          session.originalAppMuted = Boolean(stream.mute);
+          session.appMutedByMaster = false;
+
+          if (this.waveController.masterMuted && !session.originalAppMuted) {
+            await this._setTargetAppMute(session, true).catch(() => {});
+            session.appMutedByMaster = true;
+          }
 
           this.reconcileSessionState();
           await this.waveController.updateBranches(session.branches).catch(() => {});

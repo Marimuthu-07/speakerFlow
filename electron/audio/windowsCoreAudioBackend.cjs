@@ -64,6 +64,12 @@ function isVirtualOrIngressEndpoint(deviceOrSink) {
   return /voicemeeter|vb-audio|virtual|cable|steam streaming/i.test(name);
 }
 
+function isWindowsEndpointId(id) {
+  if (typeof id !== 'string') return false;
+  // Windows Core Audio endpoint ID contract: {0.0.0.00000000}.{GUID-or-token}
+  return /^\{0\.0\.[01]\.[0-9a-fA-F]{8}\}\.\{[0-9a-fA-F-]{4,38}\}$/i.test(id.trim());
+}
+
 class WindowsCoreAudioBackend extends AudioBackend {
   constructor(nativeBinding = null) {
     super();
@@ -74,6 +80,8 @@ class WindowsCoreAudioBackend extends AudioBackend {
     this._monitoringActive = false;
     this._debounceTimer = null;
     this._pendingEvents = { devices: false, streams: false, defaultSink: false };
+    this._listDevicesPromise = null;
+    this._listStreamsPromise = null;
   }
 
   startMonitoring() {
@@ -158,25 +166,37 @@ class WindowsCoreAudioBackend extends AudioBackend {
       throw new Error('Windows Core Audio backend is not initialized.');
     }
 
-    const rawDevices = await this._native.listOutputDevices();
-    return (rawDevices || []).map((device) => {
-      const name = device.name || device.id;
-      return {
-        id: device.id,
-        index: 0,
-        name,
-        technicalName: device.id,
-        state: 'active',
-        isDefault: Boolean(device.isDefault),
-        isVirtual: false,
-        volumePercent: typeof device.volumePercent === 'number' ? device.volumePercent : 100,
-        mute: Boolean(device.mute),
-        containerId: device.containerId || null,
-        formFactor: device.formFactor || null,
-        isCommunications: Boolean(device.isCommunications),
-        channels: typeof device.channels === 'number' ? device.channels : 2
-      };
-    });
+    if (this._listDevicesPromise) {
+      return this._listDevicesPromise;
+    }
+
+    this._listDevicesPromise = (async () => {
+      try {
+        const rawDevices = await this._native.listOutputDevices();
+        return (rawDevices || []).map((device) => {
+          const name = device.name || device.id;
+          return {
+            id: device.id,
+            index: 0,
+            name,
+            technicalName: device.id,
+            state: 'active',
+            isDefault: Boolean(device.isDefault),
+            isVirtual: false,
+            volumePercent: typeof device.volumePercent === 'number' ? device.volumePercent : 100,
+            mute: Boolean(device.mute),
+            containerId: device.containerId || null,
+            formFactor: device.formFactor || null,
+            isCommunications: Boolean(device.isCommunications),
+            channels: typeof device.channels === 'number' ? device.channels : 2
+          };
+        });
+      } finally {
+        this._listDevicesPromise = null;
+      }
+    })();
+
+    return this._listDevicesPromise;
   }
 
   async listSinks() {
@@ -212,18 +232,24 @@ class WindowsCoreAudioBackend extends AudioBackend {
       throw new Error('Windows Core Audio backend is not initialized.');
     }
 
-    const [devices, rawStreams] = await Promise.all([
-      this.listOutputDevices().catch(() => []),
-      this._native.listApplicationStreams()
-    ]);
+    if (this._listStreamsPromise) {
+      return this._listStreamsPromise;
+    }
 
-    const defaultDevice = devices.find((d) => d.isDefault) || devices[0];
+    this._listStreamsPromise = (async () => {
+      try {
+        const [devices, rawStreams] = await Promise.all([
+          this.listOutputDevices().catch(() => []),
+          this._native.listApplicationStreams()
+        ]);
 
-    // Phase 2F.1-G Fix 4:
-    // Identify PIDs that have an active session on the routed ingress endpoint (or any virtual ingress endpoint)
-    const ingressDeviceIds = new Set(
-      devices.filter((d) => isVirtualOrIngressEndpoint(d)).map((d) => d.id)
-    );
+        const defaultDevice = devices.find((d) => d.isDefault) || devices[0];
+
+        // Phase 2F.1-G Fix 4:
+        // Identify PIDs that have an active session on the routed ingress endpoint (or any virtual ingress endpoint)
+        const ingressDeviceIds = new Set(
+          devices.filter((d) => isVirtualOrIngressEndpoint(d)).map((d) => d.id)
+        );
 
     const pidsWithActiveIngressSession = new Set();
     for (const s of rawStreams || []) {
@@ -328,7 +354,13 @@ class WindowsCoreAudioBackend extends AudioBackend {
       });
     }
 
-    return groupedStreams;
+      return groupedStreams;
+      } finally {
+        this._listStreamsPromise = null;
+      }
+    })();
+
+    return this._listStreamsPromise;
   }
 
   async findSinkByName(sinkName) {
@@ -378,8 +410,13 @@ class WindowsCoreAudioBackend extends AudioBackend {
     if (!sinkName) {
       throw new Error('sinkName is required for setSinkVolume');
     }
-    const sink = await this.findSinkByName(sinkName);
-    const deviceId = sink ? sink.id : String(sinkName);
+    let deviceId;
+    if (isWindowsEndpointId(sinkName)) {
+      deviceId = sinkName.trim();
+    } else {
+      const sink = await this.findSinkByName(sinkName);
+      deviceId = sink ? sink.id : String(sinkName);
+    }
     const clamped = Math.max(0, Math.min(100, Math.round(Number(volumePercent) || 0)));
     return this._native.setEndpointVolume(deviceId, clamped);
   }
@@ -391,8 +428,13 @@ class WindowsCoreAudioBackend extends AudioBackend {
     if (!sinkName) {
       throw new Error('sinkName is required for setSinkMute');
     }
-    const sink = await this.findSinkByName(sinkName);
-    const deviceId = sink ? sink.id : String(sinkName);
+    let deviceId;
+    if (isWindowsEndpointId(sinkName)) {
+      deviceId = sinkName.trim();
+    } else {
+      const sink = await this.findSinkByName(sinkName);
+      deviceId = sink ? sink.id : String(sinkName);
+    }
     return this._native.setEndpointMute(deviceId, Boolean(muted));
   }
 
@@ -403,8 +445,13 @@ class WindowsCoreAudioBackend extends AudioBackend {
     if (!sinkName) {
       throw new Error('sinkName is required for getEndpointVolume');
     }
-    const sink = await this.findSinkByName(sinkName);
-    const deviceId = sink ? sink.id : String(sinkName);
+    let deviceId;
+    if (isWindowsEndpointId(sinkName)) {
+      deviceId = sinkName.trim();
+    } else {
+      const sink = await this.findSinkByName(sinkName);
+      deviceId = sink ? sink.id : String(sinkName);
+    }
     return this._native.getEndpointVolume(deviceId);
   }
 
@@ -415,8 +462,13 @@ class WindowsCoreAudioBackend extends AudioBackend {
     if (!sinkName) {
       throw new Error('sinkName is required for getEndpointMute');
     }
-    const sink = await this.findSinkByName(sinkName);
-    const deviceId = sink ? sink.id : String(sinkName);
+    let deviceId;
+    if (isWindowsEndpointId(sinkName)) {
+      deviceId = sinkName.trim();
+    } else {
+      const sink = await this.findSinkByName(sinkName);
+      deviceId = sink ? sink.id : String(sinkName);
+    }
     return this._native.getEndpointMute(deviceId);
   }
 

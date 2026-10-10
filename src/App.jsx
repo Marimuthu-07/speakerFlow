@@ -65,6 +65,11 @@ function App() {
   const confirmedDelaysRef = useRef({});
   const pendingDelayTimersRef = useRef(new Map());
 
+  // Hardware Sink Volume State & Debounce (Inactive Engine)
+  const [hardwareVolumes, setHardwareVolumes] = useState({});
+  const confirmedHardwareVolumesRef = useRef({});
+  const pendingHardwareVolumeTimersRef = useRef(new Map());
+
   // UI smoothness & re-render stabilization (Phase 2F.1-D)
   const isManualStreamSelectionRef = useRef(isManualStreamSelection);
   isManualStreamSelectionRef.current = isManualStreamSelection;
@@ -78,6 +83,28 @@ function App() {
       const deviceIds = new Set(nextDevices.map((device) => device.id));
       setDevices(nextDevices);
       setSelectedDeviceIds((current) => new Set([...current].filter((id) => deviceIds.has(id))));
+      setHardwareVolumes((current) => {
+        const next = { ...current };
+        for (const device of nextDevices) {
+          const vol = typeof device.volumePercent === 'number' ? device.volumePercent : 100;
+          confirmedHardwareVolumesRef.current[device.id] = vol;
+          if (!pendingHardwareVolumeTimersRef.current.has(device.id)) {
+            next[device.id] = vol;
+          }
+        }
+        for (const id of Object.keys(next)) {
+          if (!deviceIds.has(id)) {
+            delete next[id];
+            delete confirmedHardwareVolumesRef.current[id];
+            const timer = pendingHardwareVolumeTimersRef.current.get(id);
+            if (timer) {
+              clearTimeout(timer);
+              pendingHardwareVolumeTimersRef.current.delete(id);
+            }
+          }
+        }
+        return next;
+      });
       setLastUpdated(new Date());
     } catch (refreshError) {
       setDeviceError(refreshError.message || 'Could not detect audio output devices.');
@@ -229,17 +256,21 @@ function App() {
     engineStatus: false
   });
   const refreshScheduledRef = useRef(false);
+  const isRefreshingRef = useRef(false);
 
   const scheduleRendererRefresh = useCallback(({ devices = false, streams = false, engineStatus = false } = {}) => {
     if (devices) pendingRefreshFlagsRef.current.devices = true;
     if (streams) pendingRefreshFlagsRef.current.streams = true;
     if (engineStatus) pendingRefreshFlagsRef.current.engineStatus = true;
 
-    if (refreshScheduledRef.current) return;
+    if (refreshScheduledRef.current || isRefreshingRef.current) return;
     refreshScheduledRef.current = true;
 
     window.setTimeout(async () => {
       refreshScheduledRef.current = false;
+      if (isRefreshingRef.current) return;
+
+      isRefreshingRef.current = true;
       const flags = { ...pendingRefreshFlagsRef.current };
       pendingRefreshFlagsRef.current = { devices: false, streams: false, engineStatus: false };
 
@@ -248,8 +279,19 @@ function App() {
       if (flags.streams) tasks.push(refreshStreams());
       if (flags.engineStatus) tasks.push(refreshEngineStatus());
 
-      if (tasks.length > 0) {
-        await Promise.allSettled(tasks);
+      try {
+        if (tasks.length > 0) {
+          await Promise.allSettled(tasks);
+        }
+      } finally {
+        isRefreshingRef.current = false;
+        if (
+          pendingRefreshFlagsRef.current.devices ||
+          pendingRefreshFlagsRef.current.streams ||
+          pendingRefreshFlagsRef.current.engineStatus
+        ) {
+          scheduleRendererRefresh();
+        }
       }
     }, 50);
   }, [refreshDevices, refreshStreams, refreshEngineStatus]);
@@ -301,6 +343,10 @@ function App() {
         clearTimeout(timer);
       }
       pendingDelayTimersRef.current.clear();
+      for (const timer of pendingHardwareVolumeTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      pendingHardwareVolumeTimersRef.current.clear();
       if (typeof unsubBattery === 'function') unsubBattery();
       if (typeof unsubMaster === 'function') unsubMaster();
       if (typeof unsubDevices === 'function') unsubDevices();
@@ -421,39 +467,68 @@ function App() {
 
   // --- Phase 7.1 Per-Speaker Volume & Mute Controls ---
   async function handleSpeakerVolumeChange(sinkId, volume) {
-    setWaveStatus((prev) => ({
-      ...prev,
-      userSpeakerVolumes: { ...(prev.userSpeakerVolumes || {}), [sinkId]: volume }
-    }));
-    try {
-      if (engineActive) {
+    if (engineActive) {
+      setWaveStatus((prev) => ({
+        ...prev,
+        userSpeakerVolumes: { ...(prev.userSpeakerVolumes || {}), [sinkId]: volume }
+      }));
+      try {
         const updated = await window.speakerFlow.setSpeakerVolume(sinkId, volume);
         if (updated) setWaveStatus(updated);
-      } else {
-        await window.speakerFlow.setSinkVolume(sinkId, volume);
-        await refreshDevices();
+      } catch (err) {
+        setEngineError(err.message || 'Could not adjust speaker volume.');
       }
-    } catch (err) {
-      setEngineError(err.message || 'Could not adjust speaker volume.');
+    } else {
+      const rawVal = Number(volume);
+      const clamped = Math.max(0, Math.min(100, Number.isFinite(rawVal) ? Math.round(rawVal) : 100));
+
+      setHardwareVolumes((prev) => ({ ...prev, [sinkId]: clamped }));
+
+      const existingTimer = pendingHardwareVolumeTimersRef.current.get(sinkId);
+      if (existingTimer) {
+        clearTimeout(existingTimer);
+      }
+
+      const timer = setTimeout(async () => {
+        pendingHardwareVolumeTimersRef.current.delete(sinkId);
+        try {
+          await window.speakerFlow.setSinkVolume(sinkId, clamped);
+          confirmedHardwareVolumesRef.current[sinkId] = clamped;
+        } catch (err) {
+          const rollbackVal = confirmedHardwareVolumesRef.current[sinkId] ?? 100;
+          setHardwareVolumes((prev) => ({ ...prev, [sinkId]: rollbackVal }));
+          setEngineError(err.message || 'Could not adjust hardware sink volume.');
+        }
+      }, 50);
+      pendingHardwareVolumeTimersRef.current.set(sinkId, timer);
     }
   }
 
   async function handleSpeakerMuteToggle(sinkId, currentMuted) {
     const nextMuted = !currentMuted;
-    setWaveStatus((prev) => ({
-      ...prev,
-      userSpeakerMuted: { ...(prev.userSpeakerMuted || {}), [sinkId]: nextMuted }
-    }));
-    try {
-      if (engineActive) {
+    if (engineActive) {
+      setWaveStatus((prev) => ({
+        ...prev,
+        userSpeakerMuted: { ...(prev.userSpeakerMuted || {}), [sinkId]: nextMuted }
+      }));
+      try {
         const updated = await window.speakerFlow.setSpeakerMute(sinkId, nextMuted);
         if (updated) setWaveStatus(updated);
-      } else {
-        await window.speakerFlow.setSinkMute(sinkId, nextMuted);
-        await refreshDevices();
+      } catch (err) {
+        setEngineError(err.message || 'Could not toggle speaker mute.');
       }
-    } catch (err) {
-      setEngineError(err.message || 'Could not toggle speaker mute.');
+    } else {
+      setDevices((prev) =>
+        prev.map((d) => (d.id === sinkId ? { ...d, mute: nextMuted } : d))
+      );
+      try {
+        await window.speakerFlow.setSinkMute(sinkId, nextMuted);
+      } catch (err) {
+        setDevices((prev) =>
+          prev.map((d) => (d.id === sinkId ? { ...d, mute: currentMuted } : d))
+        );
+        setEngineError(err.message || 'Could not toggle hardware sink mute.');
+      }
     }
   }
 
@@ -1280,12 +1355,12 @@ function App() {
                             className="volume-slider"
                             min="0"
                             max="100"
-                            value={sink.mute ? 0 : (sink.volumePercent ?? 100)}
+                            value={sink.mute ? 0 : (hardwareVolumes[sink.id] ?? sink.volumePercent ?? 100)}
                             onChange={(e) => handleSpeakerVolumeChange(sink.id, parseInt(e.target.value, 10))}
                             onPointerUp={(e) => e.currentTarget.blur()}
                           />
                           <span className={`vol-badge ${sink.mute ? 'muted' : ''}`}>
-                            {sink.mute ? '0% (Muted)' : `${sink.volumePercent ?? 100}%`}
+                            {sink.mute ? '0% (Muted)' : `${hardwareVolumes[sink.id] ?? sink.volumePercent ?? 100}%`}
                           </span>
                         </div>
                       </div>
