@@ -10,6 +10,64 @@ const audioBackend = createAudioBackend();
 const streamRoutingService = new StreamRoutingService(audioBackend);
 const speakerEngineService = new SpeakerEngineService(audioBackend);
 
+// Phase 2F.1-F (PART 6 & PART 7): Coalescing Coordinator for Core Audio events and renderer notifications
+const audioCoalescingCoordinator = {
+  timer: null,
+  dirty: {
+    devices: false,
+    streams: false,
+    engineStatus: false,
+    reconcile: false,
+    forceIngressReassert: false
+  },
+  clear() {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.dirty = {
+      devices: false,
+      streams: false,
+      engineStatus: false,
+      reconcile: false,
+      forceIngressReassert: false
+    };
+  },
+  trigger({ devices = false, streams = false, engineStatus = false, reconcile = false, forceIngressReassert = false } = {}) {
+    if (devices) this.dirty.devices = true;
+    if (streams) this.dirty.streams = true;
+    if (engineStatus) this.dirty.engineStatus = true;
+    if (reconcile) this.dirty.reconcile = true;
+    if (forceIngressReassert) this.dirty.forceIngressReassert = true;
+
+    if (this.timer) {
+      clearTimeout(this.timer);
+    }
+
+    // Trailing debounce window: 180ms coalesces device negotiation bursts into ONE reconciliation cycle
+    this.timer = setTimeout(async () => {
+      this.timer = null;
+      const flags = { ...this.dirty };
+      this.dirty = { devices: false, streams: false, engineStatus: false, reconcile: false, forceIngressReassert: false };
+
+      if (flags.reconcile && speakerEngineService.session) {
+        try {
+          await speakerEngineService.reconcileSession({ forceIngressReassert: flags.forceIngressReassert });
+          flags.engineStatus = true;
+        } catch (err) {
+          console.warn('[AudioCoordinator] reconcileSession error:', err.message);
+        }
+      }
+
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (flags.devices) mainWindow.webContents.send('audio:devices-updated');
+        if (flags.streams) mainWindow.webContents.send('audio:streams-updated');
+        if (flags.engineStatus) mainWindow.webContents.send('audio:engine-status-updated');
+      }
+    }, 180);
+  }
+};
+
 speakerEngineService.onMasterVolumeChanged = (data) => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('audio:master-volume-updated', data);
@@ -17,29 +75,39 @@ speakerEngineService.onMasterVolumeChanged = (data) => {
 };
 
 speakerEngineService.onSessionChanged = () => {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('audio:engine-status-updated');
-  }
+  audioCoalescingCoordinator.trigger({ engineStatus: true });
 };
 
 audioBackend.on('devices-changed', () => {
   if (speakerEngineService.session) {
-    speakerEngineService.reconcileSession().catch(() => {});
+    speakerEngineService.reassertTargetIngress(true).catch(() => {});
   }
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('audio:devices-updated');
-    mainWindow.webContents.send('audio:engine-status-updated');
+  audioCoalescingCoordinator.trigger({
+    devices: true,
+    engineStatus: true,
+    reconcile: Boolean(speakerEngineService.session),
+    forceIngressReassert: true
+  });
+});
+
+audioBackend.on('default-sink-changed', () => {
+  if (speakerEngineService.session) {
+    speakerEngineService.reassertTargetIngress(true).catch(() => {});
   }
+  audioCoalescingCoordinator.trigger({
+    devices: true,
+    engineStatus: true,
+    reconcile: Boolean(speakerEngineService.session),
+    forceIngressReassert: true
+  });
 });
 
 audioBackend.on('streams-changed', () => {
-  if (speakerEngineService.session) {
-    speakerEngineService.reconcileSession().catch(() => {});
-  }
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('audio:streams-updated');
-    mainWindow.webContents.send('audio:engine-status-updated');
-  }
+  audioCoalescingCoordinator.trigger({
+    streams: true,
+    engineStatus: true,
+    reconcile: Boolean(speakerEngineService.session)
+  });
 });
 
 const systemPowerService = createSystemPowerService();
@@ -99,9 +167,30 @@ async function handleVolumeMute() {
   await toggleMasterMute();
 }
 
-function registerMediaShortcuts() {
-  unregisterMediaShortcuts();
+const ENGINE_MASTER_SHORTCUTS = [
+  { accelerator: 'CommandOrControl+Alt+Up', action: handleVolumeUp },
+  { accelerator: 'CommandOrControl+Alt+Down', action: handleVolumeDown },
+  { accelerator: 'CommandOrControl+Alt+M', action: handleVolumeMute }
+];
+
+function registerEngineMasterShortcuts() {
+  unregisterEngineMasterShortcuts();
   if (!speakerEngineService.session) return;
+
+  for (const { accelerator, action } of ENGINE_MASTER_SHORTCUTS) {
+    try {
+      const ok = globalShortcut.register(accelerator, () => {
+        action().catch((err) => console.error(`[Shortcuts] Error in ${accelerator} handler:`, err));
+      });
+      if (!ok) {
+        console.warn(`[Shortcuts] Could not register ${accelerator}. Shortcut may be in use by another application.`);
+      }
+    } catch (err) {
+      console.warn(`[Shortcuts] Failed to register ${accelerator}:`, err.message);
+    }
+  }
+
+  // Also retain best-effort media key registration for external keyboards
   try {
     globalShortcut.register('VolumeUp', () => {
       if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
@@ -118,11 +207,58 @@ function registerMediaShortcuts() {
   } catch {}
 }
 
-function unregisterMediaShortcuts() {
+function unregisterEngineMasterShortcuts() {
+  for (const { accelerator } of ENGINE_MASTER_SHORTCUTS) {
+    try {
+      if (globalShortcut.isRegistered(accelerator)) {
+        globalShortcut.unregister(accelerator);
+      }
+    } catch (err) {
+      console.warn(`[Shortcuts] Failed to unregister ${accelerator}:`, err.message);
+    }
+  }
   try {
     globalShortcut.unregister('VolumeUp');
     globalShortcut.unregister('VolumeDown');
     globalShortcut.unregister('VolumeMute');
+  } catch {}
+}
+
+function registerMediaShortcuts() {
+  registerEngineMasterShortcuts();
+}
+
+function unregisterMediaShortcuts() {
+  unregisterEngineMasterShortcuts();
+}
+
+let isShuttingDown = false;
+async function performGracefulShutdown() {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  audioCoalescingCoordinator.clear();
+  unregisterEngineMasterShortcuts();
+  try {
+    globalShortcut.unregisterAll();
+  } catch {}
+
+  systemPowerService.stopMonitoring();
+
+  if (speakerEngineService.session) {
+    try {
+      await speakerEngineService.stopSession();
+    } catch (err) {
+      console.warn('[Main] Error stopping session on shutdown:', err.message);
+    }
+  }
+
+  try {
+    audioBackend.stopMonitoring();
+  } catch {}
+
+  try {
+    audioBackend.destroy();
   } catch {}
 }
 
@@ -139,8 +275,27 @@ function createWindow() {
     }
   });
 
+  mainWindow.on('close', async (e) => {
+    if (mainWindow && !mainWindow.isDestroyed() && !isShuttingDown) {
+      e.preventDefault();
+      try {
+        await Promise.race([
+          performGracefulShutdown(),
+          new Promise((resolve) => setTimeout(resolve, 3000))
+        ]);
+      } catch (err) {
+        console.warn('[Main] Error during shutdown race:', err);
+      }
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.destroy();
+      }
+      mainWindow = null;
+      app.quit();
+    }
+  });
+
   mainWindow.on('closed', () => {
-    unregisterMediaShortcuts();
+    unregisterEngineMasterShortcuts();
     mainWindow = null;
   });
 
@@ -148,8 +303,30 @@ function createWindow() {
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return;
 
-    // Media Keys for SpeakerFlow Engine (Active Session Only)
+    // Media & Master Shortcuts for SpeakerFlow Engine (Active Session Only)
     if (speakerEngineService.session) {
+      const isControlOrMeta = Boolean(input.control || input.meta);
+      const isAlt = Boolean(input.alt);
+
+      // Ctrl + Alt + ArrowUp / ArrowDown / M
+      if (isControlOrMeta && isAlt) {
+        if (input.key === 'ArrowUp' || input.code === 'ArrowUp' || input.key === 'Up') {
+          handleVolumeUp().catch(() => {});
+          event.preventDefault();
+          return;
+        }
+        if (input.key === 'ArrowDown' || input.code === 'ArrowDown' || input.key === 'Down') {
+          handleVolumeDown().catch(() => {});
+          event.preventDefault();
+          return;
+        }
+        if (input.key === 'm' || input.key === 'M' || input.code === 'KeyM') {
+          handleVolumeMute().catch(() => {});
+          event.preventDefault();
+          return;
+        }
+      }
+
       if (input.key === 'AudioVolumeUp' || input.code === 'AudioVolumeUp' || input.key === 'VolumeUp' || input.code === 'VolumeUp') {
         handleVolumeUp().catch(() => {});
         event.preventDefault();
@@ -217,16 +394,16 @@ ipcMain.handle('audio:get-speaker-engine-status', async () => speakerEngineServi
 ipcMain.handle('audio:start-speaker-engine-session', async (_event, streamId, sinkIds, isManual = false) => {
   try {
     const result = await speakerEngineService.startSession(streamId, sinkIds, isManual);
-    registerMediaShortcuts();
+    registerEngineMasterShortcuts();
     return result;
   } catch (err) {
-    unregisterMediaShortcuts();
+    unregisterEngineMasterShortcuts();
     throw err;
   }
 });
 ipcMain.handle('audio:set-session-stream', async (_event, streamId, isManual) => speakerEngineService.setSessionStream(streamId, isManual));
 ipcMain.handle('audio:stop-speaker-engine-session', async () => {
-  unregisterMediaShortcuts();
+  unregisterEngineMasterShortcuts();
   return speakerEngineService.stopSession();
 });
 ipcMain.handle('audio:disconnect-branch', async (_event, sinkId) => speakerEngineService.disconnectBranch(sinkId));
@@ -256,26 +433,22 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => {
-  unregisterMediaShortcuts();
-  audioBackend.stopMonitoring();
-  systemPowerService.stopMonitoring();
-  speakerEngineService.stopSession().catch(() => {});
-  audioBackend.destroy();
+app.on('before-quit', (e) => {
+  if (!isShuttingDown) {
+    e.preventDefault();
+    performGracefulShutdown().finally(() => {
+      app.quit();
+    });
+  }
 });
 
 app.on('will-quit', () => {
-  unregisterMediaShortcuts();
-  audioBackend.stopMonitoring();
-  systemPowerService.stopMonitoring();
-  audioBackend.destroy();
+  try {
+    globalShortcut.unregisterAll();
+  } catch {}
 });
 
-app.on('window-all-closed', () => {
-  unregisterMediaShortcuts();
-  audioBackend.stopMonitoring();
-  systemPowerService.stopMonitoring();
-  speakerEngineService.stopSession().catch(() => {});
-  audioBackend.destroy();
+app.on('window-all-closed', async () => {
+  await performGracefulShutdown();
   if (process.platform !== 'darwin') app.quit();
 });

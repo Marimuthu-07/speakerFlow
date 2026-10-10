@@ -57,6 +57,13 @@ function matchesStreamId(item, streamId) {
   return false;
 }
 
+function isVirtualOrIngressEndpoint(deviceOrSink) {
+  if (!deviceOrSink) return false;
+  if (deviceOrSink.isVirtual) return true;
+  const name = deviceOrSink.name || deviceOrSink.description || '';
+  return /voicemeeter|vb-audio|virtual|cable|steam streaming/i.test(name);
+}
+
 class WindowsCoreAudioBackend extends AudioBackend {
   constructor(nativeBinding = null) {
     super();
@@ -104,7 +111,7 @@ class WindowsCoreAudioBackend extends AudioBackend {
     }
 
     if (this._debounceTimer) clearTimeout(this._debounceTimer);
-    this._debounceTimer = setTimeout(() => this._flushEvents(), 60);
+    this._debounceTimer = setTimeout(() => this._flushEvents(), 180);
   }
 
   _flushEvents() {
@@ -163,7 +170,11 @@ class WindowsCoreAudioBackend extends AudioBackend {
         isDefault: Boolean(device.isDefault),
         isVirtual: false,
         volumePercent: typeof device.volumePercent === 'number' ? device.volumePercent : 100,
-        mute: Boolean(device.mute)
+        mute: Boolean(device.mute),
+        containerId: device.containerId || null,
+        formFactor: device.formFactor || null,
+        isCommunications: Boolean(device.isCommunications),
+        channels: typeof device.channels === 'number' ? device.channels : 2
       };
     });
   }
@@ -208,8 +219,37 @@ class WindowsCoreAudioBackend extends AudioBackend {
 
     const defaultDevice = devices.find((d) => d.isDefault) || devices[0];
 
-    // Filter out expired streams (AudioSessionStateExpired = 2)
-    const validStreams = (rawStreams || []).filter((s) => s.state !== 2);
+    // Phase 2F.1-G Fix 4:
+    // Identify PIDs that have an active session on the routed ingress endpoint (or any virtual ingress endpoint)
+    const ingressDeviceIds = new Set(
+      devices.filter((d) => isVirtualOrIngressEndpoint(d)).map((d) => d.id)
+    );
+
+    const pidsWithActiveIngressSession = new Set();
+    for (const s of rawStreams || []) {
+      if ((s.state === 1 || s.isActive) && s.processId && s.processId !== process.pid) {
+        const isIngress = ingressDeviceIds.has(s.currentSinkId) ||
+                          isVirtualOrIngressEndpoint({ name: s.currentSinkName });
+        if (isIngress) {
+          pidsWithActiveIngressSession.add(s.processId);
+        }
+      }
+    }
+
+    // Filter out expired streams (AudioSessionStateExpired = 2), self-session (process.pid),
+    // and dormant inactive physical-endpoint sessions for processes that have an active routed ingress stream.
+    const validStreams = (rawStreams || []).filter((s) => {
+      if (s.state === 2 || s.processId === process.pid) return false;
+      if (s.state === 0 && !s.isActive && s.processId && pidsWithActiveIngressSession.has(s.processId)) {
+        const isIngress = ingressDeviceIds.has(s.currentSinkId) ||
+                          isVirtualOrIngressEndpoint({ name: s.currentSinkName });
+        if (!isIngress) {
+          // Suppress dormant inactive physical endpoint session
+          return false;
+        }
+      }
+      return true;
+    });
 
     // Group valid audio sessions by processId into unified application streams.
     // If processId is absent or 0, group by session ID so isolated streams are not dropped.

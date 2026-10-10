@@ -88,6 +88,7 @@ public:
      */
     AudioRingBuffer* GetRingBuffer() const { return m_ringBuffer.get(); }
     uint32_t GetChannels() const { return m_channels; }
+    uint32_t GetSampleRate() const { return m_sampleRate; }
 
     static constexpr size_t MAX_FANOUT_SLOTS = 8;
 
@@ -119,6 +120,10 @@ public:
 
     AudioRingBuffer* GetBranchBuffer(size_t slot) const {
         return (slot < MAX_FANOUT_SLOTS) ? m_branchBuffers[slot].load(std::memory_order_acquire) : nullptr;
+    }
+
+    std::atomic<bool>& GetSlotInWrite(size_t slot) {
+        return m_slotInWrite[slot];
     }
 
 private:

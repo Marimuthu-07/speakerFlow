@@ -135,6 +135,9 @@ class WaveEngineController {
   }
 
   async resolveSinkInputIds() {
+    if (process.platform === 'win32') {
+      return;
+    }
     try {
       const sinkInputs = await this.audioBackend.listSinkInputs();
       for (const branch of this.branches.values()) {
@@ -379,7 +382,7 @@ class WaveEngineController {
     const activeList = this.getActiveOrderedBranches();
     const n = activeList.length;
 
-    if (activeList.some((b) => !b.sinkInputId)) {
+    if (process.platform !== 'win32' && activeList.some((b) => !b.sinkInputId)) {
       this.resolveSinkInputIds().catch(() => {});
     }
 
@@ -723,6 +726,11 @@ class WaveEngineController {
     const { targetPercent } = this.calculateBranchTargetGain(branch.sinkId, dynGain);
     branch.pendingVolume = targetPercent;
 
+    if (process.platform === 'win32') {
+      branch.isUpdating = false;
+      return Promise.resolve();
+    }
+
     if (!branch.sinkInputId) {
       branch.isUpdating = false;
       this.resolveSinkInputIds().catch(() => {});
@@ -753,7 +761,9 @@ class WaveEngineController {
   }
 
   async resetAllVolumes(targetPercent = 100) {
-    await this.resolveSinkInputIds();
+    if (process.platform !== 'win32') {
+      await this.resolveSinkInputIds();
+    }
     const promises = [];
     for (const branch of this.branches.values()) {
       branch.targetGain = targetPercent / 100;

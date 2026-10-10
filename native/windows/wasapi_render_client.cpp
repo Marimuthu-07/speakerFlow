@@ -150,6 +150,7 @@ bool WasapiRenderClient::StartRender(const std::wstring& targetDeviceId,
     m_underrunRecoveryCount.store(0, std::memory_order_relaxed);
     m_resampleRatioMultiplier.store(1.0, std::memory_order_relaxed);
     m_bufferState.store(RenderBufferState::Preroll, std::memory_order_relaxed);
+    m_generation.fetch_add(1, std::memory_order_relaxed);
 
     IMMDeviceEnumerator* pEnumerator = nullptr;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
@@ -515,6 +516,7 @@ static void ApplyFormatAwareGain(BYTE* pBuffer, size_t totalSamples, SampleForma
 }
 
 void WasapiRenderClient::RenderThreadProc() {
+    const uint64_t currentGen = m_generation.load(std::memory_order_relaxed);
     HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
     DWORD taskIndex = 0;
@@ -844,7 +846,7 @@ void WasapiRenderClient::RenderThreadProc() {
                                framesRead,
                                pRenderData,
                                framesNeeded,
-                               framesProduced);
+                                framesProduced);
         }
 
         // Apply format-aware software gain (Master * Branch)
@@ -877,14 +879,34 @@ void WasapiRenderClient::RenderThreadProc() {
         CoUninitialize();
     }
 
-    if (m_lifecycleState.load(std::memory_order_acquire) == RenderLifecycleState::DeviceLost) {
+    if (m_lifecycleState.load(std::memory_order_acquire) == RenderLifecycleState::DeviceLost &&
+        m_generation.load(std::memory_order_acquire) == currentGen) {
         std::function<void(WasapiRenderClient*)> cb;
         {
-            std::lock_guard<std::mutex> lock(m_controlMutex);
-            cb = m_deviceLostCallback;
+            std::unique_lock<std::mutex> lock(m_controlMutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                cb = m_deviceLostCallback;
+            }
         }
         if (cb) {
-            cb(this);
+            // Dispatch asynchronously with weak_ptr lock so callback never accesses a destroyed client
+            try {
+                std::weak_ptr<WasapiRenderClient> weakSelf;
+                try {
+                    weakSelf = weak_from_this();
+                } catch (...) {}
+
+                std::thread([cb, weakSelf, currentGen]() {
+                    auto self = weakSelf.lock();
+                    if (!self) {
+                        return; // Client was destroyed or is in destruction: safely abort!
+                    }
+                    if (self->m_generation.load(std::memory_order_acquire) == currentGen &&
+                        self->m_lifecycleState.load(std::memory_order_acquire) == RenderLifecycleState::DeviceLost) {
+                        cb(self.get());
+                    }
+                }).detach();
+            } catch (...) {}
         }
     }
 }
@@ -1150,14 +1172,17 @@ bool WasapiRenderClient::ScheduleRecovery(bool allowFromRunning) {
     if (current == RenderLifecycleState::DeviceLost ||
         current == RenderLifecycleState::WaitingForDevice ||
         (allowFromRunning && (current == RenderLifecycleState::Running || current == RenderLifecycleState::Failed))) {
-        if (allowFromRunning && current == RenderLifecycleState::Running) {
-            m_recoveryAttemptCount.store(0, std::memory_order_relaxed);
-        }
+        // Reset recovery attempts budget whenever scheduling recovery
+        m_recoveryAttemptCount.store(0, std::memory_order_relaxed);
         m_lifecycleState.store(RenderLifecycleState::RecoveryPending, std::memory_order_release);
         m_recoveryPending.store(true, std::memory_order_release);
         return true;
     }
     return false;
+}
+
+void WasapiRenderClient::ResetRecoveryAttempts() {
+    m_recoveryAttemptCount.store(0, std::memory_order_relaxed);
 }
 
 uint32_t WasapiRenderClient::GetRecoveryAttemptCount() const {
@@ -1213,6 +1238,7 @@ bool WasapiRenderClient::ReinitializeRender(std::string& outError, AudioRingBuff
 
     m_lifecycleState.store(RenderLifecycleState::Reinitializing, std::memory_order_release);
     m_recoveryAttemptCount.fetch_add(1, std::memory_order_relaxed);
+    m_generation.fetch_add(1, std::memory_order_relaxed);
 
     if (m_simulateRecoveryFailure.load(std::memory_order_relaxed)) {
         HRESULT hrFail = m_simulatedRecoveryFailHr.load(std::memory_order_relaxed);
@@ -1391,7 +1417,13 @@ bool WasapiRenderClient::ReinitializeRender(std::string& outError, AudioRingBuff
         m_captureSampleRate = capRate;
         m_captureChannels = capChannels;
         m_targetDeviceId = targetId;
-        if (hr == static_cast<HRESULT>(0x80070057) || hr == static_cast<HRESULT>(0x88890004) || hr == static_cast<HRESULT>(0x80070490)) {
+        bool isTemporaryLoss = (hr == static_cast<HRESULT>(0x80070057) /* E_INVALIDARG */ ||
+                                hr == static_cast<HRESULT>(0x88890004) /* AUDCLNT_E_DEVICE_INVALIDATED */ ||
+                                hr == static_cast<HRESULT>(0x80070490) /* ERROR_NOT_FOUND */ ||
+                                hr == static_cast<HRESULT>(0x8889000a) /* AUDCLNT_E_DEVICE_IN_USE */ ||
+                                hr == static_cast<HRESULT>(0x8889000f) /* AUDCLNT_E_ENDPOINT_CREATE_FAILED */ ||
+                                hr == static_cast<HRESULT>(0x88890020) /* AUDCLNT_E_RESOURCES_INVALIDATED */);
+        if (isTemporaryLoss) {
             m_lifecycleState.store(RenderLifecycleState::WaitingForDevice, std::memory_order_release);
             m_recoveryPending.store(true, std::memory_order_release);
         } else {
@@ -1541,7 +1573,16 @@ bool WasapiRenderClient::ReinitializeRender(std::string& outError, AudioRingBuff
         m_captureSampleRate = capRate;
         m_captureChannels = capChannels;
         m_targetDeviceId = targetId;
-        if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
+        bool isTemporaryLoss = (hr == static_cast<HRESULT>(0x80070057) /* E_INVALIDARG */ ||
+                                hr == static_cast<HRESULT>(0x88890004) /* AUDCLNT_E_DEVICE_INVALIDATED */ ||
+                                hr == static_cast<HRESULT>(0x80070490) /* ERROR_NOT_FOUND */ ||
+                                hr == static_cast<HRESULT>(0x8889000a) /* AUDCLNT_E_DEVICE_IN_USE */ ||
+                                hr == static_cast<HRESULT>(0x8889000f) /* AUDCLNT_E_ENDPOINT_CREATE_FAILED */ ||
+                                hr == static_cast<HRESULT>(0x88890020) /* AUDCLNT_E_RESOURCES_INVALIDATED */);
+        if (isTemporaryLoss) {
+            m_lifecycleState.store(RenderLifecycleState::WaitingForDevice, std::memory_order_release);
+            m_recoveryPending.store(true, std::memory_order_release);
+        } else if (m_recoveryAttemptCount.load(std::memory_order_relaxed) >= 5) {
             m_lifecycleState.store(RenderLifecycleState::Failed, std::memory_order_release);
             m_recoveryPending.store(false, std::memory_order_release);
         } else {

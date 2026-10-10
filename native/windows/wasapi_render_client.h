@@ -110,7 +110,7 @@ struct WasapiRenderStats {
     float effectiveGain = 1.0f;
 };
 
-class WasapiRenderClient {
+class WasapiRenderClient : public std::enable_shared_from_this<WasapiRenderClient> {
 public:
     WasapiRenderClient();
     ~WasapiRenderClient();
@@ -238,6 +238,11 @@ public:
      * @brief Gets the last HRESULT recorded during recovery attempts (or S_OK).
      */
     HRESULT GetLastRecoveryHresult() const;
+
+    /**
+     * @brief Resets the count of recovery attempts to 0.
+     */
+    void ResetRecoveryAttempts();
 
     /**
      * @brief Checks if recovery is currently scheduled / pending.
@@ -372,6 +377,7 @@ private:
     std::atomic<DWORD> m_endpointDeviceState{0};
     std::atomic<uint64_t> m_lastRecoveryTimestampMs{0};
     std::function<void(WasapiRenderClient*)> m_deviceLostCallback;
+    std::atomic<uint64_t> m_generation{1};
     std::atomic<bool> m_simulateRecoveryFailure{false};
     std::atomic<HRESULT> m_simulatedRecoveryFailHr{E_FAIL};
     std::atomic<bool> m_simulateRecoverySuccess{false};

@@ -12,6 +12,46 @@ function isVirtualSink(sink) {
   return false;
 }
 
+function isTelephonyOrSecondaryEndpoint(sink) {
+  if (!sink) return false;
+
+  // 0. Explicit communications role from backend
+  if (sink.isCommunications) {
+    return true;
+  }
+
+  // 1. Form-factor check if provided by backend metadata
+  if (sink.formFactor && typeof sink.formFactor === 'string') {
+    const ff = sink.formFactor.toLowerCase();
+    if (ff.includes('headset') || ff.includes('handset') || ff.includes('telephony')) {
+      return true;
+    }
+  }
+
+  // 2. Role / communications check if provided by backend metadata
+  if (sink.role && typeof sink.role === 'string') {
+    const r = sink.role.toLowerCase();
+    if (r.includes('communications') || r.includes('telephony')) {
+      return true;
+    }
+  }
+
+  // 3. Friendly name, description, technical name, and ID check
+  const text = `${sink.name || ''} ${sink.description || ''} ${sink.technicalName || ''} ${sink.id || ''}`.toLowerCase();
+  if (
+    text.includes('hands-free') ||
+    text.includes('handsfree') ||
+    text.includes('hfp') ||
+    text.includes('telephony') ||
+    text.includes('communications') ||
+    text.includes('bthfpenum')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 class SpeakerEngineService {
   constructor(audioBackend, pipelineAdapter, delayStore = null) {
     this.audioBackend = audioBackend;
@@ -402,7 +442,7 @@ class SpeakerEngineService {
     await this.waveController.setMasterMute(isMuted);
     if (process.platform === 'win32') {
       if (this.session?.pipeline && typeof this.session.pipeline.setMasterMute === 'function') {
-        this.session.pipeline.setMasterMute(Boolean(muted));
+        this.session.pipeline.setMasterMute(isMuted);
       }
     } else {
       if (this.session && this.session.ingressSinkId) {
@@ -447,6 +487,7 @@ class SpeakerEngineService {
 
     session.isManualStreamSelection = Boolean(isManual);
     session.streamId = stream.id;
+    session.streamProcessId = stream.processId;
     session.streamName = stream.streamName
       ? `${stream.applicationName} — ${stream.streamName}`
       : stream.applicationName;
@@ -579,6 +620,22 @@ class SpeakerEngineService {
       clearTimeout(timer);
     }
     this.reconnectTimers.clear();
+    if (this._settlingTimer) {
+      clearTimeout(this._settlingTimer);
+      this._settlingTimer = null;
+    }
+  }
+
+  scheduleSettlingReconciliation(delayMs = 4500) {
+    if (this._settlingTimer) {
+      clearTimeout(this._settlingTimer);
+    }
+    this._settlingTimer = setTimeout(() => {
+      this._settlingTimer = null;
+      if (this.session && !this.session.stopping) {
+        this.reconcileSession().catch(() => {});
+      }
+    }, delayMs);
   }
 
   async _performBranchReconnect(sinkId, isAuto = false) {
@@ -603,7 +660,9 @@ class SpeakerEngineService {
           session.pipeline.triggerBranchRecovery(branch.branchSinkId, !isAuto);
           branch.state = 'reconnecting';
           branch.waitingForDevice = true;
+          branch.reconnecting = false;
           this.reconcileSessionState();
+          this.scheduleSettlingReconciliation(4500);
           return;
         }
       }
@@ -687,9 +746,51 @@ class SpeakerEngineService {
     }
   }
 
-  async reconcileSession() {
+  async reassertTargetIngress(force = true) {
+    const session = this.session;
+    if (!session || session.stopping || session.state === 'starting') return false;
+
+    const targetPid = session.streamProcessId;
+    if (!targetPid || targetPid === process.pid) return false;
+
+    try {
+      const streams = await this.audioBackend.listApplicationStreams();
+      const streamList = streams || [];
+      const matchingStreams = streamList.filter((s) => s.processId === targetPid);
+      if (matchingStreams.length === 0) return false;
+
+      let rerouted = false;
+      for (const s of matchingStreams) {
+        const appLower = (s.applicationName || '').toLowerCase();
+        if (appLower.includes('electron') || appLower.includes('speakerflow') ||
+            appLower.includes('antigravity') || appLower.includes('voicemeeter')) {
+          continue;
+        }
+
+        if (s.currentSinkId && s.currentSinkId !== session.ingressSinkId) {
+          const now = Date.now();
+          if (force || !session.lastRerouteTimestamp || (now - session.lastRerouteTimestamp) > 1000) {
+            session.lastRerouteTimestamp = now;
+            await this.audioBackend.moveSinkInput(targetPid, session.ingressSinkId).catch(() => {});
+            await this.verifyStreamSink(targetPid, session.ingressSinkId, 500).catch(() => {});
+            rerouted = true;
+          }
+          break;
+        }
+      }
+      return rerouted;
+    } catch {
+      return false;
+    }
+  }
+
+  async reconcileSession(options = {}) {
     const session = this.session;
     if (!session || session.stopping || session.state === 'starting') return;
+
+    if (options && options.forceIngressReassert) {
+      this._forceIngressPending = true;
+    }
 
     if (this._isReconciling) {
       this._reconcilePending = true;
@@ -700,15 +801,18 @@ class SpeakerEngineService {
     try {
       do {
         this._reconcilePending = false;
-        await this._performReconciliation();
+        const forceIngress = Boolean(this._forceIngressPending);
+        this._forceIngressPending = false;
+        await this._performReconciliation(forceIngress);
       } while (this._reconcilePending && this.session && !this.session.stopping && this.session.state !== 'starting');
     } finally {
       this._isReconciling = false;
       this._reconcilePending = false;
+      this._forceIngressPending = false;
     }
   }
 
-  async _performReconciliation() {
+  async _performReconciliation(forceIngressReassert = false) {
     const session = this.session;
     if (!session || session.stopping || session.state === 'starting') return;
 
@@ -791,6 +895,29 @@ class SpeakerEngineService {
           }
         }
 
+        // Phase 2F.1-F: Target Application Ingress Re-Assertion (Prevent Chrome escaping to physical Bluetooth)
+        const targetPid = session.streamProcessId || targetStream.processId;
+        if (targetPid && targetPid !== process.pid) {
+          const matchingStreams = streamList.filter((s) => s.processId === targetPid);
+          for (const s of matchingStreams) {
+            const appLower = (s.applicationName || '').toLowerCase();
+            if (appLower.includes('electron') || appLower.includes('speakerflow') ||
+                appLower.includes('antigravity') || appLower.includes('voicemeeter')) {
+              continue;
+            }
+
+            if (s.currentSinkId && s.currentSinkId !== session.ingressSinkId) {
+              const now = Date.now();
+              if (forceIngressReassert || !session.lastRerouteTimestamp || (now - session.lastRerouteTimestamp) > 1000) {
+                session.lastRerouteTimestamp = now;
+                await this.audioBackend.moveSinkInput(targetPid, session.ingressSinkId).catch(() => {});
+                await this.verifyStreamSink(targetPid, session.ingressSinkId, 500).catch(() => {});
+              }
+              break;
+            }
+          }
+        }
+
         const freshName = targetStream.streamName
           ? `${targetStream.applicationName} — ${targetStream.streamName}`
           : targetStream.applicationName;
@@ -854,7 +981,18 @@ class SpeakerEngineService {
                 branch.error = null;
                 branch.waitingForDevice = false;
                 branch.retryCount = 0;
+                branch.reconnecting = false;
                 branchesChanged = true;
+                if (process.platform === 'win32' && session.pipeline) {
+                  const spkVol = this.waveController.userSpeakerVolumes.get(branch.sinkId) ?? 100;
+                  const spkMute = this.waveController.userSpeakerMuted.get(branch.sinkId) ?? false;
+                  if (typeof session.pipeline.setBranchVolume === 'function') {
+                    session.pipeline.setBranchVolume(branch.branchSinkId, spkVol / 100);
+                  }
+                  if (typeof session.pipeline.setBranchMute === 'function') {
+                    session.pipeline.setBranchMute(branch.branchSinkId, spkMute);
+                  }
+                }
               }
             } else if (nb.lifecycleStateName === 'WaitingForDevice' || nb.waitingForDevice) {
               if (branch.state !== 'waiting_device') {
@@ -863,6 +1001,7 @@ class SpeakerEngineService {
                 branch.waitingForDevice = true;
                 branchesChanged = true;
               }
+              this.scheduleSettlingReconciliation(2000);
             } else if (
               nb.lifecycleStateName === 'RecoveryPending' ||
               nb.lifecycleStateName === 'Reinitializing' ||
@@ -873,6 +1012,7 @@ class SpeakerEngineService {
                 branch.waitingForDevice = true;
                 branchesChanged = true;
               }
+              this.scheduleSettlingReconciliation(4500);
             } else if (nb.lifecycleStateName === 'DeviceLost') {
               if (branch.state !== 'waiting_device') {
                 branch.state = 'waiting_device';
@@ -949,6 +1089,11 @@ class SpeakerEngineService {
     for (const physicalSink of validPhysicalSinks) {
       if (existingSinkIds.has(physicalSink.name) || existingSinkIds.has(physicalSink.id)) continue;
 
+      // Filter out telephony/hands-free communication profiles from automatic branch addition
+      if (isTelephonyOrSecondaryEndpoint(physicalSink)) {
+        continue;
+      }
+
       // Target selection semantics:
       // Must be explicitly selected by the user OR be a brand new device plugged in after session started
       const isSelected =
@@ -990,7 +1135,7 @@ class SpeakerEngineService {
         try {
           const branchHandle = await session.pipeline.createBranch({
             branchSinkId,
-            physicalSinkId: physicalSink.name,
+            physicalSinkId: physicalSink.id || physicalSink.name,
             onError: (error) => {
               branchObj.state = 'failed';
               branchObj.error = error.message;
@@ -1136,4 +1281,4 @@ function parseSinkVolumePercent(volumeObj) {
   return count > 0 ? Math.round(totalPercent / count) : 100;
 }
 
-module.exports = { SpeakerEngineService };
+module.exports = { SpeakerEngineService, isTelephonyOrSecondaryEndpoint };
