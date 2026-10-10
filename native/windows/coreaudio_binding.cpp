@@ -17,6 +17,7 @@
 
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <mutex>
 #include <atomic>
 #include <cmath>
@@ -251,6 +252,65 @@ static std::wstring GetFullDevicePath(IMMDevice* pDevice, const std::wstring& en
     return L"\\\\?\\SWD#MMDEVAPI#" + endpointId + L"#{e6327cad-dcec-4949-ae8a-991e976a79d2}";
 }
 
+static bool IsTelephonyOrHandsFreeEndpoint(IMMDevice* pDevice, const std::wstring& devFriendlyName = L"") {
+    std::wstring friendlyName = devFriendlyName;
+    if (friendlyName.empty() && pDevice) {
+        IPropertyStore* pProps = NULL;
+        if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
+            PROPVARIANT varName;
+            PropVariantInit(&varName);
+            if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName))) {
+                if (varName.vt == VT_LPWSTR && varName.pwszVal) {
+                    friendlyName = varName.pwszVal;
+                }
+            }
+            PropVariantClear(&varName);
+            pProps->Release();
+        }
+    }
+
+    std::wstring lower = friendlyName;
+    for (auto& c : lower) c = towlower(c);
+    if (lower.find(L"hands-free") != std::wstring::npos ||
+        lower.find(L"handsfree") != std::wstring::npos ||
+        lower.find(L"bthfpenum") != std::wstring::npos ||
+        lower.find(L"bthhfenum") != std::wstring::npos ||
+        lower.find(L"hfp") != std::wstring::npos ||
+        lower.find(L"telephony") != std::wstring::npos) {
+        return true;
+    }
+
+    if (pDevice) {
+        LPWSTR pstrId = NULL;
+        if (SUCCEEDED(pDevice->GetId(&pstrId)) && pstrId) {
+            std::wstring idLower = pstrId;
+            for (auto& c : idLower) c = towlower(c);
+            CoTaskMemFree(pstrId);
+            if (idLower.find(L"bthhfenum") != std::wstring::npos ||
+                idLower.find(L"bthfpenum") != std::wstring::npos) {
+                return true;
+            }
+        }
+
+        IPropertyStore* pProps = NULL;
+        if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
+            static const PROPERTYKEY propKeyFormFactor = { { 0x1da5d803, 0xd492, 0x4edd, { 0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e } }, 0 };
+            PROPVARIANT varFF;
+            PropVariantInit(&varFF);
+            if (SUCCEEDED(pProps->GetValue(propKeyFormFactor, &varFF))) {
+                if (varFF.vt == VT_UI4 && varFF.ulVal == 6 /* Handset */) {
+                    PropVariantClear(&varFF);
+                    pProps->Release();
+                    return true;
+                }
+            }
+            PropVariantClear(&varFF);
+            pProps->Release();
+        }
+    }
+    return false;
+}
+
 static DWORD FindProcessIdFromSession(const std::wstring& targetSessionId) {
     if (targetSessionId.empty()) return 0;
 
@@ -283,6 +343,11 @@ static DWORD FindProcessIdFromSession(const std::wstring& targetSessionId) {
     for (UINT d = 0; d < devCount && foundPid == 0; d++) {
         IMMDevice* pDevice = NULL;
         if (FAILED(pCollection->Item(d, &pDevice)) || !pDevice) continue;
+
+        if (IsTelephonyOrHandsFreeEndpoint(pDevice)) {
+            pDevice->Release();
+            continue;
+        }
 
         LPWSTR pstrDevId = NULL;
         std::wstring deviceId;
@@ -375,6 +440,11 @@ static HRESULT FindSessionSimpleVolume(const std::wstring& targetSessionId, ISim
     for (UINT d = 0; d < devCount && !found; d++) {
         IMMDevice* pDevice = NULL;
         if (FAILED(pCollection->Item(d, &pDevice)) || !pDevice) continue;
+
+        if (IsTelephonyOrHandsFreeEndpoint(pDevice)) {
+            pDevice->Release();
+            continue;
+        }
 
         LPWSTR pstrDevId = NULL;
         std::wstring deviceId;
@@ -949,7 +1019,7 @@ public:
 
             DWORD pid = 0;
             pSessionControl2->GetProcessId(&pid);
-            if (pid == 0) {
+            if (pid == 0 || pid == GetCurrentProcessId()) {
                 pSessionControl2->Release();
                 return S_OK;
             }
@@ -1024,6 +1094,40 @@ static void RegisterEndpointMonitoring(IMMDevice* pDevice, const std::wstring& d
         }
     }
 
+    IPropertyStore* pProps = NULL;
+    if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
+        PROPVARIANT varFF;
+        PropVariantInit(&varFF);
+        static const PROPERTYKEY propKeyFormFactor = { { 0x1da5d803, 0xd492, 0x4edd, { 0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e } }, 0 };
+        bool isComm = false;
+        if (SUCCEEDED(pProps->GetValue(propKeyFormFactor, &varFF))) {
+            if (varFF.vt == VT_UI4 && (varFF.ulVal == 5 || varFF.ulVal == 6)) {
+                isComm = true;
+            }
+        }
+        PropVariantClear(&varFF);
+
+        PROPVARIANT varName;
+        PropVariantInit(&varName);
+        if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName))) {
+            if (varName.vt == VT_LPWSTR && varName.pwszVal) {
+                std::wstring nameLower = varName.pwszVal;
+                for (auto& c : nameLower) c = static_cast<wchar_t>(towlower(c));
+                if (nameLower.find(L"hands-free") != std::wstring::npos ||
+                    nameLower.find(L"handsfree") != std::wstring::npos ||
+                    nameLower.find(L"hfp") != std::wstring::npos) {
+                    isComm = true;
+                }
+            }
+        }
+        PropVariantClear(&varName);
+        pProps->Release();
+
+        if (isComm) {
+            return;
+        }
+    }
+
     IAudioSessionManager2* pMgr = NULL;
     HRESULT hr = pDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, NULL, (void**)&pMgr);
     if (FAILED(hr) || !pMgr) {
@@ -1062,7 +1166,7 @@ static void RegisterEndpointMonitoring(IMMDevice* pDevice, const std::wstring& d
 
                         DWORD pid = 0;
                         pCtrl2->GetProcessId(&pid);
-                        if (pid != 0) {
+                        if (pid != 0 && pid != GetCurrentProcessId()) {
                             LPWSTR pInstId = NULL;
                             std::wstring sessionId;
                             if (SUCCEEDED(pCtrl2->GetSessionInstanceIdentifier(&pInstId)) && pInstId && wcslen(pInstId) > 0) {
@@ -1213,20 +1317,37 @@ static void OnSessionDisconnectedInternal(const std::wstring& deviceId, const st
 }
 
 static void StopAllMonitoringInternal() {
-    std::lock_guard<std::mutex> lock(g_monitorMutex);
-    g_monitoringActive = false;
+    IMMDeviceEnumerator* pEnumeratorToRelease = nullptr;
+    NotificationClient* pNotificationClientToRelease = nullptr;
+    std::vector<MonitoredEndpoint> endpointsToRelease;
+    napi_threadsafe_function tsfnToRelease = nullptr;
 
-    if (g_pDeviceEnumerator && g_pNotificationClient) {
-        g_pDeviceEnumerator->UnregisterEndpointNotificationCallback(g_pNotificationClient);
-        g_pNotificationClient->Release();
-        g_pNotificationClient = nullptr;
-    }
-    if (g_pDeviceEnumerator) {
-        g_pDeviceEnumerator->Release();
+    {
+        std::lock_guard<std::mutex> lock(g_monitorMutex);
+        g_monitoringActive = false;
+
+        pEnumeratorToRelease = g_pDeviceEnumerator;
         g_pDeviceEnumerator = nullptr;
+
+        pNotificationClientToRelease = g_pNotificationClient;
+        g_pNotificationClient = nullptr;
+
+        endpointsToRelease = std::move(g_monitoredEndpoints);
+        g_monitoredEndpoints.clear();
+
+        tsfnToRelease = g_tsfn;
+        g_tsfn = nullptr;
     }
 
-    for (auto& ep : g_monitoredEndpoints) {
+    if (pEnumeratorToRelease && pNotificationClientToRelease) {
+        pEnumeratorToRelease->UnregisterEndpointNotificationCallback(pNotificationClientToRelease);
+        pNotificationClientToRelease->Release();
+    }
+    if (pEnumeratorToRelease) {
+        pEnumeratorToRelease->Release();
+    }
+
+    for (auto& ep : endpointsToRelease) {
         for (auto& sess : ep.sessions) {
             if (sess.pControl && sess.pEventsClient) {
                 sess.pControl->UnregisterAudioSessionNotification(sess.pEventsClient);
@@ -1242,11 +1363,9 @@ static void StopAllMonitoringInternal() {
             ep.pSessionManager->Release();
         }
     }
-    g_monitoredEndpoints.clear();
 
-    if (g_tsfn) {
-        napi_release_threadsafe_function(g_tsfn, napi_tsfn_abort);
-        g_tsfn = nullptr;
+    if (tsfnToRelease) {
+        napi_release_threadsafe_function(tsfnToRelease, napi_tsfn_abort);
     }
 }
 
@@ -1275,6 +1394,9 @@ static bool StartMonitoringInternal(napi_env env, napi_value jsCallback) {
     if (status != napi_ok || !g_tsfn) {
         return false;
     }
+
+    // Do NOT let threadsafe function hold Node.js event loop open during shutdown
+    napi_unref_threadsafe_function(env, g_tsfn);
 
     g_monitoringActive = true;
 
@@ -1433,6 +1555,17 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
         pDefaultDevice->Release();
     }
 
+    std::wstring defaultCommDeviceId;
+    IMMDevice* pDefaultCommDevice = NULL;
+    if (SUCCEEDED(pEnumerator->GetDefaultAudioEndpoint(eRender, eCommunications, &pDefaultCommDevice)) && pDefaultCommDevice) {
+        LPWSTR pCommDefId = NULL;
+        if (SUCCEEDED(pDefaultCommDevice->GetId(&pCommDefId)) && pCommDefId) {
+            defaultCommDeviceId = pCommDefId;
+            CoTaskMemFree(pCommDefId);
+        }
+        pDefaultCommDevice->Release();
+    }
+
     IMMDeviceCollection* pCollection = NULL;
     hr = pEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &pCollection);
     pEnumerator->Release();
@@ -1449,6 +1582,9 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
     napi_value jsArray;
     napi_create_array_with_length(env, count, &jsArray);
 
+    static const PROPERTYKEY propKeyContainerId = { { 0x8c7fd20d, 0x61fc, 0x4e4d, { 0xb4, 0xe0, 0xf5, 0x0e, 0x3f, 0xe7, 0x38, 0x37 } }, 2 };
+    static const PROPERTYKEY propKeyFormFactor = { { 0x1da5d803, 0xd492, 0x4edd, { 0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e } }, 0 };
+
     for (UINT i = 0; i < count; i++) {
         IMMDevice* pDevice = NULL;
         if (FAILED(pCollection->Item(i, &pDevice)) || !pDevice) {
@@ -1463,6 +1599,10 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
         }
 
         std::wstring friendlyName = deviceId;
+        std::wstring containerId;
+        std::wstring formFactorStr = L"Unknown";
+        int formFactorVal = -1;
+
         IPropertyStore* pProps = NULL;
         if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
             PROPVARIANT varName;
@@ -1473,10 +1613,54 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
                 }
             }
             PropVariantClear(&varName);
+
+            PROPVARIANT varContainer;
+            PropVariantInit(&varContainer);
+            if (SUCCEEDED(pProps->GetValue(propKeyContainerId, &varContainer))) {
+                if (varContainer.vt == VT_CLSID && varContainer.puuid) {
+                    LPOLESTR lpszGuid = NULL;
+                    if (SUCCEEDED(StringFromCLSID(*varContainer.puuid, &lpszGuid)) && lpszGuid) {
+                        containerId = lpszGuid;
+                        CoTaskMemFree(lpszGuid);
+                    }
+                } else if (varContainer.vt == VT_LPWSTR && varContainer.pwszVal) {
+                    containerId = varContainer.pwszVal;
+                }
+            }
+            PropVariantClear(&varContainer);
+
+            PROPVARIANT varFF;
+            PropVariantInit(&varFF);
+            if (SUCCEEDED(pProps->GetValue(propKeyFormFactor, &varFF))) {
+                if (varFF.vt == VT_UI4) {
+                    formFactorVal = (int)varFF.ulVal;
+                    switch (varFF.ulVal) {
+                        case 1: formFactorStr = L"Speakers"; break;
+                        case 2: formFactorStr = L"LineLevel"; break;
+                        case 3: formFactorStr = L"Headphones"; break;
+                        case 5: formFactorStr = L"Headset"; break;
+                        case 6: formFactorStr = L"Handset"; break;
+                        case 9: formFactorStr = L"DigitalAudioDisplayDevice"; break;
+                        default: formFactorStr = L"Other"; break;
+                    }
+                }
+            }
+            PropVariantClear(&varFF);
+
             pProps->Release();
         }
 
         bool isDefault = (!defaultDeviceId.empty() && defaultDeviceId == deviceId);
+        bool isCommunications = (!defaultCommDeviceId.empty() && defaultCommDeviceId == deviceId) ||
+                                (formFactorVal == 5 || formFactorVal == 6);
+
+        std::wstring lowerName = friendlyName;
+        for (auto& c : lowerName) c = static_cast<wchar_t>(towlower(c));
+        if (lowerName.find(L"hands-free") != std::wstring::npos ||
+            lowerName.find(L"handsfree") != std::wstring::npos ||
+            lowerName.find(L"hfp") != std::wstring::npos) {
+            isCommunications = true;
+        }
 
         int volPercent = 100;
         bool isMuted = false;
@@ -1491,6 +1675,21 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
                 isMuted = (muteVal != FALSE);
             }
             pEpVol->Release();
+        }
+
+        int channels = 2;
+        if (!isCommunications) {
+            IAudioClient* pAudioClientForFormat = NULL;
+            if (SUCCEEDED(pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClientForFormat)) && pAudioClientForFormat) {
+                WAVEFORMATEX* pMix = NULL;
+                if (SUCCEEDED(pAudioClientForFormat->GetMixFormat(&pMix)) && pMix) {
+                    channels = (int)pMix->nChannels;
+                    CoTaskMemFree(pMix);
+                }
+                pAudioClientForFormat->Release();
+            }
+        } else {
+            channels = 1;
         }
 
         napi_value jsDevice;
@@ -1514,6 +1713,20 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
         napi_get_boolean(env, isMuted, &mutePropVal);
         napi_set_named_property(env, jsDevice, "mute", mutePropVal);
 
+        napi_value containerVal = CreateNapiStringFromWide(env, containerId.c_str());
+        napi_set_named_property(env, jsDevice, "containerId", containerVal);
+
+        napi_value formFactorValProp = CreateNapiStringFromWide(env, formFactorStr.c_str());
+        napi_set_named_property(env, jsDevice, "formFactor", formFactorValProp);
+
+        napi_value isCommVal;
+        napi_get_boolean(env, isCommunications, &isCommVal);
+        napi_set_named_property(env, jsDevice, "isCommunications", isCommVal);
+
+        napi_value channelsVal;
+        napi_create_int32(env, channels, &channelsVal);
+        napi_set_named_property(env, jsDevice, "channels", channelsVal);
+
         napi_set_element(env, jsArray, i, jsDevice);
 
         pDevice->Release();
@@ -1521,6 +1734,16 @@ static napi_value Method_ListOutputDevices(napi_env env, napi_callback_info info
 
     pCollection->Release();
     return jsArray;
+}
+
+static bool IsVirtualOrIngressEndpointName(const std::wstring& name) {
+    if (name.empty()) return false;
+    std::wstring lower = name;
+    for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
+    return lower.find(L"voicemeeter") != std::wstring::npos ||
+           lower.find(L"vb-audio") != std::wstring::npos ||
+           lower.find(L"virtual") != std::wstring::npos ||
+           lower.find(L"cable") != std::wstring::npos;
 }
 
 static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info info) {
@@ -1550,9 +1773,23 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
     UINT devCount = 0;
     pCollection->GetCount(&devCount);
 
-    napi_value jsArray;
-    napi_create_array(env, &jsArray);
-    uint32_t streamIndex = 0;
+    struct StreamItem {
+        std::wstring uniqueSessionId;
+        std::wstring sessionIdentifier;
+        DWORD pid = 0;
+        std::wstring appName;
+        AudioSessionState state = AudioSessionStateInactive;
+        bool isActive = false;
+        int volumePercent = 100;
+        bool isMuted = false;
+        std::wstring currentSinkId;
+        std::wstring currentSinkName;
+        std::wstring persistedSinkId;
+        bool isIngress = false;
+    };
+
+    std::vector<StreamItem> gatheredStreams;
+    std::unordered_set<DWORD> pidsWithActiveIngressSession;
 
     for (UINT d = 0; d < devCount; d++) {
         IMMDevice* pDevice = NULL;
@@ -1581,6 +1818,13 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
             pProps->Release();
         }
 
+        if (IsTelephonyOrHandsFreeEndpoint(pDevice, devFriendlyName)) {
+            pDevice->Release();
+            continue;
+        }
+
+        bool devIsIngress = IsVirtualOrIngressEndpointName(devFriendlyName);
+
         IAudioSessionManager2* pSessionManager = NULL;
         hr = pDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, NULL, (void**)&pSessionManager);
         if (SUCCEEDED(hr) && pSessionManager) {
@@ -1606,7 +1850,7 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
 
                         DWORD pid = 0;
                         pSessionControl2->GetProcessId(&pid);
-                        if (pid == 0) {
+                        if (pid == 0 || pid == GetCurrentProcessId()) {
                             pSessionControl2->Release();
                             pSessionControl->Release();
                             continue;
@@ -1667,46 +1911,6 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
                             }
                         }
 
-                        napi_value jsStream;
-                        napi_create_object(env, &jsStream);
-
-                        napi_value idVal = CreateNapiStringFromWide(env, uniqueSessionId.c_str());
-                        napi_set_named_property(env, jsStream, "id", idVal);
-
-                        if (!sessionIdentifier.empty()) {
-                            napi_value sessIdVal = CreateNapiStringFromWide(env, sessionIdentifier.c_str());
-                            napi_set_named_property(env, jsStream, "sessionIdentifier", sessIdVal);
-                        }
-
-                        napi_value pidVal;
-                        napi_create_uint32(env, pid, &pidVal);
-                        napi_set_named_property(env, jsStream, "processId", pidVal);
-
-                        napi_value nameVal = CreateNapiStringFromWide(env, appName.c_str());
-                        napi_set_named_property(env, jsStream, "name", nameVal);
-
-                        napi_value stateVal;
-                        napi_create_int32(env, (int)state, &stateVal);
-                        napi_set_named_property(env, jsStream, "state", stateVal);
-
-                        napi_value isActiveVal;
-                        napi_get_boolean(env, isActive, &isActiveVal);
-                        napi_set_named_property(env, jsStream, "isActive", isActiveVal);
-
-                        napi_value volVal;
-                        napi_create_int32(env, volumePercent, &volVal);
-                        napi_set_named_property(env, jsStream, "volumePercent", volVal);
-
-                        napi_value muteVal;
-                        napi_get_boolean(env, (bool)isMuted, &muteVal);
-                        napi_set_named_property(env, jsStream, "mute", muteVal);
-
-                        napi_value sinkIdVal = CreateNapiStringFromWide(env, deviceId.c_str());
-                        napi_set_named_property(env, jsStream, "currentSinkId", sinkIdVal);
-
-                        napi_value sinkNameVal = CreateNapiStringFromWide(env, devFriendlyName.c_str());
-                        napi_set_named_property(env, jsStream, "currentSinkName", sinkNameVal);
-
                         std::wstring persistedSinkId;
                         if (pPolicyConfig && pid != 0) {
                             void** vtable = *(void***)pPolicyConfig;
@@ -1723,16 +1927,24 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
                             }
                         }
 
-                        if (!persistedSinkId.empty()) {
-                            napi_value persistedSinkVal = CreateNapiStringFromWide(env, persistedSinkId.c_str());
-                            napi_set_named_property(env, jsStream, "persistedSinkId", persistedSinkVal);
-                        } else {
-                            napi_value nullVal;
-                            napi_get_null(env, &nullVal);
-                            napi_set_named_property(env, jsStream, "persistedSinkId", nullVal);
-                        }
+                        StreamItem item;
+                        item.uniqueSessionId = std::move(uniqueSessionId);
+                        item.sessionIdentifier = std::move(sessionIdentifier);
+                        item.pid = pid;
+                        item.appName = std::move(appName);
+                        item.state = state;
+                        item.isActive = isActive;
+                        item.volumePercent = volumePercent;
+                        item.isMuted = (bool)isMuted;
+                        item.currentSinkId = deviceId;
+                        item.currentSinkName = devFriendlyName;
+                        item.persistedSinkId = std::move(persistedSinkId);
+                        item.isIngress = devIsIngress;
 
-                        napi_set_element(env, jsArray, streamIndex++, jsStream);
+                        if (isActive && devIsIngress) {
+                            pidsWithActiveIngressSession.insert(pid);
+                        }
+                        gatheredStreams.push_back(std::move(item));
 
                         pSessionControl2->Release();
                     }
@@ -1751,6 +1963,71 @@ static napi_value Method_ListApplicationStreams(napi_env env, napi_callback_info
     }
 
     pCollection->Release();
+
+    napi_value jsArray;
+    napi_create_array(env, &jsArray);
+    uint32_t streamIndex = 0;
+
+    for (const auto& s : gatheredStreams) {
+        // Phase 2F.1-G Fix 4: If a process has an active session on the routed ingress endpoint,
+        // suppress dormant inactive physical-endpoint sessions for that same PID.
+        if (s.state == AudioSessionStateInactive && !s.isActive && !s.isIngress &&
+            pidsWithActiveIngressSession.count(s.pid) > 0) {
+            continue;
+        }
+
+        napi_value jsStream;
+        napi_create_object(env, &jsStream);
+
+        napi_value idVal = CreateNapiStringFromWide(env, s.uniqueSessionId.c_str());
+        napi_set_named_property(env, jsStream, "id", idVal);
+
+        if (!s.sessionIdentifier.empty()) {
+            napi_value sessIdVal = CreateNapiStringFromWide(env, s.sessionIdentifier.c_str());
+            napi_set_named_property(env, jsStream, "sessionIdentifier", sessIdVal);
+        }
+
+        napi_value pidVal;
+        napi_create_uint32(env, s.pid, &pidVal);
+        napi_set_named_property(env, jsStream, "processId", pidVal);
+
+        napi_value nameVal = CreateNapiStringFromWide(env, s.appName.c_str());
+        napi_set_named_property(env, jsStream, "name", nameVal);
+
+        napi_value stateVal;
+        napi_create_int32(env, (int)s.state, &stateVal);
+        napi_set_named_property(env, jsStream, "state", stateVal);
+
+        napi_value isActiveVal;
+        napi_get_boolean(env, s.isActive, &isActiveVal);
+        napi_set_named_property(env, jsStream, "isActive", isActiveVal);
+
+        napi_value volVal;
+        napi_create_int32(env, s.volumePercent, &volVal);
+        napi_set_named_property(env, jsStream, "volumePercent", volVal);
+
+        napi_value muteVal;
+        napi_get_boolean(env, s.isMuted, &muteVal);
+        napi_set_named_property(env, jsStream, "mute", muteVal);
+
+        napi_value sinkIdVal = CreateNapiStringFromWide(env, s.currentSinkId.c_str());
+        napi_set_named_property(env, jsStream, "currentSinkId", sinkIdVal);
+
+        napi_value sinkNameVal = CreateNapiStringFromWide(env, s.currentSinkName.c_str());
+        napi_set_named_property(env, jsStream, "currentSinkName", sinkNameVal);
+
+        if (!s.persistedSinkId.empty()) {
+            napi_value persistedSinkVal = CreateNapiStringFromWide(env, s.persistedSinkId.c_str());
+            napi_set_named_property(env, jsStream, "persistedSinkId", persistedSinkVal);
+        } else {
+            napi_value nullVal;
+            napi_get_null(env, &nullVal);
+            napi_set_named_property(env, jsStream, "persistedSinkId", nullVal);
+        }
+
+        napi_set_element(env, jsArray, streamIndex++, jsStream);
+    }
+
     return jsArray;
 }
 

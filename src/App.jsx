@@ -150,7 +150,8 @@ function App() {
         }
       }
       setSelectedEngineSinkIds((current) => {
-        const availableIds = new Set((nextStatus?.outputs || []).map((o) => o.id));
+        const availableOutputs = nextStatus?.outputs || [];
+        const availableIds = new Set(availableOutputs.map((o) => o.id));
         const persistentBranchSinkIds = new Set(
           (nextStatus?.session?.branches || [])
             .filter((b) => {
@@ -170,8 +171,16 @@ function App() {
         const filtered = new Set(
           [...current].filter((id) => availableIds.has(id) || persistentBranchSinkIds.has(id))
         );
-        if (filtered.size === 0 && (nextStatus?.outputs || []).length > 0) {
-          return new Set(nextStatus.outputs.map((o) => o.id));
+        if (filtered.size === 0 && availableOutputs.length > 0) {
+          // Prefer primary stereo outputs by default; do NOT automatically select Hands-Free / telephony endpoints
+          const primaryOutputs = availableOutputs.filter((o) => {
+            const isComm = Boolean(o.isCommunications);
+            const name = (o.name || o.id || '').toLowerCase();
+            const isHfp = name.includes('hands-free') || name.includes('handsfree') || name.includes('hfp');
+            return !isComm && !isHfp;
+          });
+          const targets = primaryOutputs.length > 0 ? primaryOutputs : availableOutputs;
+          return new Set(targets.map((o) => o.id));
         }
         return filtered;
       });
@@ -213,25 +222,53 @@ function App() {
     } catch {}
   }, []);
 
-  // Main 5-second polling loop
-  useEffect(() => {
-    refreshDevices();
-    refreshStreams();
-    refreshEngineStatus();
-    const refreshInterval = window.setInterval(() => {
-      refreshDevices();
-      refreshStreams();
-      refreshEngineStatus();
-    }, 5000);
-    return () => window.clearInterval(refreshInterval);
+  // Phase 2F.1-F (PART 8): Coalesce renderer refreshes to eliminate React state thrashing and scroll freezing
+  const pendingRefreshFlagsRef = useRef({
+    devices: false,
+    streams: false,
+    engineStatus: false
+  });
+  const refreshScheduledRef = useRef(false);
+
+  const scheduleRendererRefresh = useCallback(({ devices = false, streams = false, engineStatus = false } = {}) => {
+    if (devices) pendingRefreshFlagsRef.current.devices = true;
+    if (streams) pendingRefreshFlagsRef.current.streams = true;
+    if (engineStatus) pendingRefreshFlagsRef.current.engineStatus = true;
+
+    if (refreshScheduledRef.current) return;
+    refreshScheduledRef.current = true;
+
+    window.setTimeout(async () => {
+      refreshScheduledRef.current = false;
+      const flags = { ...pendingRefreshFlagsRef.current };
+      pendingRefreshFlagsRef.current = { devices: false, streams: false, engineStatus: false };
+
+      const tasks = [];
+      if (flags.devices) tasks.push(refreshDevices());
+      if (flags.streams) tasks.push(refreshStreams());
+      if (flags.engineStatus) tasks.push(refreshEngineStatus());
+
+      if (tasks.length > 0) {
+        await Promise.allSettled(tasks);
+      }
+    }, 50);
   }, [refreshDevices, refreshStreams, refreshEngineStatus]);
 
-  // Faster UI meter refresh (100ms) ONLY when wave/spatial engine is active
+  // Main 5-second polling loop
+  useEffect(() => {
+    scheduleRendererRefresh({ devices: true, streams: true, engineStatus: true });
+    const refreshInterval = window.setInterval(() => {
+      scheduleRendererRefresh({ devices: true, streams: true, engineStatus: true });
+    }, 5000);
+    return () => window.clearInterval(refreshInterval);
+  }, [scheduleRendererRefresh]);
+
+  // Smoother UI meter refresh (250ms) ONLY when wave/spatial engine is active with JSON dedup
   useEffect(() => {
     if (!waveStatus?.enabled || !engineStatus?.session?.active) return;
     const waveInterval = window.setInterval(() => {
       refreshWaveStatus();
-    }, 100);
+    }, 250);
     return () => window.clearInterval(waveInterval);
   }, [waveStatus?.enabled, engineStatus?.session?.active, refreshWaveStatus]);
 
@@ -247,16 +284,16 @@ function App() {
     });
     const unsubMaster = window.speakerFlow?.onMasterVolumeUpdated?.(({ masterVolume, masterMuted }) => {
       setWaveStatus((prev) => prev ? { ...prev, masterVolume, masterMuted } : prev);
-      refreshEngineStatus();
+      scheduleRendererRefresh({ engineStatus: true });
     });
     const unsubDevices = window.speakerFlow?.onDevicesUpdated?.(() => {
-      refreshDevices();
+      scheduleRendererRefresh({ devices: true });
     });
     const unsubStreams = window.speakerFlow?.onStreamsUpdated?.(() => {
-      refreshStreams();
+      scheduleRendererRefresh({ streams: true });
     });
     const unsubEngineStatus = window.speakerFlow?.onEngineStatusUpdated?.(() => {
-      refreshEngineStatus();
+      scheduleRendererRefresh({ engineStatus: true });
     });
 
     return () => {
@@ -270,7 +307,20 @@ function App() {
       if (typeof unsubStreams === 'function') unsubStreams();
       if (typeof unsubEngineStatus === 'function') unsubEngineStatus();
     };
-  }, [refreshDevices, refreshStreams, refreshEngineStatus]);
+  }, [scheduleRendererRefresh]);
+
+  // Phase 2F.1-E: Window-level pointer cleanup ensuring SVG room dragging never sticks
+  useEffect(() => {
+    function handleGlobalPointerEnd() {
+      setDraggingTarget(null);
+    }
+    window.addEventListener('pointerup', handleGlobalPointerEnd);
+    window.addEventListener('pointercancel', handleGlobalPointerEnd);
+    return () => {
+      window.removeEventListener('pointerup', handleGlobalPointerEnd);
+      window.removeEventListener('pointercancel', handleGlobalPointerEnd);
+    };
+  }, []);
 
   const selectedStream = useMemo(
     () => streams.find((stream) => stream.id === selectedStreamId) || null,
@@ -809,7 +859,7 @@ function App() {
           )}
           <button
             className="button secondary refresh-hero-btn"
-            onClick={() => { refreshDevices(); refreshStreams(); refreshEngineStatus(); }}
+            onClick={() => { scheduleRendererRefresh({ devices: true, streams: true, engineStatus: true }); }}
             disabled={loadingDevices || loadingStreams}
             title="Refresh PipeWire state"
           >
@@ -867,6 +917,7 @@ function App() {
                     handleMasterMuteToggle();
                   }
                 }}
+                onPointerUp={(e) => e.currentTarget.blur()}
               />
               <span className={`vol-badge ${waveStatus.masterMuted ? 'muted' : ''} ${!engineActive ? 'disabled' : ''}`}>
                 {waveStatus.masterMuted
@@ -1045,6 +1096,7 @@ function App() {
                         max="100"
                         value={stream.mute ? 0 : (stream.volumePercent ?? 100)}
                         onChange={(e) => handleStreamVolumeChange(stream.id, parseInt(e.target.value, 10))}
+                        onPointerUp={(e) => e.currentTarget.blur()}
                       />
                       <span className={`vol-badge ${stream.mute ? 'muted' : ''}`}>
                         {stream.mute ? '0% (Muted)' : `${stream.volumePercent ?? 100}%`}
@@ -1197,6 +1249,7 @@ function App() {
                             value={spkMuted ? 0 : userVol}
                             onChange={(e) => handleSpeakerVolumeChange(sink.id, parseInt(e.target.value, 10))}
                             disabled={!isBranchActive}
+                            onPointerUp={(e) => e.currentTarget.blur()}
                           />
                           <span className={`vol-badge ${spkMuted ? 'muted' : ''}`}>
                             {spkMuted ? '0% (Muted)' : `${userVol}%`}
@@ -1229,6 +1282,7 @@ function App() {
                             max="100"
                             value={sink.mute ? 0 : (sink.volumePercent ?? 100)}
                             onChange={(e) => handleSpeakerVolumeChange(sink.id, parseInt(e.target.value, 10))}
+                            onPointerUp={(e) => e.currentTarget.blur()}
                           />
                           <span className={`vol-badge ${sink.mute ? 'muted' : ''}`}>
                             {sink.mute ? '0% (Muted)' : `${sink.volumePercent ?? 100}%`}
@@ -1261,7 +1315,10 @@ function App() {
                           step="1"
                           value={deviceDelays[sink.id] ?? 0}
                           onChange={(e) => handleAcousticDelayChange(sink.id, e.target.value)}
-                          onPointerUp={() => handleAcousticDelayCommit(sink.id)}
+                          onPointerUp={(e) => {
+                            handleAcousticDelayCommit(sink.id);
+                            e.currentTarget.blur();
+                          }}
                           onKeyUp={() => handleAcousticDelayCommit(sink.id)}
                           disabled={engineActive && !isBranchActive}
                           title={`Acoustic compensation delay for ${sink.name}`}
@@ -2325,7 +2382,7 @@ function App() {
             <div className="engine-speakers-header">
               <h3>Target Physical Outputs</h3>
               <span className="count">
-                {selectedEngineSinkIds.size} of {engineStatus?.outputs?.length || 0} selected
+                {(engineStatus?.outputs || []).filter((o) => selectedEngineSinkIds.has(o.id)).length} of {engineStatus?.outputs?.length || 0} selected
               </span>
             </div>
 

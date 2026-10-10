@@ -53,17 +53,26 @@ bool WasapiFanOutEngine::StartCapture(const std::wstring& targetDeviceId, std::s
 }
 
 void WasapiFanOutEngine::StopCapture() {
-    std::lock_guard<std::mutex> lock(m_engineMutex);
-
-    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
-        if (m_branches[i]) {
-            m_captureClient.SetBranchBuffer(i, nullptr);
-            m_branches[i]->active.store(false, std::memory_order_release);
-            m_branches[i]->renderClient->StopRender();
-            m_branches[i].reset();
+    std::vector<std::shared_ptr<WasapiRenderClient>> clientsToStop;
+    {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i]) {
+                m_branches[i]->active.store(false, std::memory_order_release);
+                if (m_branches[i]->renderClient) {
+                    clientsToStop.push_back(m_branches[i]->renderClient);
+                }
+                m_branches[i].reset();
+            }
         }
     }
 
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        m_captureClient.DetachBranchBufferSync(i);
+    }
+    for (auto& client : clientsToStop) {
+        client->StopRender();
+    }
     m_captureClient.StopCapture();
 }
 
@@ -131,7 +140,7 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
 
     // Check for duplicate endpointId across active branches
     for (size_t i = 0; i < MAX_BRANCHES; ++i) {
-        if (m_branches[i] && m_branches[i]->endpointId == endpointId) {
+        if (m_branches[i] && EndpointIdsMatch(m_branches[i]->endpointId, endpointId)) {
             outError = "Output endpoint is already in use by branch '" + m_branches[i]->branchId + "'.";
             m_lastError = outError;
             return false;
@@ -212,21 +221,27 @@ bool WasapiFanOutEngine::AddOutput(const std::string& branchId,
 }
 
 bool WasapiFanOutEngine::RemoveOutput(const std::string& branchId) {
-    std::lock_guard<std::mutex> lock(m_engineMutex);
-
-    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
-        if (m_branches[i] && m_branches[i]->branchId == branchId) {
-            // 1. Synchronously detach capture distribution and wait for any in-flight write to complete
-            m_captureClient.DetachBranchBufferSync(i);
-            m_branches[i]->active.store(false, std::memory_order_release);
-
-            // 2. Stop render client and join its worker thread
-            m_branches[i]->renderClient->StopRender();
-
-            // 3. Release branch memory
-            m_branches[i].reset();
-            return true;
+    std::shared_ptr<WasapiRenderClient> clientToStop;
+    size_t detachedSlot = MAX_BRANCHES;
+    {
+        std::lock_guard<std::mutex> lock(m_engineMutex);
+        for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+            if (m_branches[i] && m_branches[i]->branchId == branchId) {
+                detachedSlot = i;
+                m_branches[i]->active.store(false, std::memory_order_release);
+                clientToStop = m_branches[i]->renderClient;
+                m_branches[i].reset();
+                break;
+            }
         }
+    }
+
+    if (detachedSlot < MAX_BRANCHES) {
+        m_captureClient.DetachBranchBufferSync(detachedSlot);
+        if (clientToStop) {
+            clientToStop->StopRender();
+        }
+        return true;
     }
 
     return false;
@@ -511,14 +526,14 @@ WasapiFanOutEngineStatus WasapiFanOutEngine::GetStatus() const {
 }
 
 void WasapiFanOutEngine::Shutdown() {
-    StopCapture();
-
     if (!m_stopRecoveryThread.exchange(true)) {
         m_recoveryCv.notify_all();
         if (m_recoveryThread.joinable()) {
             m_recoveryThread.join();
         }
     }
+
+    StopCapture();
 }
 
 void WasapiFanOutEngine::OnDeviceStateChanged(const std::wstring& deviceId, DWORD newState) {
@@ -534,8 +549,11 @@ void WasapiFanOutEngine::OnDeviceStateChanged(const std::wstring& deviceId, DWOR
 
                     if (newState == DEVICE_STATE_ACTIVE) {
                         RenderLifecycleState st = m_branches[i]->renderClient->GetLifecycleState();
-                        // Phase 2F.1-I FIX 2: Reset exhausted recovery attempts when device returns
+                        // Reset exhausted recovery attempts when device returns
                         m_branches[i]->recoveryAttempts.store(0, std::memory_order_relaxed);
+                        if (m_branches[i]->renderClient) {
+                            m_branches[i]->renderClient->ResetRecoveryAttempts();
+                        }
 
                         // Duplicate suppression & flurry extension: if recovery is already scheduled and waiting for settling delay, push forward
                         if (st == RenderLifecycleState::RecoveryPending && m_branches[i]->nextRetryTime > now) {
@@ -578,8 +596,11 @@ void WasapiFanOutEngine::OnDeviceAdded(const std::wstring& deviceId) {
                     m_branches[i]->lastKnownDeviceState = DEVICE_STATE_ACTIVE;
 
                     RenderLifecycleState st = m_branches[i]->renderClient->GetLifecycleState();
-                    // Phase 2F.1-I FIX 2: Reset exhausted recovery attempts when device returns
+                    // Reset exhausted recovery attempts when device returns
                     m_branches[i]->recoveryAttempts.store(0, std::memory_order_relaxed);
+                    if (m_branches[i]->renderClient) {
+                        m_branches[i]->renderClient->ResetRecoveryAttempts();
+                    }
 
                     // Duplicate suppression & flurry extension: if recovery is already scheduled and waiting for settling delay, push forward
                     if (st == RenderLifecycleState::RecoveryPending && m_branches[i]->nextRetryTime > now) {
@@ -637,11 +658,12 @@ bool WasapiFanOutEngine::TriggerBranchRecovery(const std::string& branchId, bool
                     break;
                 }
 
-                // Phase 2F.1-I FIX 2: If currently in WaitingForDevice or retries were exhausted, reset budget on re-arm
-                if (current == RenderLifecycleState::WaitingForDevice ||
-                    m_branches[i]->recoveryAttempts.load(std::memory_order_relaxed) >= 5) {
-                    m_branches[i]->recoveryAttempts.store(0, std::memory_order_relaxed);
+                // Reset recovery attempts budget on re-arm
+                m_branches[i]->recoveryAttempts.store(0, std::memory_order_relaxed);
+                if (m_branches[i]->renderClient) {
+                    m_branches[i]->renderClient->ResetRecoveryAttempts();
                 }
+                m_branches[i]->lastKnownDeviceState = DEVICE_STATE_ACTIVE;
 
                 // Phase 2F.1-H Fix 3: If forceImmediate is false (automatic JS reconciliation) and
                 // a settling delay is already active in the future, preserve nextRetryTime!
@@ -686,6 +708,13 @@ void WasapiFanOutEngine::OnRenderClientDeviceLost(WasapiRenderClient* pClient) {
         for (size_t i = 0; i < MAX_BRANCHES; ++i) {
             if (m_branches[i] && m_branches[i]->renderClient.get() == pClient &&
                 m_branches[i]->active.load(std::memory_order_relaxed)) {
+
+                RenderLifecycleState current = m_branches[i]->renderClient->GetLifecycleState();
+                if (current == RenderLifecycleState::Running) {
+                    // Branch has already been recovered and is actively running; do not detach or disturb it
+                    break;
+                }
+
                 // Detach capture buffer immediately so capture thread does not pump samples to lost endpoint
                 m_captureClient.DetachBranchBufferSync(i);
                 if (m_branches[i]->renderClient->ScheduleRecovery()) {
@@ -732,6 +761,10 @@ void WasapiFanOutEngine::RecoveryThreadProc() {
             for (size_t i = 0; i < MAX_BRANCHES; ++i) {
                 if (m_branches[i] && m_branches[i]->active.load(std::memory_order_acquire)) {
                     RenderLifecycleState st = m_branches[i]->renderClient->GetLifecycleState();
+                    if (st == RenderLifecycleState::Running && m_branches[i]->ringBuffer &&
+                        m_captureClient.GetBranchBuffer(i) == nullptr) {
+                        m_captureClient.SetBranchBuffer(i, m_branches[i]->ringBuffer.get());
+                    }
                     if (st == RenderLifecycleState::DeviceLost) {
                         m_branches[i]->renderClient->ScheduleRecovery();
                         st = RenderLifecycleState::RecoveryPending;
@@ -803,9 +836,25 @@ void WasapiFanOutEngine::RecoverBranchIfDue(size_t slotIndex, const std::chrono:
                 return;
             }
         }
-        // If last known device state was not ACTIVE (e.g. UNPLUGGED), defer recovery until device arrival
+        // If last known device state was not ACTIVE (e.g. UNPLUGGED), verify whether device has actually become ACTIVE
         if (m_branches[slotIndex]->lastKnownDeviceState != DEVICE_STATE_ACTIVE) {
-            return;
+            IMMDeviceEnumerator* pEnum = nullptr;
+            if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+                                           __uuidof(IMMDeviceEnumerator), (void**)&pEnum)) && pEnum) {
+                IMMDevice* pDev = nullptr;
+                if (SUCCEEDED(pEnum->GetDevice(m_branches[slotIndex]->endpointId.c_str(), &pDev)) && pDev) {
+                    DWORD dState = 0;
+                    if (SUCCEEDED(pDev->GetState(&dState)) && dState == DEVICE_STATE_ACTIVE) {
+                        m_branches[slotIndex]->lastKnownDeviceState = DEVICE_STATE_ACTIVE;
+                    }
+                    pDev->Release();
+                }
+                pEnum->Release();
+            }
+            if (m_branches[slotIndex]->lastKnownDeviceState != DEVICE_STATE_ACTIVE) {
+                m_branches[slotIndex]->nextRetryTime = now + std::chrono::milliseconds(2000);
+                return;
+            }
         }
         pClient = m_branches[slotIndex]->renderClient;
         branchId = m_branches[slotIndex]->branchId;

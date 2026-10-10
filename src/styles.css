@@ -11,8 +11,16 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  background-color: #0d121d;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
   background: radial-gradient(circle at 50% 0%, #172138 0%, #0d121d 60%);
-  background-attachment: fixed;
+  z-index: -1;
+  pointer-events: none;
 }
 
 button, input { font: inherit; }
@@ -187,10 +195,12 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
 .branch-indicator { font-weight: 900; font-size: 1.1rem; color: #55d688; }
 .branch-disconnected .branch-indicator { color: #ffbe53; }
 .branch-failed .branch-indicator { color: #ff7584; }
+.branch-waiting .branch-indicator { color: #38bdf8; }
 .branch-info { display: grid; gap: 3px; flex: 1; min-width: 0; }
 .branch-name { font-weight: 700; color: #f0f4ff; font-size: 0.92rem; }
 .branch-target { font-family: ui-monospace, monospace; font-size: 0.75rem; color: #8fa4cb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .branch-error { font-size: 0.78rem; color: #ff9b9b; }
+.branch-waiting-hint { font-size: 0.78rem; color: #7dd3fc; font-style: italic; }
 
 /* Phase 6 Spatial Wave Engine Styling */
 .wave-body { padding: 4px 0 0; }
@@ -497,7 +507,7 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
   width: min(100%, 360px);
   height: auto;
   user-select: none;
-  touch-action: none;
+  touch-action: pan-y;
 }
 .room-boundary {
   fill: #0c1220;
@@ -831,6 +841,7 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
   border-bottom: 1px solid #25334c;
   padding-bottom: 8px;
   overflow-x: auto;
+  overscroll-behavior-x: contain;
 }
 .nav-tab-btn {
   display: flex;
@@ -909,6 +920,10 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
 .pavu-card.card-disconnected {
   border-color: #522d34;
   opacity: 0.75;
+}
+.pavu-card.card-waiting {
+  border-color: #0284c7;
+  background: linear-gradient(180deg, #0f2438 0%, #101926 100%);
 }
 
 .engine-stream-picker-wrap {
@@ -1004,6 +1019,11 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
   color: #f5c2c7;
   border: 1px solid #6b333c;
 }
+.status-pill.waiting {
+  background: #0c334d;
+  color: #7dd3fc;
+  border: 1px solid #0284c7;
+}
 .badge-engine {
   background: #1e3352;
   color: #8ab4ff;
@@ -1013,6 +1033,24 @@ h4 { font-size: 0.92rem; margin-bottom: 8px; color: #a9b4ca; text-transform: upp
   background: #4a3615;
   color: #ffdca8;
   border: 1px solid #755520;
+}
+.badge-waiting {
+  background: #0c334d;
+  color: #7dd3fc;
+  border: 1px solid #0284c7;
+  animation: pulse-glow 2s infinite ease-in-out;
+}
+.btn-reconnect-now {
+  background: #0284c7 !important;
+  color: #ffffff !important;
+  border-color: #38bdf8 !important;
+}
+.btn-reconnect-now:hover {
+  background: #0369a1 !important;
+}
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
 }
 
 /* Output Destination Selector */
