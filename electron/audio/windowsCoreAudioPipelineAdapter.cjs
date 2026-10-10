@@ -2,13 +2,104 @@ const { AudioPipelineAdapter, AudioPipelineSession } = require('./audioPipelineA
 const { getNativeBinding } = require('./windowsCoreAudioBackend.cjs');
 
 class WindowsCoreAudioPipelineSession extends AudioPipelineSession {
-  constructor({ sessionId, ingressSinkId, tapSourceId, audioBackend, native, targetStream }) {
+  constructor({
+    sessionId,
+    ingressSinkId,
+    tapSourceId,
+    audioBackend,
+    native,
+    targetStream,
+    captureMode = 'endpoint',
+    isNativeProcessLoopback = false,
+    targetProcessId = null,
+    captureInfo = null
+  }) {
     super(sessionId, ingressSinkId, tapSourceId);
     this.audioBackend = audioBackend;
     this.native = native;
     this.targetStream = targetStream || null;
+    this.captureMode = captureMode;
+    this.isNativeProcessLoopback = Boolean(isNativeProcessLoopback);
+    this.targetProcessId = targetProcessId;
+    this.captureInfo = captureInfo;
     this.branches = new Map(); // branchSinkId -> { handle, physicalSinkId, branchSinkId }
     this.destroyed = false;
+  }
+
+  async switchProcess(targetPid) {
+    if (this.destroyed) {
+      throw new Error('Cannot switch target process on a destroyed pipeline session.');
+    }
+    if (!this.isNativeProcessLoopback) {
+      throw new Error('switchProcess is only supported on native process loopback sessions.');
+    }
+    const pid = Number(targetPid);
+    if (!Number.isInteger(pid) || pid <= 0 || typeof this.native.engineStartProcessCapture !== 'function') {
+      throw new Error(`Invalid process ID (${targetPid}) for process loopback capture.`);
+    }
+
+    // 1. Snapshot existing branch configurations before native capture restart resets C++ branches
+    const branchSnapshots = Array.from(this.branches.values()).map((b) => ({
+      branchSinkId: b.branchSinkId,
+      physicalSinkId: b.physicalSinkId,
+      delayMs: b.delayMs ?? 0,
+      volume: typeof this.getBranchVolume === 'function' ? this.getBranchVolume(b.branchSinkId) : 1.0,
+      muted: typeof this.isBranchMuted === 'function' ? this.isBranchMuted(b.branchSinkId) : false
+    }));
+
+    // 2. Perform process capture switch
+    let refDevId = this.ingressSinkId || '';
+    if (refDevId === 'process-loopback') refDevId = '';
+
+    let res = null;
+    try {
+      res = this.native.engineStartProcessCapture(pid, refDevId);
+      if (!res || !res.success) {
+        throw new Error(`engineStartProcessCapture returned an unsuccessful result for PID ${pid}`);
+      }
+    } catch (err) {
+      // Native StartProcessCapture resets all branches in C++ on restart attempt.
+      // Clear this.branches so Electron never refers to destroyed native branches.
+      this.branches.clear();
+      this.targetProcessId = null;
+      throw new Error(`Failed to switch process capture to PID ${pid}: ${err.message}`);
+    }
+
+    // Native capture started for the new PID
+    this.targetProcessId = pid;
+    this.captureInfo = res;
+
+    // 3. Reconstruct all output branches against the new capture stream
+    this.branches.clear();
+    let reconstructedCount = 0;
+    const branchErrors = [];
+
+    for (const snap of branchSnapshots) {
+      try {
+        const handle = await this.createBranch({
+          branchSinkId: snap.branchSinkId,
+          physicalSinkId: snap.physicalSinkId,
+          delayMs: snap.delayMs
+        });
+        if (typeof this.setBranchVolume === 'function') {
+          this.setBranchVolume(snap.branchSinkId, snap.volume);
+        }
+        if (typeof this.setBranchMute === 'function') {
+          this.setBranchMute(snap.branchSinkId, snap.muted);
+        }
+        reconstructedCount++;
+      } catch (branchErr) {
+        branchErrors.push(`Branch ${snap.branchSinkId} (${snap.physicalSinkId}): ${branchErr.message}`);
+      }
+    }
+
+    if (branchSnapshots.length > 0 && reconstructedCount === 0) {
+      throw new Error(
+        `Switched capture to PID ${pid}, but all output branches failed to reinitialize: ${branchErrors.join('; ')}`
+      );
+    }
+
+    return res;
   }
 
   async createBranch({ branchSinkId, physicalSinkId, delayMs = 0, onError, onDisconnect }) {
@@ -184,7 +275,13 @@ class WindowsCoreAudioPipelineSession extends AudioPipelineSession {
       return null;
     }
     try {
-      return this.native.engineGetStatus();
+      const status = this.native.engineGetStatus();
+      if (status) {
+        status.captureMode = this.captureMode;
+        status.isNativeProcessLoopback = this.isNativeProcessLoopback;
+        status.targetProcessId = this.targetProcessId;
+      }
+      return status;
     } catch {
       return null;
     }
@@ -241,7 +338,73 @@ class WindowsCoreAudioPipelineAdapter extends AudioPipelineAdapter {
       native.init();
     }
 
-    // Query available audio endpoints
+    // Determine target process ID for Phase 2G native process-loopback capture.
+    // Strictly validate PID: must be a positive integer from stream.processId or an explicit numeric PID streamId.
+    let targetPid = null;
+    if (stream && typeof stream.processId === 'number' && Number.isInteger(stream.processId) && stream.processId > 0) {
+      targetPid = stream.processId;
+    } else if (!stream && typeof streamId === 'number' && Number.isInteger(streamId) && streamId > 0) {
+      targetPid = streamId;
+    } else if (!stream && typeof streamId === 'string' && /^\d+$/.test(streamId.trim())) {
+      const parsed = Number(streamId.trim());
+      if (Number.isInteger(parsed) && parsed > 0) {
+        targetPid = parsed;
+      }
+    }
+
+    let nativeCaptureAttempted = false;
+    let nativeCaptureError = null;
+
+    if (targetPid && typeof native.engineStartProcessCapture === 'function') {
+      nativeCaptureAttempted = true;
+      let referenceDeviceId = '';
+      try {
+        referenceDeviceId = (await this.audioBackend.getDefaultOutputId().catch(() => '')) || '';
+      } catch {}
+
+      try {
+        const captureInfo = native.engineStartProcessCapture(targetPid, referenceDeviceId);
+        if (captureInfo && captureInfo.success) {
+          return new WindowsCoreAudioPipelineSession({
+            sessionId,
+            ingressSinkId: referenceDeviceId || 'process-loopback',
+            tapSourceId: tapSourceId || referenceDeviceId || 'process-loopback',
+            audioBackend: this.audioBackend,
+            native,
+            targetStream: stream,
+            captureMode: 'process',
+            isNativeProcessLoopback: true,
+            targetProcessId: targetPid,
+            captureInfo
+          });
+        }
+        nativeCaptureError = new Error('engineStartProcessCapture returned an unsuccessful result.');
+      } catch (err) {
+        nativeCaptureError = err;
+      }
+
+      // If native process capture failed, clean up partial native resources before attempting virtual cable fallback
+      try {
+        native.engineStopCapture();
+        if (typeof native.engineIsCaptureActive === 'function' && native.engineIsCaptureActive()) {
+          throw new Error('WASAPI engine capture remained active after stop request.');
+        }
+      } catch (cleanupErr) {
+        const fatalErr = new Error(
+          `Native process capture failed (${nativeCaptureError?.message || 'unknown error'}), ` +
+          `and partial native resources could not be cleaned up: ${cleanupErr.message}`
+        );
+        if (typeof onIngressError === 'function') onIngressError(fatalErr);
+        throw fatalErr;
+      }
+
+      console.warn(
+        `[WindowsCoreAudioPipelineAdapter] Native process capture unavailable or failed for PID ${targetPid} ` +
+        `(${nativeCaptureError?.message || 'unknown error'}). Falling back to virtual-cable pipeline.`
+      );
+    }
+
+    // Fallback: Query available audio endpoints for virtual-cable ingress
     const devices = await this.audioBackend.listOutputDevices();
 
     // Look for an isolated virtual ingress endpoint to eliminate acoustic/digital feedback loops
@@ -253,10 +416,13 @@ class WindowsCoreAudioPipelineAdapter extends AudioPipelineAdapter {
       devices.find((d) => /voicemeeter|vb-audio|virtual|cable/i.test(d.name));
 
     if (!virtualDevice) {
-      const err = new Error(
+      const baseMsg =
         'No virtual audio loopback endpoint (such as VB-Audio Voicemeeter or Virtual Audio Cable) was found. ' +
-        'An isolated virtual ingress endpoint is required on Windows for feedback-free multi-speaker routing.'
-      );
+        'An isolated virtual ingress endpoint is required on Windows for feedback-free multi-speaker routing.';
+      const errMsg = nativeCaptureAttempted && nativeCaptureError
+        ? `Native process capture failed (${nativeCaptureError.message}), and virtual-cable fallback was unavailable: ${baseMsg}`
+        : baseMsg;
+      const err = new Error(errMsg);
       if (typeof onIngressError === 'function') onIngressError(err);
       throw err;
     }
@@ -284,7 +450,11 @@ class WindowsCoreAudioPipelineAdapter extends AudioPipelineAdapter {
       tapSourceId: tapSourceId || effectiveIngressId,
       audioBackend: this.audioBackend,
       native,
-      targetStream: stream
+      targetStream: stream,
+      captureMode: 'endpoint',
+      isNativeProcessLoopback: false,
+      targetProcessId: null,
+      captureInfo
     });
   }
 }

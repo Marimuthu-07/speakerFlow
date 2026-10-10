@@ -2939,6 +2939,106 @@ static napi_value Method_EngineStartCapture(napi_env env, napi_callback_info inf
     return resObj;
 }
 
+static napi_value Method_EngineStartProcessCapture(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = { nullptr, nullptr };
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+
+    DWORD targetPid = 0;
+    std::wstring referenceDeviceId;
+
+    if (argc > 0 && args[0] != nullptr) {
+        napi_valuetype argType;
+        napi_typeof(env, args[0], &argType);
+        if (argType == napi_number) {
+            uint32_t pidVal = 0;
+            napi_get_value_uint32(env, args[0], &pidVal);
+            targetPid = pidVal;
+        } else if (argType == napi_object) {
+            napi_value pidVal;
+            if (napi_get_named_property(env, args[0], "processId", &pidVal) == napi_ok ||
+                napi_get_named_property(env, args[0], "targetPid", &pidVal) == napi_ok) {
+                napi_valuetype pType;
+                napi_typeof(env, pidVal, &pType);
+                if (pType == napi_number) {
+                    uint32_t p = 0;
+                    napi_get_value_uint32(env, pidVal, &p);
+                    targetPid = p;
+                }
+            }
+            napi_value refDevVal;
+            if (napi_get_named_property(env, args[0], "referenceDeviceId", &refDevVal) == napi_ok ||
+                napi_get_named_property(env, args[0], "deviceId", &refDevVal) == napi_ok) {
+                napi_valuetype rType;
+                napi_typeof(env, refDevVal, &rType);
+                if (rType == napi_string) {
+                    referenceDeviceId = GetWideStringFromNapi(env, refDevVal);
+                }
+            }
+        }
+    }
+
+    if (argc > 1 && args[1] != nullptr && referenceDeviceId.empty()) {
+        napi_valuetype arg1Type;
+        napi_typeof(env, args[1], &arg1Type);
+        if (arg1Type == napi_string) {
+            referenceDeviceId = GetWideStringFromNapi(env, args[1]);
+        }
+    }
+
+    if (targetPid == 0) {
+        napi_throw_error(env, NULL, "processId (targetPid) is required and must be non-zero for engineStartProcessCapture.");
+        return NULL;
+    }
+
+    std::lock_guard<std::mutex> lock(g_fanoutMutex);
+    if (!g_fanoutEngine) {
+        g_fanoutEngine = std::make_unique<speakerflow::WasapiFanOutEngine>();
+    }
+
+    std::string error;
+    bool success = g_fanoutEngine->StartProcessCapture(targetPid, referenceDeviceId, error);
+    if (!success) {
+        napi_throw_error(env, NULL, error.c_str());
+        return NULL;
+    }
+
+    speakerflow::WasapiCaptureStats stats = g_fanoutEngine->GetCaptureStats();
+
+    napi_value resObj;
+    napi_create_object(env, &resObj);
+
+    napi_value boolVal;
+    napi_get_boolean(env, true, &boolVal);
+    napi_set_named_property(env, resObj, "success", boolVal);
+
+    napi_value srVal, chVal, bpsVal, pidVal;
+    napi_create_uint32(env, stats.sampleRate, &srVal);
+    napi_create_uint32(env, stats.channels, &chVal);
+    napi_create_uint32(env, stats.bitsPerSample, &bpsVal);
+    napi_create_uint32(env, stats.targetProcessId, &pidVal);
+    napi_set_named_property(env, resObj, "sampleRate", srVal);
+    napi_set_named_property(env, resObj, "channels", chVal);
+    napi_set_named_property(env, resObj, "bitsPerSample", bpsVal);
+    napi_set_named_property(env, resObj, "targetProcessId", pidVal);
+
+    napi_value modeVal, fmtVal, nameVal, devIdVal;
+    napi_create_string_utf8(env, "process", NAPI_AUTO_LENGTH, &modeVal);
+    napi_create_string_utf8(env, stats.formatTag.c_str(), NAPI_AUTO_LENGTH, &fmtVal);
+    napi_create_string_utf8(env, stats.deviceFriendlyName.c_str(), NAPI_AUTO_LENGTH, &nameVal);
+    napi_create_string_utf8(env, stats.deviceId.c_str(), NAPI_AUTO_LENGTH, &devIdVal);
+    napi_set_named_property(env, resObj, "captureMode", modeVal);
+    napi_set_named_property(env, resObj, "format", fmtVal);
+    napi_set_named_property(env, resObj, "deviceFriendlyName", nameVal);
+    napi_set_named_property(env, resObj, "referenceDeviceId", devIdVal);
+
+    napi_value evVal;
+    napi_get_boolean(env, stats.isEventDriven, &evVal);
+    napi_set_named_property(env, resObj, "isEventDriven", evVal);
+
+    return resObj;
+}
+
 static napi_value Method_EngineStopCapture(napi_env env, napi_callback_info info) {
     std::lock_guard<std::mutex> lock(g_fanoutMutex);
     if (g_fanoutEngine) {
@@ -2974,6 +3074,13 @@ static napi_value Method_EngineGetCaptureStats(napi_env env, napi_callback_info 
     napi_get_boolean(env, stats.isEventDriven, &isEvVal);
     napi_set_named_property(env, obj, "isCapturing", isCapVal);
     napi_set_named_property(env, obj, "isEventDriven", isEvVal);
+
+    napi_value modeVal, pidVal;
+    const char* modeStr = (stats.captureMode == speakerflow::WasapiCaptureMode::ProcessLoopback) ? "process" : "endpoint";
+    napi_create_string_utf8(env, modeStr, NAPI_AUTO_LENGTH, &modeVal);
+    napi_create_uint32(env, stats.targetProcessId, &pidVal);
+    napi_set_named_property(env, obj, "captureMode", modeVal);
+    napi_set_named_property(env, obj, "targetProcessId", pidVal);
 
     napi_value srVal, chVal, bpsVal;
     napi_create_uint32(env, stats.sampleRate, &srVal);
@@ -4046,9 +4153,12 @@ NAPI_MODULE_INIT() {
     napi_create_function(env, NULL, 0, Method_RenderGetStats, NULL, &fn);
     napi_set_named_property(env, exports, "renderGetStats", fn);
 
-    // Multi-output Fan-Out Engine exports (Phase 2C)
+    // Multi-output Fan-Out Engine exports (Phase 2C & Phase 2G)
     napi_create_function(env, NULL, 0, Method_EngineStartCapture, NULL, &fn);
     napi_set_named_property(env, exports, "engineStartCapture", fn);
+
+    napi_create_function(env, NULL, 0, Method_EngineStartProcessCapture, NULL, &fn);
+    napi_set_named_property(env, exports, "engineStartProcessCapture", fn);
 
     napi_create_function(env, NULL, 0, Method_EngineStopCapture, NULL, &fn);
     napi_set_named_property(env, exports, "engineStopCapture", fn);

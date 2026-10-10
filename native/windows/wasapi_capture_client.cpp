@@ -9,6 +9,11 @@
 #include <sstream>
 #include <iomanip>
 
+#include <audioclientactivationparams.h>
+#include <psapi.h>
+
+#pragma comment(lib, "mmdevapi.lib")
+
 namespace speakerflow {
 
 static std::string WideToUtf8(const wchar_t* wstr) {
@@ -28,9 +33,160 @@ static std::string FormatHresult(const char* action, HRESULT hr) {
     return ss.str();
 }
 
+static std::string GetProcessFriendlyName(DWORD pid) {
+    if (pid == 0) return "";
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) {
+        return "PID " + std::to_string(pid);
+    }
+    wchar_t exePath[MAX_PATH] = { 0 };
+    DWORD size = MAX_PATH;
+    std::string name;
+    if (QueryFullProcessImageNameW(hProcess, 0, exePath, &size)) {
+        const wchar_t* pFileName = wcsrchr(exePath, L'\\');
+        pFileName = pFileName ? (pFileName + 1) : exePath;
+        name = WideToUtf8(pFileName);
+    } else {
+        name = "PID " + std::to_string(pid);
+    }
+    CloseHandle(hProcess);
+    return name;
+}
+
+static bool ParseMixFormat(const WAVEFORMATEX* pMixFormat,
+                           SampleFormatType& outType,
+                           std::string& outTag) {
+    if (!pMixFormat) return false;
+    outType = SampleFormatType::Unknown;
+    outTag = "Unknown";
+
+    if (pMixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        outType = SampleFormatType::Float32;
+        outTag = "IEEE_FLOAT";
+        return true;
+    } else if (pMixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        const WAVEFORMATEXTENSIBLE* pExt = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pMixFormat);
+        if (IsEqualGUID(pExt->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
+            outType = SampleFormatType::Float32;
+            outTag = "EXTENSIBLE_IEEE_FLOAT";
+            return true;
+        } else if (IsEqualGUID(pExt->SubFormat, KSDATAFORMAT_SUBTYPE_PCM)) {
+            if (pMixFormat->wBitsPerSample == 16) {
+                outType = SampleFormatType::Pcm16;
+                outTag = "EXTENSIBLE_PCM_16";
+                return true;
+            } else if (pMixFormat->wBitsPerSample == 24) {
+                outType = (pMixFormat->nBlockAlign == pMixFormat->nChannels * 4)
+                                   ? SampleFormatType::Pcm24In32
+                                   : SampleFormatType::Pcm24Packed;
+                outTag = "EXTENSIBLE_PCM_24";
+                return true;
+            } else if (pMixFormat->wBitsPerSample == 32) {
+                outType = SampleFormatType::Pcm32;
+                outTag = "EXTENSIBLE_PCM_32";
+                return true;
+            }
+        }
+    } else if (pMixFormat->wFormatTag == WAVE_FORMAT_PCM) {
+        if (pMixFormat->wBitsPerSample == 16) {
+            outType = SampleFormatType::Pcm16;
+            outTag = "PCM_16";
+            return true;
+        } else if (pMixFormat->wBitsPerSample == 24) {
+            outType = (pMixFormat->nBlockAlign == pMixFormat->nChannels * 4)
+                               ? SampleFormatType::Pcm24In32
+                               : SampleFormatType::Pcm24Packed;
+            outTag = "PCM_24";
+            return true;
+        } else if (pMixFormat->wBitsPerSample == 32) {
+            outType = SampleFormatType::Pcm32;
+            outTag = "PCM_32";
+            return true;
+        }
+    }
+    return false;
+}
+
+class ProcessLoopbackActivationHandler : public IActivateAudioInterfaceCompletionHandler {
+public:
+    ProcessLoopbackActivationHandler()
+        : m_refCount(1),
+          m_hCompleted(CreateEvent(NULL, TRUE, FALSE, NULL)),
+          m_hrResult(E_FAIL),
+          m_pAudioClient(nullptr) {}
+
+    ~ProcessLoopbackActivationHandler() {
+        if (m_hCompleted) CloseHandle(m_hCompleted);
+        if (m_pAudioClient) m_pAudioClient->Release();
+    }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) ||
+            riid == __uuidof(IActivateAudioInterfaceCompletionHandler) ||
+            riid == __uuidof(IAgileObject)) {
+            *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return InterlockedIncrement(&m_refCount);
+    }
+
+    STDMETHODIMP_(ULONG) Release() override {
+        ULONG ref = InterlockedDecrement(&m_refCount);
+        if (ref == 0) delete this;
+        return ref;
+    }
+
+    STDMETHODIMP ActivateCompleted(IActivateAudioInterfaceAsyncOperation* pAsyncOp) override {
+        if (!pAsyncOp) {
+            m_hrResult = E_POINTER;
+            SetEvent(m_hCompleted);
+            return S_OK;
+        }
+        HRESULT hrActivate = S_OK;
+        IUnknown* pUnk = nullptr;
+        HRESULT hr = pAsyncOp->GetActivateResult(&hrActivate, &pUnk);
+        if (SUCCEEDED(hr) && SUCCEEDED(hrActivate) && pUnk) {
+            hr = pUnk->QueryInterface(IID_PPV_ARGS(&m_pAudioClient));
+            pUnk->Release();
+            m_hrResult = hr;
+        } else {
+            m_hrResult = FAILED(hr) ? hr : hrActivate;
+        }
+        SetEvent(m_hCompleted);
+        return S_OK;
+    }
+
+    bool WaitForCompletion(DWORD timeoutMs) {
+        return WaitForSingleObject(m_hCompleted, timeoutMs) == WAIT_OBJECT_0;
+    }
+
+    HRESULT GetResult() const { return m_hrResult; }
+    IAudioClient* DetachAudioClient() {
+        IAudioClient* pClient = m_pAudioClient;
+        m_pAudioClient = nullptr;
+        return pClient;
+    }
+
+private:
+    long m_refCount;
+    HANDLE m_hCompleted;
+    HRESULT m_hrResult;
+    IAudioClient* m_pAudioClient;
+};
+
 WasapiCaptureClient::WasapiCaptureClient()
     : m_isCapturing(false),
       m_isEventDriven(false),
+      m_captureMode(WasapiCaptureMode::EndpointLoopback),
+      m_targetProcessId(0),
+      m_hTargetProcess(NULL),
       m_sampleRate(48000),
       m_channels(2),
       m_bitsPerSample(32),
@@ -67,7 +223,10 @@ bool WasapiCaptureClient::StartCapture(const std::wstring& targetDeviceId, std::
     std::lock_guard<std::mutex> lock(m_errorMutex);
     m_lastError.clear();
 
+    m_captureMode = WasapiCaptureMode::EndpointLoopback;
+    m_targetProcessId = 0;
     m_targetDeviceId = targetDeviceId;
+    m_referenceDeviceId.clear();
     m_framesCaptured.store(0, std::memory_order_relaxed);
     m_silentFramesCaptured.store(0, std::memory_order_relaxed);
     m_packetsCaptured.store(0, std::memory_order_relaxed);
@@ -140,48 +299,7 @@ bool WasapiCaptureClient::StartCapture(const std::wstring& targetDeviceId, std::
     m_channels = m_pMixFormat->nChannels;
     m_bitsPerSample = m_pMixFormat->wBitsPerSample;
 
-    // Detect format type
-    m_formatType = SampleFormatType::Unknown;
-    m_formatTagName = "Unknown";
-
-    if (m_pMixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-        m_formatType = SampleFormatType::Float32;
-        m_formatTagName = "IEEE_FLOAT";
-    } else if (m_pMixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-        const WAVEFORMATEXTENSIBLE* pExt = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(m_pMixFormat);
-        if (IsEqualGUID(pExt->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
-            m_formatType = SampleFormatType::Float32;
-            m_formatTagName = "EXTENSIBLE_IEEE_FLOAT";
-        } else if (IsEqualGUID(pExt->SubFormat, KSDATAFORMAT_SUBTYPE_PCM)) {
-            if (m_bitsPerSample == 16) {
-                m_formatType = SampleFormatType::Pcm16;
-                m_formatTagName = "EXTENSIBLE_PCM_16";
-            } else if (m_bitsPerSample == 24) {
-                m_formatType = (m_pMixFormat->nBlockAlign == m_channels * 4)
-                                   ? SampleFormatType::Pcm24In32
-                                   : SampleFormatType::Pcm24Packed;
-                m_formatTagName = "EXTENSIBLE_PCM_24";
-            } else if (m_bitsPerSample == 32) {
-                m_formatType = SampleFormatType::Pcm32;
-                m_formatTagName = "EXTENSIBLE_PCM_32";
-            }
-        }
-    } else if (m_pMixFormat->wFormatTag == WAVE_FORMAT_PCM) {
-        if (m_bitsPerSample == 16) {
-            m_formatType = SampleFormatType::Pcm16;
-            m_formatTagName = "PCM_16";
-        } else if (m_bitsPerSample == 24) {
-            m_formatType = (m_pMixFormat->nBlockAlign == m_channels * 4)
-                               ? SampleFormatType::Pcm24In32
-                               : SampleFormatType::Pcm24Packed;
-            m_formatTagName = "PCM_24";
-        } else if (m_bitsPerSample == 32) {
-            m_formatType = SampleFormatType::Pcm32;
-            m_formatTagName = "PCM_32";
-        }
-    }
-
-    if (m_formatType == SampleFormatType::Unknown) {
+    if (!ParseMixFormat(m_pMixFormat, m_formatType, m_formatTagName)) {
         CoTaskMemFree(m_pMixFormat);
         m_pMixFormat = nullptr;
         m_pAudioClient->Release();
@@ -275,6 +393,236 @@ bool WasapiCaptureClient::StartCapture(const std::wstring& targetDeviceId, std::
     return true;
 }
 
+bool WasapiCaptureClient::StartProcessCapture(DWORD targetProcessId, const std::wstring& referenceDeviceId, std::string& outError) {
+    StopCapture();
+
+    std::lock_guard<std::mutex> lock(m_errorMutex);
+    m_lastError.clear();
+
+    if (targetProcessId == 0) {
+        outError = "Invalid target process ID (0).";
+        m_lastError = outError;
+        return false;
+    }
+
+    m_captureMode = WasapiCaptureMode::ProcessLoopback;
+    m_targetProcessId = targetProcessId;
+    m_referenceDeviceId = referenceDeviceId;
+    m_targetDeviceId.clear();
+
+    // Open target process handle with SYNCHRONIZE for fast termination detection
+    m_hTargetProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, targetProcessId);
+    if (!m_hTargetProcess) {
+        m_hTargetProcess = OpenProcess(SYNCHRONIZE, FALSE, targetProcessId);
+    }
+    if (!m_hTargetProcess) {
+        DWORD err = GetLastError();
+        if (err == ERROR_INVALID_PARAMETER) {
+            outError = "Target process does not exist or has already terminated.";
+            m_lastError = outError;
+            return false;
+        }
+        // If access denied (e.g. system protected process), proceed without waitable process handle;
+        // termination will be caught via WASAPI's packet/device invalidation.
+    }
+
+    m_framesCaptured.store(0, std::memory_order_relaxed);
+    m_silentFramesCaptured.store(0, std::memory_order_relaxed);
+    m_packetsCaptured.store(0, std::memory_order_relaxed);
+    m_peakLevel.store(0.0f, std::memory_order_relaxed);
+    m_rmsLevel.store(0.0f, std::memory_order_relaxed);
+
+    m_deviceFriendlyName = "App: " + GetProcessFriendlyName(targetProcessId);
+
+    // Acquire reference render format from default or reference endpoint
+    IMMDeviceEnumerator* pEnumerator = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                  NULL,
+                                  CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator),
+                                  (void**)&pEnumerator);
+    if (FAILED(hr) || !pEnumerator) {
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = FormatHresult("CoCreateInstance(MMDeviceEnumerator)", hr);
+        m_lastError = outError;
+        return false;
+    }
+
+    IMMDevice* pRefDevice = nullptr;
+    if (m_referenceDeviceId.empty()) {
+        hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pRefDevice);
+    } else {
+        hr = pEnumerator->GetDevice(m_referenceDeviceId.c_str(), &pRefDevice);
+    }
+    pEnumerator->Release();
+
+    if (FAILED(hr) || !pRefDevice) {
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = FormatHresult("GetAudioEndpoint(ReferenceDevice)", hr);
+        m_lastError = outError;
+        return false;
+    }
+
+    IAudioClient* pRefClient = nullptr;
+    hr = pRefDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pRefClient);
+    pRefDevice->Release();
+    if (FAILED(hr) || !pRefClient) {
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = FormatHresult("Activate(ReferenceClient)", hr);
+        m_lastError = outError;
+        return false;
+    }
+
+    hr = pRefClient->GetMixFormat(&m_pMixFormat);
+    pRefClient->Release();
+    if (FAILED(hr) || !m_pMixFormat) {
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = FormatHresult("GetMixFormat(ReferenceClient)", hr);
+        m_lastError = outError;
+        return false;
+    }
+
+    m_sampleRate = m_pMixFormat->nSamplesPerSec;
+    m_channels = m_pMixFormat->nChannels;
+    m_bitsPerSample = m_pMixFormat->wBitsPerSample;
+
+    if (!ParseMixFormat(m_pMixFormat, m_formatType, m_formatTagName)) {
+        CoTaskMemFree(m_pMixFormat);
+        m_pMixFormat = nullptr;
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = "Unsupported reference mix format for process loopback.";
+        m_lastError = outError;
+        return false;
+    }
+
+    // Activate process loopback IAudioClient
+    AUDIOCLIENT_ACTIVATION_PARAMS params = {};
+    params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+    params.ProcessLoopbackParams.TargetProcessId = targetProcessId;
+    params.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+
+    PROPVARIANT activateParams;
+    PropVariantInit(&activateParams);
+    activateParams.vt = VT_BLOB;
+    activateParams.blob.cbSize = sizeof(params);
+    activateParams.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
+
+    ProcessLoopbackActivationHandler* pHandler = new ProcessLoopbackActivationHandler();
+    IActivateAudioInterfaceAsyncOperation* pAsyncOp = nullptr;
+
+    hr = ActivateAudioInterfaceAsync(
+        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        __uuidof(IAudioClient),
+        &activateParams,
+        pHandler,
+        &pAsyncOp
+    );
+
+    if (FAILED(hr)) {
+        pHandler->Release();
+        CoTaskMemFree(m_pMixFormat);
+        m_pMixFormat = nullptr;
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = FormatHresult("ActivateAudioInterfaceAsync(PROCESS_LOOPBACK)", hr);
+        m_lastError = outError;
+        return false;
+    }
+
+    bool completed = pHandler->WaitForCompletion(3000);
+    if (!completed) {
+        if (pAsyncOp) pAsyncOp->Release();
+        pHandler->Release();
+        CoTaskMemFree(m_pMixFormat);
+        m_pMixFormat = nullptr;
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = "ActivateAudioInterfaceAsync timed out after 3000ms.";
+        m_lastError = outError;
+        return false;
+    }
+
+    HRESULT actResult = pHandler->GetResult();
+    if (FAILED(actResult)) {
+        if (pAsyncOp) pAsyncOp->Release();
+        pHandler->Release();
+        CoTaskMemFree(m_pMixFormat);
+        m_pMixFormat = nullptr;
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = FormatHresult("Process Loopback Activation", actResult);
+        m_lastError = outError;
+        return false;
+    }
+
+    m_pAudioClient = pHandler->DetachAudioClient();
+    if (pAsyncOp) pAsyncOp->Release();
+    pHandler->Release();
+
+    if (!m_pAudioClient) {
+        CoTaskMemFree(m_pMixFormat);
+        m_pMixFormat = nullptr;
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = "Activation completed but IAudioClient interface was null.";
+        m_lastError = outError;
+        return false;
+    }
+
+    // Initialize event-driven capture
+    m_hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    m_hAudioEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+    REFERENCE_TIME hnsRequestedDuration = 2000000; // 200ms
+    DWORD streamFlags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    hr = m_pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                    streamFlags,
+                                    hnsRequestedDuration,
+                                    0,
+                                    m_pMixFormat,
+                                    NULL);
+
+    bool eventDriven = false;
+    if (SUCCEEDED(hr)) {
+        hr = m_pAudioClient->SetEventHandle(m_hAudioEvent);
+        if (SUCCEEDED(hr)) {
+            eventDriven = true;
+        }
+    }
+
+    if (!eventDriven || FAILED(hr)) {
+        if (m_hAudioEvent) { CloseHandle(m_hAudioEvent); m_hAudioEvent = NULL; }
+        if (m_hStopEvent) { CloseHandle(m_hStopEvent); m_hStopEvent = NULL; }
+        if (m_pMixFormat) { CoTaskMemFree(m_pMixFormat); m_pMixFormat = nullptr; }
+        if (m_pAudioClient) { m_pAudioClient->Release(); m_pAudioClient = nullptr; }
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = FormatHresult("Initialize(IAudioClient PROCESS_LOOPBACK)", hr);
+        m_lastError = outError;
+        return false;
+    }
+
+    m_isEventDriven.store(true, std::memory_order_relaxed);
+
+    hr = m_pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&m_pCaptureClient);
+    if (FAILED(hr) || !m_pCaptureClient) {
+        if (m_hAudioEvent) { CloseHandle(m_hAudioEvent); m_hAudioEvent = NULL; }
+        if (m_hStopEvent) { CloseHandle(m_hStopEvent); m_hStopEvent = NULL; }
+        if (m_pMixFormat) { CoTaskMemFree(m_pMixFormat); m_pMixFormat = nullptr; }
+        if (m_pAudioClient) { m_pAudioClient->Release(); m_pAudioClient = nullptr; }
+        if (m_hTargetProcess) { CloseHandle(m_hTargetProcess); m_hTargetProcess = NULL; }
+        outError = FormatHresult("GetService(IAudioCaptureClient)", hr);
+        m_lastError = outError;
+        return false;
+    }
+
+    if (!m_ringBuffer || m_ringBuffer->GetChannels() != m_channels) {
+        m_ringBuffer = std::make_unique<AudioRingBuffer>(65536, m_channels);
+    } else {
+        m_ringBuffer->Reset();
+    }
+
+    m_isCapturing.store(true, std::memory_order_release);
+    m_thread = std::thread(&WasapiCaptureClient::CaptureThreadProc, this);
+
+    return true;
+}
+
 void WasapiCaptureClient::StopCapture() {
     if (!m_isCapturing.exchange(false, std::memory_order_acq_rel)) {
         return;
@@ -296,6 +644,10 @@ void WasapiCaptureClient::StopCapture() {
         CloseHandle(m_hStopEvent);
         m_hStopEvent = NULL;
     }
+    if (m_hTargetProcess) {
+        CloseHandle(m_hTargetProcess);
+        m_hTargetProcess = NULL;
+    }
 
     if (m_pCaptureClient) {
         m_pCaptureClient->Release();
@@ -313,6 +665,9 @@ void WasapiCaptureClient::StopCapture() {
         CoTaskMemFree(m_pMixFormat);
         m_pMixFormat = nullptr;
     }
+
+    m_targetProcessId = 0;
+    m_captureMode = WasapiCaptureMode::EndpointLoopback;
 
     ClearBranchBuffers();
 }
@@ -352,13 +707,28 @@ void WasapiCaptureClient::CaptureThreadProc() {
     std::vector<float> stagingBuffer(stagingCapacity, 0.0f);
 
     const bool isEventDriven = m_isEventDriven.load(std::memory_order_relaxed);
-    HANDLE waitHandles[2] = { m_hStopEvent, m_hAudioEvent };
-    const DWORD waitCount = isEventDriven ? 2 : 1;
+    HANDLE waitHandles[3] = { m_hStopEvent, NULL, NULL };
+    DWORD waitCount = 1;
+    if (isEventDriven && m_hAudioEvent) {
+        waitHandles[waitCount++] = m_hAudioEvent;
+    }
+    DWORD processWaitIdx = 0;
+    if (m_hTargetProcess) {
+        processWaitIdx = waitCount;
+        waitHandles[waitCount++] = m_hTargetProcess;
+    }
 
     while (m_isCapturing.load(std::memory_order_relaxed)) {
         DWORD waitRes = WaitForMultipleObjects(waitCount, waitHandles, FALSE, isEventDriven ? 100 : 10);
         if (waitRes == WAIT_OBJECT_0) {
             // Stop event signaled
+            break;
+        }
+
+        if (processWaitIdx > 0 && waitRes == (WAIT_OBJECT_0 + processWaitIdx)) {
+            // Target process terminated
+            std::lock_guard<std::mutex> lock(m_errorMutex);
+            m_lastError = "Target application process terminated.";
             break;
         }
 
@@ -419,9 +789,9 @@ void WasapiCaptureClient::CaptureThreadProc() {
         }
 
         if (FAILED(hrPacket)) {
-            if (hrPacket == AUDCLNT_E_DEVICE_INVALIDATED) {
+            if (hrPacket == AUDCLNT_E_DEVICE_INVALIDATED || hrPacket == AUDCLNT_E_RESOURCES_INVALIDATED) {
                 std::lock_guard<std::mutex> lock(m_errorMutex);
-                m_lastError = "WASAPI capture device was invalidated or disconnected.";
+                m_lastError = "WASAPI capture device was invalidated or target process disconnected.";
                 break;
             }
         }
@@ -510,6 +880,8 @@ WasapiCaptureStats WasapiCaptureClient::GetStats() const {
     WasapiCaptureStats stats;
     stats.isCapturing = m_isCapturing.load(std::memory_order_acquire);
     stats.isEventDriven = m_isEventDriven.load(std::memory_order_relaxed);
+    stats.captureMode = m_captureMode;
+    stats.targetProcessId = m_targetProcessId;
     stats.sampleRate = m_sampleRate;
     stats.channels = m_channels;
     stats.bitsPerSample = m_bitsPerSample;

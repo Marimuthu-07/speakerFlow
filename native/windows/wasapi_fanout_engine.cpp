@@ -52,6 +52,33 @@ bool WasapiFanOutEngine::StartCapture(const std::wstring& targetDeviceId, std::s
     return ok;
 }
 
+bool WasapiFanOutEngine::StartProcessCapture(DWORD targetProcessId, const std::wstring& referenceDeviceId, std::string& outError) {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    m_lastError.clear();
+
+    // Reset all existing branches
+    for (size_t i = 0; i < MAX_BRANCHES; ++i) {
+        if (m_branches[i]) {
+            m_branches[i]->active.store(false, std::memory_order_release);
+            m_branches[i]->renderClient->StopRender();
+            m_branches[i].reset();
+        }
+    }
+    m_captureClient.StopCapture();
+
+    m_captureDeviceId = referenceDeviceId;
+    bool ok = m_captureClient.StartProcessCapture(targetProcessId, referenceDeviceId, outError);
+    if (!ok) {
+        m_lastError = outError;
+    }
+    return ok;
+}
+
+bool WasapiFanOutEngine::IsProcessCapture() const {
+    std::lock_guard<std::mutex> lock(m_engineMutex);
+    return m_captureClient.GetStats().captureMode == WasapiCaptureMode::ProcessLoopback;
+}
+
 void WasapiFanOutEngine::StopCapture() {
     std::vector<std::shared_ptr<WasapiRenderClient>> clientsToStop;
     {

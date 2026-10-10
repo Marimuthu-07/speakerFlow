@@ -48,7 +48,8 @@
             "-luuid.lib",
             "-lpropsys.lib",
             "-lpsapi.lib",
-            "-lavrt.lib"
+            "-lavrt.lib",
+            "-lmmdevapi.lib"
           ],
           "msvs_settings": {
             "VCCLCompilerTool": {

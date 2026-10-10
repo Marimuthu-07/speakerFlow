@@ -30,9 +30,16 @@ enum class SampleFormatType {
     Pcm32
 };
 
+enum class WasapiCaptureMode {
+    EndpointLoopback,
+    ProcessLoopback
+};
+
 struct WasapiCaptureStats {
     bool isCapturing = false;
     bool isEventDriven = false;
+    WasapiCaptureMode captureMode = WasapiCaptureMode::EndpointLoopback;
+    uint32_t targetProcessId = 0;
     uint32_t sampleRate = 0;
     uint32_t channels = 0;
     uint32_t bitsPerSample = 0;
@@ -69,7 +76,16 @@ public:
     bool StartCapture(const std::wstring& targetDeviceId, std::string& outError);
 
     /**
-     * @brief Stops WASAPI loopback capture and joins the capture worker thread.
+     * @brief Starts native WASAPI process-loopback capture for a target application process tree.
+     * @param targetProcessId Process ID of the application to capture.
+     * @param referenceDeviceId Optional reference render device endpoint ID for format negotiation (empty = default console render endpoint).
+     * @param outError Receives error description if start fails.
+     * @return true if capture started successfully, false otherwise.
+     */
+    bool StartProcessCapture(DWORD targetProcessId, const std::wstring& referenceDeviceId, std::string& outError);
+
+    /**
+     * @brief Stops WASAPI capture and joins the capture worker thread.
      */
     void StopCapture();
 
@@ -137,7 +153,11 @@ private:
 
     std::atomic<bool> m_isCapturing;
     std::atomic<bool> m_isEventDriven;
+    WasapiCaptureMode m_captureMode;
+    DWORD m_targetProcessId;
+    HANDLE m_hTargetProcess;
     std::wstring m_targetDeviceId;
+    std::wstring m_referenceDeviceId;
     std::string m_deviceFriendlyName;
 
     uint32_t m_sampleRate;

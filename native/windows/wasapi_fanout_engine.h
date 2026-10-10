@@ -95,6 +95,20 @@ public:
     bool StartCapture(const std::wstring& targetDeviceId, std::string& outError);
 
     /**
+     * @brief Starts native WASAPI process-loopback capture for a target application process tree.
+     * @param targetProcessId Process ID of the application to capture.
+     * @param referenceDeviceId Optional reference render device endpoint ID for format negotiation (empty = default console render endpoint).
+     * @param outError Receives error description if start fails.
+     * @return true if capture started successfully, false otherwise.
+     */
+    bool StartProcessCapture(DWORD targetProcessId, const std::wstring& referenceDeviceId, std::string& outError);
+
+    /**
+     * @brief Checks if process-loopback capture is currently active.
+     */
+    bool IsProcessCapture() const;
+
+    /**
      * @brief Stops loopback capture and all active render branches.
      */
     void StopCapture();

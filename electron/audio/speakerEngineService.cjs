@@ -105,6 +105,8 @@ class SpeakerEngineService {
             ingressStatus: this.session.ingressStatus,
             tapSourceId: this.session.tapSourceId,
             tapStatus: this.session.tapStatus,
+            captureMode: this.session.captureMode || (this.session.pipeline?.captureMode || (this.session.pipeline?.isNativeProcessLoopback ? 'process' : 'endpoint')),
+            isNativeProcessLoopback: Boolean(this.session.isNativeProcessLoopback || this.session.pipeline?.isNativeProcessLoopback),
             branches: this.session.branches.map((b) => ({
               sinkId: b.sinkId,
               sinkName: b.sinkName,
@@ -232,6 +234,8 @@ class SpeakerEngineService {
       });
 
       session.pipeline = pipeline;
+      session.captureMode = pipeline.captureMode || (pipeline.isNativeProcessLoopback ? 'process' : 'endpoint');
+      session.isNativeProcessLoopback = Boolean(pipeline.isNativeProcessLoopback);
       session.ingressStatus = 'active';
       session.tapStatus = 'active';
       const effectiveIngressSinkId = pipeline.ingressSinkId || ingressSinkId;
@@ -319,14 +323,16 @@ class SpeakerEngineService {
         throw new Error('All selected output branches failed to start.');
       }
 
-      await this.audioBackend.moveSinkInput(stream.id, effectiveIngressSinkId);
-      await this.verifyStreamSink(stream.id, effectiveIngressSinkId);
+      if (!pipeline.isNativeProcessLoopback) {
+        await this.audioBackend.moveSinkInput(stream.id, effectiveIngressSinkId);
+        await this.verifyStreamSink(stream.id, effectiveIngressSinkId);
 
-      // On non-Windows platforms (e.g. Linux PipeWire), establish the temporary ingress sink as system default
-      if (process.platform !== 'win32') {
-        await this.audioBackend.setDefaultOutput(effectiveIngressSinkId);
-        await this.verifyDefaultOutput(effectiveIngressSinkId);
-        session.defaultOutputEstablished = true;
+        // On non-Windows platforms (e.g. Linux PipeWire), establish the temporary ingress sink as system default
+        if (process.platform !== 'win32') {
+          await this.audioBackend.setDefaultOutput(effectiveIngressSinkId);
+          await this.verifyDefaultOutput(effectiveIngressSinkId);
+          session.defaultOutputEstablished = true;
+        }
       }
 
       session.state = 'running';
@@ -337,7 +343,8 @@ class SpeakerEngineService {
       // Perform final reconciliation pass in case device or stream events occurred during startup
       await this.reconcileSession().catch(() => {});
 
-      this.lastMessage = `Audio routed across ${successfulBranches} physical output branch${successfulBranches === 1 ? '' : 'es'}.`;
+      const modeText = pipeline.isNativeProcessLoopback ? ' (direct process capture)' : '';
+      this.lastMessage = `Audio routed across ${successfulBranches} physical output branch${successfulBranches === 1 ? '' : 'es'}${modeText}.`;
     } catch (error) {
       await this.stopSession({ restore: true, preserveMessage: true });
       throw error;
@@ -368,26 +375,28 @@ class SpeakerEngineService {
       }
 
       // 2. Restore application stream to original output
-      try {
-        const stream = await this.findApplicationStream(session.streamId);
-        if (stream?.currentSinkId === session.ingressSinkId) {
-          if (process.platform === 'win32') {
-            if (session.originalSinkId && session.originalSinkId !== session.previousDefaultSinkId) {
-              await this.audioBackend.moveSinkInput(session.streamId, session.originalSinkId);
+      if (!session.pipeline?.isNativeProcessLoopback && !session.isNativeProcessLoopback) {
+        try {
+          const stream = await this.findApplicationStream(session.streamId);
+          if (stream?.currentSinkId === session.ingressSinkId) {
+            if (process.platform === 'win32') {
+              if (session.originalSinkId && session.originalSinkId !== session.previousDefaultSinkId) {
+                await this.audioBackend.moveSinkInput(session.streamId, session.originalSinkId);
+              } else {
+                await this.audioBackend.clearApplicationOutput(session.streamId);
+              }
             } else {
-              await this.audioBackend.clearApplicationOutput(session.streamId);
+              const originalSink = await this.audioBackend.findSinkByName(session.originalSinkId);
+              if (!originalSink) {
+                throw new Error(`The original output, ${session.originalSinkName}, is unavailable.`);
+              }
+              await this.audioBackend.moveSinkInput(session.streamId, originalSink.id);
+              await this.verifyStreamSink(session.streamId, originalSink.id);
             }
-          } else {
-            const originalSink = await this.audioBackend.findSinkByName(session.originalSinkId);
-            if (!originalSink) {
-              throw new Error(`The original output, ${session.originalSinkName}, is unavailable.`);
-            }
-            await this.audioBackend.moveSinkInput(session.streamId, originalSink.id);
-            await this.verifyStreamSink(session.streamId, originalSink.id);
           }
+        } catch (error) {
+          if (!restoreError) restoreError = error;
         }
-      } catch (error) {
-        if (!restoreError) restoreError = error;
       }
     }
 
@@ -413,7 +422,9 @@ class SpeakerEngineService {
     }
 
     if (!options.preserveMessage) {
-      this.lastMessage = 'The temporary Multi-Speaker Engine session stopped and the original output was restored.';
+      this.lastMessage = (session.pipeline?.isNativeProcessLoopback || session.isNativeProcessLoopback)
+        ? 'The Multi-Speaker Engine session stopped.'
+        : 'The temporary Multi-Speaker Engine session stopped and the original output was restored.';
     }
   }
 
@@ -494,16 +505,89 @@ class SpeakerEngineService {
       throw new Error(`The selected application stream ${streamId} was not found.`);
     }
 
-    session.isManualStreamSelection = Boolean(isManual);
-    session.streamId = stream.id;
-    session.streamProcessId = stream.processId;
-    session.streamName = stream.streamName
-      ? `${stream.applicationName} — ${stream.streamName}`
-      : stream.applicationName;
-    session.streamActive = stream.isActive;
+    if (!session.pipeline?.isNativeProcessLoopback && !session.isNativeProcessLoopback) {
+      // Virtual-cable / endpoint loopback mode
+      if (stream.currentSinkId !== session.ingressSinkId) {
+        await this.audioBackend.moveSinkInput(stream.id, session.ingressSinkId);
+        await this.verifyStreamSink(stream.id, session.ingressSinkId).catch(() => {});
+      }
 
-    if (stream.currentSinkId !== session.ingressSinkId) {
-      await this.audioBackend.moveSinkInput(stream.id, session.ingressSinkId).catch(() => {});
+      session.isManualStreamSelection = Boolean(isManual);
+      session.streamId = stream.id;
+      session.streamProcessId = stream.processId;
+      session.streamName = stream.streamName
+        ? `${stream.applicationName} — ${stream.streamName}`
+        : stream.applicationName;
+      session.streamActive = stream.isActive;
+      this.lastMessage = `Switched audio routing to ${session.streamName}.`;
+    } else {
+      // Native process capture mode: strictly resolve target process ID
+      const targetPid = (typeof stream.processId === 'number' && Number.isInteger(stream.processId) && stream.processId > 0)
+        ? stream.processId
+        : (Number.isInteger(Number(streamId)) && Number(streamId) > 0 ? Number(streamId) : null);
+
+      if (!targetPid) {
+        const err = new Error(
+          `Cannot switch native process capture to "${stream.applicationName}": no valid process ID found.`
+        );
+        this.lastMessage = err.message;
+        throw err;
+      }
+
+      if (session.pipeline && typeof session.pipeline.switchProcess === 'function') {
+        try {
+          await session.pipeline.switchProcess(targetPid);
+
+          // Synchronize session branch objects with pipeline branches after reconstruction
+          if (session.pipeline.branches) {
+            for (const branchObj of session.branches) {
+              const handle = session.pipeline.branches.get(branchObj.branchSinkId);
+              if (handle) {
+                branchObj.handle = handle;
+                branchObj.delayMs = handle.delayMs ?? branchObj.delayMs;
+                branchObj.delayFrames = handle.delayFrames ?? 0;
+                branchObj.state = 'active';
+                branchObj.error = null;
+              } else {
+                branchObj.handle = null;
+                branchObj.state = 'failed';
+                branchObj.error = 'Branch reconstruction failed after process switch.';
+              }
+            }
+          }
+
+          // Successfully switched native process capture! Now update session stream metadata
+          session.isManualStreamSelection = Boolean(isManual);
+          session.streamId = stream.id;
+          session.streamProcessId = stream.processId;
+          session.streamName = stream.streamName
+            ? `${stream.applicationName} — ${stream.streamName}`
+            : stream.applicationName;
+          session.streamActive = stream.isActive;
+
+          this.reconcileSessionState();
+          await this.waveController.updateBranches(session.branches).catch(() => {});
+          this.lastMessage = `Switched audio capture to ${session.streamName}.`;
+        } catch (switchErr) {
+          // Native switching failed: do NOT mark new stream as active.
+          // Synchronize session branches to reflect any lost native branches.
+          if (session.pipeline?.branches) {
+            for (const branchObj of session.branches) {
+              if (!session.pipeline.branches.has(branchObj.branchSinkId)) {
+                branchObj.handle = null;
+                branchObj.state = 'failed';
+                branchObj.error = 'Render branch lost during process retargeting failure.';
+              }
+            }
+          }
+          this.reconcileSessionState();
+          this.lastMessage = `Failed to switch capture to ${stream.applicationName}: ${switchErr.message}`;
+          if (typeof this.onSessionChanged === 'function') {
+            this.onSessionChanged();
+          }
+          throw switchErr;
+        }
+      }
     }
 
     if (typeof this.onSessionChanged === 'function') {
@@ -758,6 +842,7 @@ class SpeakerEngineService {
   async reassertTargetIngress(force = true) {
     const session = this.session;
     if (!session || session.stopping || session.state === 'starting') return false;
+    if (session.pipeline?.isNativeProcessLoopback || session.isNativeProcessLoopback) return false;
 
     const targetPid = session.streamProcessId;
     if (!targetPid || targetPid === process.pid) return false;
@@ -898,31 +983,35 @@ class SpeakerEngineService {
         if (session.streamId !== targetStream.id) {
           session.streamId = targetStream.id;
           streamChanged = true;
-          // Direct newly targeted stream to engine ingress if not already there
-          if (targetStream.currentSinkId !== session.ingressSinkId) {
-            await this.audioBackend.moveSinkInput(targetStream.id, session.ingressSinkId).catch(() => {});
+          if (!session.pipeline?.isNativeProcessLoopback && !session.isNativeProcessLoopback) {
+            // Direct newly targeted stream to engine ingress if not already there
+            if (targetStream.currentSinkId !== session.ingressSinkId) {
+              await this.audioBackend.moveSinkInput(targetStream.id, session.ingressSinkId).catch(() => {});
+            }
           }
         }
 
         // Phase 2F.1-F: Target Application Ingress Re-Assertion (Prevent Chrome escaping to physical Bluetooth)
-        const targetPid = session.streamProcessId || targetStream.processId;
-        if (targetPid && targetPid !== process.pid) {
-          const matchingStreams = streamList.filter((s) => s.processId === targetPid);
-          for (const s of matchingStreams) {
-            const appLower = (s.applicationName || '').toLowerCase();
-            if (appLower.includes('electron') || appLower.includes('speakerflow') ||
-                appLower.includes('antigravity') || appLower.includes('voicemeeter')) {
-              continue;
-            }
-
-            if (s.currentSinkId && s.currentSinkId !== session.ingressSinkId) {
-              const now = Date.now();
-              if (forceIngressReassert || !session.lastRerouteTimestamp || (now - session.lastRerouteTimestamp) > 1000) {
-                session.lastRerouteTimestamp = now;
-                await this.audioBackend.moveSinkInput(targetPid, session.ingressSinkId).catch(() => {});
-                await this.verifyStreamSink(targetPid, session.ingressSinkId, 500).catch(() => {});
+        if (!session.pipeline?.isNativeProcessLoopback && !session.isNativeProcessLoopback) {
+          const targetPid = session.streamProcessId || targetStream.processId;
+          if (targetPid && targetPid !== process.pid) {
+            const matchingStreams = streamList.filter((s) => s.processId === targetPid);
+            for (const s of matchingStreams) {
+              const appLower = (s.applicationName || '').toLowerCase();
+              if (appLower.includes('electron') || appLower.includes('speakerflow') ||
+                  appLower.includes('antigravity') || appLower.includes('voicemeeter')) {
+                continue;
               }
-              break;
+
+              if (s.currentSinkId && s.currentSinkId !== session.ingressSinkId) {
+                const now = Date.now();
+                if (forceIngressReassert || !session.lastRerouteTimestamp || (now - session.lastRerouteTimestamp) > 1000) {
+                  session.lastRerouteTimestamp = now;
+                  await this.audioBackend.moveSinkInput(targetPid, session.ingressSinkId).catch(() => {});
+                  await this.verifyStreamSink(targetPid, session.ingressSinkId, 500).catch(() => {});
+                }
+                break;
+              }
             }
           }
         }
@@ -950,7 +1039,19 @@ class SpeakerEngineService {
     // 2.5 Sync native engine branch lifecycle on Windows
     if (process.platform === 'win32' && session.pipeline && typeof session.pipeline.getEngineStatus === 'function') {
       const engineStatus = session.pipeline.getEngineStatus();
-      if (engineStatus && Array.isArray(engineStatus.branches)) {
+      if (engineStatus) {
+        if (!engineStatus.isCapturing && session.state === 'running' && !session.stopping) {
+          const reason = engineStatus.lastError || 'WASAPI capture stopped';
+          session.ingressStatus = 'stopped';
+          session.tapStatus = 'stopped';
+          this.lastMessage = (session.pipeline.isNativeProcessLoopback || session.isNativeProcessLoopback)
+            ? `Target application capture ended: ${reason}`
+            : `Capture stopped unexpectedly: ${reason}`;
+          await this.stopSession({ restore: true, preserveMessage: true }).catch(() => {});
+          return;
+        }
+
+        if (Array.isArray(engineStatus.branches)) {
         const nativeMap = new Map();
         for (const nb of engineStatus.branches) {
           if (nb.branchId) nativeMap.set(nb.branchId, nb);
@@ -1039,6 +1140,7 @@ class SpeakerEngineService {
         }
       }
     }
+  }
 
     // 3. Clean up branches for physical sinks that no longer exist in the system
     for (let i = session.branches.length - 1; i >= 0; i--) {
